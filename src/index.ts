@@ -512,7 +512,7 @@ function detectUrlType(url: string): 'video' | 'image' | 'audio' | 'webpage' {
 }
 
 // ── 所有外部URL走同源代理，绕过Chrome PNA/CORS限制 ──
-// ── 代理白名单（只代理内网 OSS 域名）───────────────
+// ── 内网域名必须走代理；其他域名先直连，失败后自动回退到代理 ──
 const PROXY_DOMAINS = [
   'oss-cn-shenzhen-internal.aliyuncs.com',
 ];
@@ -521,10 +521,27 @@ function needsProxy(url: string): boolean {
   return PROXY_DOMAINS.some(d => url.includes(d));
 }
 
+function toProxy(url: string): string {
+  return 'api-proxy/' + encodeURIComponent(url);
+}
+
 function proxyUrl(url: string): string {
-  if (/^https?:\/\//.test(url) && needsProxy(url)) return 'api-proxy/' + encodeURIComponent(url);
+  if (/^https?:\/\//.test(url) && needsProxy(url)) return toProxy(url);
   return url;
 }
+
+// 媒体直连失败（网络不通 / 混合内容 / CORS / PNA 等）时，自动改走服务器代理重试一次
+document.addEventListener('error', (e) => {
+  const el = e.target as HTMLElement | null;
+  if (!el || !['IMG', 'VIDEO', 'AUDIO', 'SOURCE'].includes(el.tagName)) return;
+  const raw = el.getAttribute('src');
+  if (!raw || !/^https?:\/\//i.test(raw) || el.dataset.proxied) return;
+  el.dataset.proxied = '1';
+  el.setAttribute('src', toProxy(raw));
+  const media = el.tagName === 'SOURCE' ? el.parentElement as HTMLMediaElement | null : null;
+  if (media && typeof media.load === 'function') media.load();
+  e.stopPropagation();
+}, true);
 
 // ── 会执行破框代码的域名（不渲染 iframe，只展示链接） ──
 const FRAMEBUSTER_DOMAINS = [
