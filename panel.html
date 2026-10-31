@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>多维表格标注器 · 双栏面板</title>
+</head>
+<body class="panel-page">
+  <div class="panel-layout">
+    <section class="viewer">
+      <div id="connBanner" class="conn-banner" hidden>与侧边栏的连接已断开，请回到多维表格侧边栏确认插件仍在运行（或重新点击 ⧉）</div>
+      <div id="blocks" class="blocks"></div>
+      <div id="viewerLayer" class="viewer-layer"></div>
+    </section>
+    <div id="splitter" class="splitter" title="拖动调整左右宽度"></div>
+    <div id="app">
+      <div class="header">
+        <h3>多维表格标注器</h3>
+        <div class="header-actions">
+          <a id="helpLink" class="refresh-btn help-link" href="https://zyt.feishu.cn/wiki/OwMPw0mzciAyuskIqUFcsdmSnsE" target="_blank" rel="noopener noreferrer" title="使用教程">?</a>
+          <button id="refreshBtn" class="refresh-btn" title="刷新视图记录列表">↻</button>
+        </div>
+        <div class="nav-controls">
+          <button id="prevBtn" class="nav-btn" disabled>上一条</button>
+          <input id="recordJump" class="jump-input" type="number" min="1" value="0" disabled />
+          <span id="totalCount" class="index-display">/ 0</span>
+          <button id="nextBtn" class="nav-btn" disabled>下一条</button>
+        </div>
+      </div>
+      <div id="recordContent" class="content">
+        <div class="loading">加载中...</div>
+      </div>
+      <div class="footer">
+        <div class="zoom-ctrl">
+          <button id="zoomOutBtn" class="zoom-btn" title="缩小标注栏字号">A−</button>
+          <button id="zoomInBtn" class="zoom-btn" title="放大标注栏字号">A＋</button>
+        </div>
+        <button id="undoBtn" class="undo-btn" disabled>撤销</button>
+        <button id="saveBtn" class="save-btn" disabled>保存</button>
+      </div>
+    </div>
+  </div>
+  <script type="module" src="/src/panel/index.ts"></script>
+</body>
+</html>

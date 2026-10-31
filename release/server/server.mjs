@@ -1,14 +1,17 @@
 import http, { createServer } from 'http';
 import { lookup as dnsLookup } from 'dns';
 import { isIP } from 'net';
-import { readFile } from 'fs/promises';
-import { join, extname } from 'path';
+import { readFile, stat } from 'fs/promises';
+import { gzip, brotliCompress, constants as zlibConstants } from 'zlib';
+import { promisify } from 'util';
+import { join, extname, sep } from 'path';
 import { fileURLToPath } from 'url';
 import https from 'https';
 import { URL } from 'url';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
-const DIST = join(__dirname, 'dist');
+const ROOT = join(__dirname, '..', 'dist');
+const ASSETS = join(ROOT, 'assets');
 const PORT = process.env.PORT || 6868;
 
 const MIME = {
@@ -116,6 +119,63 @@ function proxyRequest(targetUrl, req, res, redirects = 0) {
   proxyReq.end();
 }
 
+const gzipAsync = promisify(gzip);
+const brotliAsync = promisify(brotliCompress);
+const COMPRESSIBLE = new Set(['.html', '.js', '.css', '.json', '.svg']);
+
+// 静态文件内容与压缩结果按 mtime 缓存在内存里（dist 总共才 1MB 左右），重新构建后自动失效
+const staticCache = new Map();
+
+async function loadStatic(filePath) {
+  const st = await stat(filePath);
+  if (!st.isFile()) throw new Error('Not a file');
+  let entry = staticCache.get(filePath);
+  if (!entry || entry.mtimeMs !== st.mtimeMs) {
+    entry = {
+      mtimeMs: st.mtimeMs,
+      etag: `W/"${st.size}-${Math.floor(st.mtimeMs)}"`,
+      raw: await readFile(filePath),
+      gz: null,
+      br: null,
+    };
+    staticCache.set(filePath, entry);
+  }
+  return entry;
+}
+
+// 带哈希的 assets/* 永久缓存；html 等入口文件每次校验 ETag（未变化返回 304）
+async function sendStatic(req, res, filePath) {
+  const entry = await loadStatic(filePath);
+  const ext = extname(filePath).toLowerCase();
+  const headers = {
+    'Content-Type': MIME[ext] || 'application/octet-stream',
+    'Cache-Control': filePath.startsWith(ASSETS + sep) ? 'public, max-age=31536000, immutable' : 'no-cache',
+    'ETag': entry.etag,
+    'Vary': 'Accept-Encoding',
+  };
+  if (req.headers['if-none-match'] === entry.etag) {
+    res.writeHead(304, headers);
+    return res.end();
+  }
+
+  let body = entry.raw;
+  if (COMPRESSIBLE.has(ext)) {
+    const accepted = (req.headers['accept-encoding'] || '').split(',').map(e => e.trim().split(';')[0]);
+    if (accepted.includes('br')) {
+      if (!entry.br) entry.br = await brotliAsync(entry.raw, { params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 6 } });
+      body = entry.br;
+      headers['Content-Encoding'] = 'br';
+    } else if (accepted.includes('gzip')) {
+      if (!entry.gz) entry.gz = await gzipAsync(entry.raw);
+      body = entry.gz;
+      headers['Content-Encoding'] = 'gzip';
+    }
+  }
+  headers['Content-Length'] = body.length;
+  res.writeHead(200, headers);
+  res.end(req.method === 'HEAD' ? undefined : body);
+}
+
 const server = createServer((req, res) => {
   // 通用代理: /api-proxy/<encodeURIComponent(目标URL)>
   if (req.url.startsWith('/api-proxy/')) {
@@ -130,20 +190,18 @@ const server = createServer((req, res) => {
   }
 
   // 静态文件
-  const cleanPath = req.url.split('?')[0].split('#')[0];
-  const filePath = join(DIST, cleanPath === '/' ? 'index.html' : cleanPath);
+  let cleanPath;
+  try { cleanPath = decodeURIComponent(req.url.split('?')[0].split('#')[0]); }
+  catch { res.writeHead(400); return res.end('Bad URL'); }
+  let filePath = join(ROOT, cleanPath === '/' ? 'index.html' : cleanPath);
+  if (filePath !== ROOT && !filePath.startsWith(ROOT + sep)) filePath = join(ROOT, 'index.html');
 
-  readFile(filePath)
-    .then(data => {
-      const ext = extname(filePath).toLowerCase();
-      res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' });
-      res.end(data);
-    })
-    .catch(() => {
-      readFile(join(DIST, 'index.html'))
-        .then(data => { res.writeHead(200, { 'Content-Type': 'text/html' }); res.end(data); })
-        .catch(() => { res.writeHead(404); res.end('Not Found'); });
+  sendStatic(req, res, filePath).catch(() => {
+    sendStatic(req, res, join(ROOT, 'index.html')).catch(() => {
+      if (!res.headersSent) res.writeHead(404);
+      res.end('Not Found');
     });
+  });
 });
 
 server.listen(PORT, '0.0.0.0', () => {

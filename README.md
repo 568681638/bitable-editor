@@ -9,16 +9,23 @@
 ## 目录结构
 
 ```
-src/index.ts          插件主逻辑
-src/index.scss        样式
-index.html            插件 HTML 模板
-vite.config.js        Vite 配置
-tsconfig*.json        TypeScript 配置
-server.mjs            生产服务：托管 dist/ 静态文件 + /api-proxy/ 通用代理
-supervisor.conf       supervisord 程序配置模板
-deploy.sh             一键部署（详见 DEPLOY.md）
-DEPLOY.md             部署与运维说明
-dist/                 编译产物（不入库，部署前需 npm run build）
+index.html                Vite 入口：侧边栏插件页
+panel.html                Vite 入口：双栏面板页
+src/
+  sidebar/index.ts        侧边栏插件入口：飞书 SDK 读写 + 向双栏面板推送数据
+  panel/index.ts          双栏面板页入口：左侧自选字段分块展示 + 右侧标注面板 + 与侧边栏的连接
+  shared/                 两个页面共用
+    annotator-ui.ts       标注面板（字段渲染/编辑/保存/导航）
+    common.ts             共用类型与工具（URL 识别、代理回退、预览渲染）
+    bridge.ts             侧边栏 ↔ 面板页 postMessage 协议
+  styles/
+    annotator.scss        标注面板与页头样式（两个页面都加载）
+    panel.scss            双栏面板页专用样式（分块、图层、分隔线等）
+release/                  部署包：整个目录拷到服务器即可（详见 release/README.md）
+  README.md               部署与运维说明
+  deploy/                 deploy.sh 一键部署、supervisor.conf 配置模板
+  server/server.mjs       生产服务：托管 dist/ 静态文件 + /api-proxy/ 通用代理（需兼容 Node 14）
+  dist/                   前端构建产物（npm run build 直接输出到这里，不入库）
 ```
 
 ## 开发与部署
@@ -26,14 +33,15 @@ dist/                 编译产物（不入库，部署前需 npm run build）
 ```bash
 npm install
 npm run dev          # Vite 开发服务器 → http://localhost:5173/
-npm run build        # tsc + vite build → dist/
-./deploy.sh          # 安装 supervisor 配置并（重）启动 server.mjs，端口 6868
+npm run build        # tsc + vite build → release/dist/
+bash release/deploy/deploy.sh   # （在服务器上）安装 supervisor 配置并（重）启动 release/server/server.mjs，端口 6868
 ```
 
-服务器上更新插件的完整流程：`git pull` → `npm run build` → `./deploy.sh`。
-部署、日志、排障等细节见 [DEPLOY.md](DEPLOY.md)。
+更新插件的流程：本机 `npm run build`（产物生成到 `release/dist/`）→ 把整个 `release/` 目录拷到服务器 → 服务器上 `bash release/deploy/deploy.sh`。
+（也可以在服务器上 `git pull` 后构建，服务器不需要 `node_modules` 也能运行，只有构建时才需要。）
+部署、日志、排障等细节见 [release/README.md](release/README.md)。
 
-> `npm run deploy`（gh-pages）只能发布纯静态页面，没有 `/api-proxy/`，不适用于需要代理的场景。
+> `npm run deploy`（gh-pages，发布 `release/dist/`）只能发布纯静态页面，没有 `/api-proxy/`，不适用于需要代理的场景。
 
 ## 核心功能
 
@@ -41,9 +49,41 @@ npm run build        # tsc + vite build → dist/
 2. **字段渲染**：文本、数字、单选、多选、日期、复选框、URL、公式、附件、人员、群组、位置、自动编号、电话、邮箱。
    - URL 字段自动识别类型，渲染为 `<video>` / `<img>` / `<audio>` / `<iframe>`（网页 16:9 自适应）。
    - 人员、群组只读展示名称。
+   - 飞书「文本」类型字段一律用多行输入框：**没有换行时高度与单行输入框完全一致**（外观也一样：无滚动条、无拖拽角、超长时随光标横向滚动），
+     值里有换行或输入了回车才对应增高（每一行都不折行，横向滚动；最小一行，上限是窗口高度的 50%，右栏有缩放，会换算成屏幕像素；超出后内部滚动；
+     手动拖拽右下角调整过高度后不再自动撑开）。飞书文本末尾自带的换行会被去掉，否则单行文本会多出一个空行。
+     其他类型（电话、邮箱等）没有换行时仍用单行输入框。各类控件统一继承页面字体，保证同一栏里字体一致。
+   - 多行输入框里 **Ctrl+A 分两步**（类似飞书文档）：第一次只选中光标所在的那一行，该行已整行选中时再按一次才全选；
+     单行文本、空行、选区已跨行时直接全选。实现在 `src/shared/textarea.ts`。
 3. **编辑与保存**：改动后保存按钮亮起，`setRecord` 写回表格；撤销按钮恢复原值。
    只读字段：首字段、URL、公式、关联、附件、人员、群组、位置、自动编号。
-4. **刷新按钮 ↻**：同步字段元数据、视图可见字段顺序、单/多选选项、记录列表。
+4. **帮助按钮 ?**（刷新按钮左侧，侧边栏和面板页都有）：新标签页打开使用教程（链接在 index.html 和 panel.html 的 #helpLink 里，两处需同步修改）https://zyt.feishu.cn/wiki/OwMPw0mzciAyuskIqUFcsdmSnsE 。
+5. **刷新按钮 ↻**：同步字段元数据、视图可见字段顺序、单/多选选项、记录列表。
+
+## 双栏面板
+
+侧边栏标题栏的 **⧉** 按钮会在新标签页打开 `panel.html`：左侧是「展示区」，右侧是与侧边栏一致的标注面板。
+
+- **左侧展示哪个字段由用户决定**：把右侧字段名（标签）拖到左侧即可新增一个分块；左侧没有顶栏，空白时才显示操作提示。
+  分块标题栏是「字段名 | 只读输入框（字段值，可选中复制）| ↗ 新窗口打开 | ✕ 关闭」；URL 字段在标题栏下方按类型渲染网页 iframe / 图片 / 视频 / 音频。
+  其他字段的值只显示在标题栏里：值里**没有换行**用单行输入框（过长用省略号，悬停看全文）；**有换行**用多行输入框，规则与右侧标注栏一致
+  （每行不折行、横向滚动；高度随内容撑开；Ctrl+A 先选当前行再全选），区别只是上限更紧：窗口高度的 30%（标题栏撑得越高，下面的渲染区越小），超出后内部滚动。
+  不需要渲染的块，下方还有别的块时只占标题栏高度，下方没有东西时占满可用高度（全由这类块组成的一行，下方有别的块时整行也只占标题栏高度）。
+  只有**字段名**可以拖动（用来移动分块）；输入框不在可拖动区域内，所以能正常用鼠标选中文字。
+- **分块可上下左右任意切分**：把字段拖到某个分块的上 / 下 / 左 / 右边缘（会高亮将占据的那一半），就从该方向切出新块，可嵌套（树形布局）。
+  拖分块标题可移动位置，拖分隔线调整大小，✕ 移除；同一字段只能放一块。
+  拖到分块之间或分块旁边的空白处时，会找到对应的分块并在该方向切分（空白区会高亮）。
+- **已拖到左侧的字段，右侧标注栏不再显示**（不重渲染，其他字段里未保存的输入不受影响）；关闭左侧分块后自动回到右侧，原有的预览渲染区也一并恢复。
+  注意：左侧分块是只读展示，拖走可编辑字段后需先关闭分块才能在右侧编辑。
+- **全屏**：需要渲染的块（网页 / 视频 / 图片）左上角有悬浮的「全屏」按钮，点击后铺满整个浏览器窗口（盖住右侧标注栏），按钮变成「退出全屏」；点击或按 Esc 恢复。
+  全屏只改样式（`position: fixed`）、不挪动 DOM，所以网页不会重新加载、视频不会重播；同一时间只有一个块能全屏。
+- 右侧标注栏默认缩放到 85%（更接近多维表格侧边栏的字号），右栏底部（撤销 / 保存左侧）的 A− / A＋ 可调（60%～120%）。
+- 左右两栏之间的分隔线可拖动调整宽度。布局（分块树、大小、右栏宽度和缩放）存在浏览器 localStorage，换记录不丢。
+- 数据来源：飞书 SDK 只能在多维表格内嵌的插件 iframe 里运行，所以面板页不直接访问表格——侧边栏插件需保持打开，
+  它通过 `window.open` 句柄 + `postMessage`（校验同源）把当前记录推给面板页，面板页的翻页 / 刷新 / 保存也回传给插件执行。
+  面板已打开且连着时，再点 ⧉ 只把它切回前台、不重新加载（保留网页滚动位置和视频进度）；面板没开或侧边栏刚刷新丢了连接时才重新打开，此时同名窗口会被复用并重新加载，所以连接以「每次页面加载的随机会话 ID」而不是窗口对象来区分新旧页面。面板页每 3 秒发一次心跳，侧边栏刷新后会自动重连；超过 12 秒无响应显示断开提示。
+- 禁止嵌入的站点（`FRAMEBUSTER_DOMAINS`）只显示链接；
+  其他因 X-Frame-Options / CSP 拒绝嵌入的站点 iframe 会空白（浏览器不提供检测），可点分块标题上的 ↗ 新窗口打开。
 
 ## 服务端代理 `/api-proxy/`
 
@@ -51,7 +91,7 @@ npm run build        # tsc + vite build → dist/
 
 - 用法：`/api-proxy/<encodeURIComponent(目标URL)>`（相对路径，避免与 k8s 的 `/proxy/<port>/` 路由冲突）。
 - 前端策略：内网 OSS 域名（`oss-cn-shenzhen-internal.aliyuncs.com`）一开始就走代理；其他 URL 先直连，
-  `<img>` / `<video>` / `<audio>` / `<source>` 加载失败时，由全局 error 监听自动改走代理重试一次（`src/index.ts`）。
+  `<img>` / `<video>` / `<audio>` / `<source>` 加载失败时，由全局 error 监听自动改走代理重试一次（`src/shared/common.ts` 的 `installProxyFallback`）。
 - 服务端：支持 Range（拖进度条）、跟随重定向（最多 5 次）、流式转发；仅允许 GET / HEAD，不转发 cookie，且仅支持 http / https。
 - 安全：**不设域名白名单**，有意放行内网网段（10/8、172.16/12、192.168/16、100.64/10），
   因此能访问本服务的人可以借它探测内网。已拦截回环（含 `localhost`）、链路本地 / 云元数据（169.254.x）、
@@ -59,6 +99,9 @@ npm run build        # tsc + vite build → dist/
 - 不覆盖 `<iframe>` 网页：代理后页面里的相对链接和脚本会失效。
 
 ## 技术决策记录
+
+> **服务端（`server/server.mjs`）必须兼容 Node 14**：DSW 容器自带的 Node 是 14.x，不支持 `??=` / `||=` / `&&=`（Node 15+）、`replaceAll`（Node 15+）、`Array.prototype.at`（Node 16.6+）等较新的语法和 API。
+> 本机用新版 Node 测试通过不代表能在 DSW 上运行，改服务端后请避免使用这些特性。前端代码由 Vite 编译，不受此限制。
 
 | 决策 | 原因 |
 |------|------|
@@ -68,6 +111,11 @@ npm run build        # tsc + vite build → dist/
 | 代理路径用相对路径 `api-proxy/` | 避免与 k8s 的 `/proxy/<port>/` 路由冲突 |
 | 代理从“内网 OSS 白名单”改为“通用代理 + 失败自动回退” | 别的内网域名（如 bcebos，解析到 10.x）浏览器同样访问不到；见上方安全说明 |
 | TTE 等会破框的域名不渲染 iframe | 只展示可点击链接，避免页面无限重刷 |
+| 面板页用 window.open + postMessage，不用 BroadcastChannel | 插件在飞书页面里是第三方 iframe，Chrome 对其 BroadcastChannel / 存储做了分区，与顶层标签页同源也互通不了 |
+| 静态文件开 br / gzip 压缩，带哈希的 `assets/*` 永久缓存，html 走 ETag | 插件经内网 k8s 代理访问，`main.js` 有 838KB（gzip 后约 265KB、br 约 237KB）；二次打开基本不用再下载 |
+| 标注面板数据指纹没变就不重建 DOM | 保存后同步回来的相同数据不再重画，视频 / iframe 预览不会被重载、未保存的输入不会被清掉 |
+| 记录按需分批加载（先取 ID 列表，内容每 40 条一块） | `getRecords` 每页最多 200 条，原先只取了第一页，视图超过 200 条时总数和翻页都不对；改为只取 ID 拿总数，内容按块加载并缓存，跳转到任意位置只等一次请求，连续翻页时在距块边缘 10 条内后台预取相邻块；刷新会清空缓存并只重载当前块 |
+| 左侧的网页 / 视频 / 图片放在固定图层里，按分块内容区的位置叠加 | 布局变化（新增、移动、切分块）会重建分块的容器，iframe 一旦换了父节点就会被浏览器重新加载；渲染内容从不移动，布局变化时只更新位置和大小（`ResizeObserver` 监听占位内容区），网页的滚动位置、视频的播放进度都不会丢 |
 | 用 supervisord 托管进程 | 部署环境是 DSW 容器，没有 systemd，pm2 自启不可用 |
 
 ## SDK 关键 API
@@ -77,7 +125,8 @@ npm run build        # tsc + vite build → dist/
 | `bitable.base.getTableById(id)` | 获取表对象 |
 | `table.getFieldMetaList()` | 获取所有字段元数据 |
 | `view.getVisibleFieldIdList()` | 获取视图可见字段 ID 列表 |
-| `table.getRecords({viewId})` | 获取视图记录列表 |
+| `view.getVisibleRecordIdList()` | 获取视图里全部记录 ID（顺序与视图一致，总数 = ID 数） |
+| `table.getRecordsByIds(ids)` | 按 ID 批量取记录内容（单次上限 1000 条），按需分批加载用 |
 | `field.getOptions()` | 获取单选 / 多选字段的选项 |
 | `table.setRecord(recordId, {fields})` | 保存记录 |
 | `bitable.ui.showFieldValueEditor(...)` | 打开字段编辑弹窗（触发表格定位高亮） |

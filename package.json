@@ -8,8 +8,8 @@
     "start": "npm run dev",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "deploy": "npm run build && gh-pages -d dist",
-    "serve": "node server.mjs"
+    "deploy": "npm run build && gh-pages -d release/dist",
+    "serve": "node release/server/server.mjs"
   },
   "keywords": [],
   "author": "",

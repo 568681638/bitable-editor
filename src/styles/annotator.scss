@@ -26,13 +26,16 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 16px 20px;
+  flex-wrap: wrap; // 侧边栏较窄时，导航整体换到第二行
+  gap: 8px;
+  padding: 16px 14px;
   background: #4f7cff;
   color: #fff;
   border-bottom: 1px solid #e8e8e8;
 }
 
 .header h3 {
+  white-space: nowrap;
   font-size: 18px;
   font-weight: 600;
 }
@@ -49,6 +52,15 @@ body {
   transition: all 0.2s;
 }
 
+.help-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
 .refresh-btn:hover {
   background: rgba(255, 255, 255, 0.35);
 }
@@ -57,14 +69,20 @@ body {
   background: rgba(255, 255, 255, 0.45);
 }
 
+.header-actions {
+  display: flex;
+  gap: 6px;
+}
+
 .nav-controls {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 8px;
 }
 
 .nav-btn {
-  padding: 6px 16px;
+  white-space: nowrap;
+  padding: 6px 10px;
   background: rgba(255, 255, 255, 0.2);
   border: 1px solid rgba(255, 255, 255, 0.3);
   border-radius: 4px;
@@ -163,6 +181,7 @@ body {
 .field-value input,
 .field-value textarea,
 .field-value select {
+  font-family: inherit; // 各类控件统一用页面字体（textarea 默认等宽、input 默认 Arial，同一栏里会不一致）
   width: 100%;
   padding: 6px 10px;
   border: 1px solid #d9d9d9;
@@ -179,9 +198,24 @@ body {
   border-color: #4f7cff;
 }
 
+.field-value input,
+.field-value textarea {
+  // 固定行高：让多行框的单行高度与单行输入框完全一致（内容高度都是 16px）
+  line-height: 16px;
+}
+
 .field-value textarea {
   resize: vertical;
-  min-height: 60px;
+  // 每一行都不折行，过长时横向滚动（高度随内容撑开，见 shared/textarea.ts）
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+}
+
+// 单行状态（值里没有换行）：看起来就是普通输入框，没有滚动条和拖拽角，超长时随光标移动横向滚动
+.field-value textarea.single-line {
+  overflow: hidden;
+  resize: none;
 }
 
 .field-value select {

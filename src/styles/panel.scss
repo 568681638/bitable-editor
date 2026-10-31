@@ -1,0 +1,348 @@
+// 双栏面板页（panel.html）专用样式；与侧边栏共用的部分在 annotator.scss
+// ── 双栏面板页（panel.html） ──────────────────────
+// 拖拽过程中 iframe 会吞掉鼠标事件，统一关闭
+body.dragging-field iframe,
+body.dragging-field .viewer-item {
+  pointer-events: none;
+}
+
+.field-label[draggable="true"] {
+  cursor: grab;
+  align-self: flex-start;
+}
+
+.panel-page {
+  overflow: hidden;
+}
+
+.panel-layout {
+  --ann-width: 420px;
+  display: flex;
+  height: 100vh;
+
+  --ann-zoom: 0.85;
+
+  // 右栏整体缩放，字号更接近多维表格侧边栏；宽高按缩放反算，视觉宽度仍等于 --ann-width
+  #app {
+    flex: none;
+    zoom: var(--ann-zoom);
+    width: calc(var(--ann-width) / var(--ann-zoom));
+    height: calc(100vh / var(--ann-zoom));
+    box-shadow: none;
+  }
+}
+
+.viewer {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: #eef0f4;
+}
+
+.zoom-ctrl {
+  margin-right: auto;
+  display: flex;
+  gap: 4px;
+}
+
+.zoom-btn {
+  padding: 4px 8px;
+  background: #fff;
+  border: 1px solid #d9d9d9;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+
+  &:hover {
+    border-color: #4f7cff;
+    color: #4f7cff;
+  }
+}
+
+.conn-banner {
+  padding: 6px 12px;
+  background: #fff7e6;
+  color: #d46b08;
+  font-size: 13px;
+}
+
+.blocks {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  padding: 4px;
+
+  &.drop-active { outline: 2px dashed #4f7cff; outline-offset: -4px; }
+}
+
+.split {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+
+  &.row { flex-direction: row; }
+  &.column { flex-direction: column; }
+}
+
+.drop-hint {
+  position: absolute;
+  z-index: 3;
+  background: rgba(79, 124, 255, 0.25);
+  border: 2px solid #4f7cff;
+  pointer-events: none;
+}
+
+.blocks-empty {
+  margin: auto;
+  padding: 40px 56px;
+  text-align: center;
+  border: 2px dashed #c5cbd6;
+  border-radius: 10px;
+  color: #8a93a3;
+}
+
+.blocks-empty-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: #5b6577;
+}
+
+.blocks-empty-sub {
+  margin-top: 10px;
+  font-size: 13px;
+}
+
+.block {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+  border: 1px solid #d9d9d9;
+  border-radius: 6px;
+  overflow: hidden;
+
+  // 落点提示：高亮将要占据的那一半
+  &::after {
+    content: '';
+    position: absolute;
+    z-index: 2;
+    display: none;
+    background: rgba(79, 124, 255, 0.25);
+    border: 2px solid #4f7cff;
+    pointer-events: none;
+  }
+
+  &.drop-left::after { display: block; top: 0; bottom: 0; left: 0; width: 50%; }
+  &.drop-right::after { display: block; top: 0; bottom: 0; right: 0; width: 50%; }
+  &.drop-top::after { display: block; left: 0; right: 0; top: 0; height: 50%; }
+  &.drop-bottom::after { display: block; left: 0; right: 0; bottom: 0; height: 50%; }
+}
+
+.block-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px 8px;
+  background: #fafafa;
+  border-bottom: 1px solid #e8e8e8;
+  user-select: none;
+}
+
+.block-title {
+  flex: none;
+  cursor: grab; // 只有字段名可拖动；输入框不在可拖动区域内，才能正常选中文字
+  padding-top: 4px;
+  max-width: 35%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+  color: #666;
+}
+
+.block-value {
+  flex: 1;
+  min-width: 0;
+  padding: 3px 8px;
+  border: 1px solid #d9d9d9;
+  border-radius: 4px;
+  background: #fff;
+  font-size: 13px;
+  color: #333;
+  outline: none;
+  text-overflow: ellipsis;
+  cursor: text;
+  user-select: text;
+
+  &:focus { border-color: #4f7cff; }
+
+  &[hidden] { display: none; }
+}
+
+.block-value-multi {
+  font-family: inherit;
+  line-height: 1.5;
+  resize: vertical;
+  // 与右侧标注栏一致：每行不折行，过长时横向滚动（高度随内容撑开，见 shared/textarea.ts）
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+}
+
+.block-open {
+  padding-top: 4px;
+  color: #4f7cff;
+  text-decoration: none;
+}
+
+.block-close {
+  padding-top: 4px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: #999;
+
+  &:hover { color: #ff4d4f; }
+}
+
+.block-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  background: #fff;
+}
+
+// 没有可渲染内容的块：下方还有别的块时（panel.ts 里打上 data-fit）只占标题栏高度，
+// 下方没有东西时不打标记，按权重占满可用高度
+.block[data-fit],
+.split[data-fit] {
+  flex: 0 0 auto !important;
+}
+
+.block-body[hidden] {
+  display: none;
+}
+
+.viewer-layer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  // 不加 overflow: hidden：渲染块本来就精确定位在各自占位上，不需要裁剪，
+  // 而且图层只覆盖左侧区域，祖先的裁剪可能连带限制 fixed 的全屏块
+  pointer-events: none;
+  z-index: 1;
+}
+
+.viewer-item {
+  position: absolute;
+  display: none;
+  background: #fff;
+  overflow: hidden;
+  pointer-events: auto;
+}
+
+.viewer-content {
+  flex: 1;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+
+// 全屏：铺满整个浏览器窗口，盖住右侧标注栏。只改样式不挪 DOM，iframe 不会重新加载；
+// !important 用来盖过 positionViewers 写在行内的位置，退出后行内位置仍是最新的
+.viewer-item.fullscreen {
+  position: fixed !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  z-index: 1000;
+}
+
+// 悬浮在渲染区左上角的全屏 / 退出全屏按钮：贴着左上角、小字号，用较亮的主色让人容易注意到
+.viewer-fs-btn {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 2;
+  padding: 2px 8px;
+  font-size: 12px;
+  line-height: 18px;
+  color: #fff;
+  background: #4f7cff;
+  border: none;
+  border-radius: 0 0 4px 0; // 只圆右下角，贴边更自然
+  cursor: pointer;
+  transition: background 0.15s;
+
+  &:hover {
+    background: #3d6ae8;
+  }
+}
+
+.block-frame {
+  flex: 1;
+  width: 100%;
+  border: none;
+}
+
+.block-media {
+  max-width: 100%;
+  max-height: 100%;
+  margin: auto;
+  object-fit: contain;
+}
+
+.block-audio {
+  margin: auto;
+  width: 90%;
+}
+
+.block-text,
+.block-hint {
+  padding: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  width: 100%;
+}
+
+.block-hint {
+  color: #999;
+  text-align: center;
+  margin: auto;
+}
+
+// 分块之间 / 左右两栏之间的分隔线
+.block-splitter {
+  flex: none;
+  background: transparent;
+  transition: background 0.15s;
+
+  &:hover { background: #4f7cff; }
+}
+
+.split.column > .block-splitter { height: 8px; cursor: row-resize; }
+.split.row > .block-splitter { width: 8px; cursor: col-resize; }
+
+.field-row[hidden] {
+  display: none;
+}
+
+.splitter {
+  flex: none;
+  width: 6px;
+  cursor: col-resize;
+  background: #e8e8e8;
+  transition: background 0.15s;
+
+  &:hover { background: #4f7cff; }
+}
