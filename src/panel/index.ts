@@ -6,6 +6,9 @@ import {
   detectUrlType, proxyUrl, resolveImageUrl, isFramebuster, installProxyFallback,
 } from '../shared/common';
 import { createAnnotatorUI, FIELD_DRAG_TYPE } from '../shared/annotator-ui';
+import { setupModeSwitch } from '../shared/mode-switch';
+import { setupZoom } from '../shared/zoom';
+import { describedError } from '../shared/errors';
 import { autosizeTextarea, trackManualResize, installLineSelectAll } from '../shared/textarea';
 import type { HostMessage, PanelCommand, SnapshotMessage } from '../shared/bridge';
 
@@ -32,12 +35,15 @@ const ui = createAnnotatorUI({
   onNavigate: (index) => send({ type: 'navigate', index }),
   onRefresh: () => send({ type: 'refresh' }),
   saveRecord: (recordId, values) => new Promise<void>((resolve, reject) => {
-    if (!opener) return reject(new Error('未连接到侧边栏'));
+    if (!opener) return reject(describedError('未连接到侧边栏：请回到多维表格侧边栏确认插件仍在运行（或重新点击 ⧉ 打开面板）'));
     const id = ++saveSeq;
     pendingSaves.set(id, { resolve, reject });
     send({ type: 'save', id, recordId, fields: values });
   }),
 });
+
+setupModeSwitch(ui.saveIfModified);
+document.getElementById('autoContent')!.innerHTML = '<div class="empty-state"><p>自动刷写请在多维表格侧边栏里使用</p></div>';
 
 window.addEventListener('message', (e) => {
   if (e.origin !== location.origin || e.source !== opener || !e.data) return;
@@ -46,7 +52,7 @@ window.addEventListener('message', (e) => {
   if (msg.type === 'ack') {
     const p = pendingSaves.get(msg.id);
     pendingSaves.delete(msg.id);
-    if (p) msg.ok ? p.resolve() : p.reject(new Error(msg.error || '保存失败'));
+    if (p) msg.ok ? p.resolve() : p.reject(describedError(msg.error || '保存失败，原因未知，请稍后重试'));
     return;
   }
   if (msg.type === 'snapshot') {
@@ -88,9 +94,9 @@ type Zone = 'left' | 'right' | 'top' | 'bottom';
 
 const LAYOUT_KEY = 'annotator-panel-layout-v2';
 const WIDTH_KEY = 'annotator-panel-width';
-const ZOOM_KEY = 'annotator-panel-zoom';
+const ZOOM_KEY = 'annotator-panel-zoom-v4'; // 之前的版本会把默认值也自动存下来，换个 key 让它们失效
 const BLOCK_DRAG_TYPE = 'application/x-annotator-block';
-// 左侧块标题栏里多行字段值的高度上限：窗口高度的比例。标题栏撑得越高，下面的渲染区越小，所以比右侧标注栏（50%）收得更紧
+// 左侧块标题栏里多行字段值的高度上限：窗口高度的比例。标题栏撑得越高，下面的渲染区越小，所以比右侧编辑区（50%）收得更紧
 const BLOCK_VALUE_MAX_RATIO = 0.3;
 
 function validNode(n: any): boolean {
@@ -312,7 +318,7 @@ function updateBlock(leaf: Leaf) {
 
   // 标题栏：字段名 | 字段值（左右结构，悬停看全文）。
   // 值里没有换行 → 单行输入框（过长用省略号）；有换行 → 多行输入框，保留换行。都只读，可选中复制。
-  // 多行框与右侧标注栏同一套规则：每行不折行（横向滚动）、高度随内容撑开、Ctrl+A 分两步；上限更紧（BLOCK_VALUE_MAX_RATIO）
+  // 多行框与右侧编辑区同一套规则：每行不折行（横向滚动）、高度随内容撑开、Ctrl+A 分两步；上限更紧（BLOCK_VALUE_MAX_RATIO）
   const valueInput = el.querySelector('input.block-value') as HTMLInputElement;
   const valueArea = el.querySelector('textarea.block-value') as HTMLTextAreaElement;
   const multiline = text.includes('\n');
@@ -385,7 +391,7 @@ function createBlockEl(leaf: Leaf): HTMLElement {
       <input class="block-value" readonly placeholder="（空）" />
       <textarea class="block-value block-value-multi" rows="2" wrap="off" readonly hidden></textarea>
       <a class="block-open" target="_blank" rel="noopener noreferrer" title="在新窗口打开">↗</a>
-      <button class="block-close" title="移除该分块（字段回到右侧标注栏）">✕</button>
+      <button class="block-close" title="移除该分块（字段回到右侧编辑区）">✕</button>
     </div><div class="block-body"></div>`;
   bodyObserver.observe(el.querySelector('.block-body') as HTMLElement);
   const area = el.querySelector('textarea.block-value') as HTMLTextAreaElement;
@@ -446,11 +452,11 @@ function renderBlocks() {
     removeViewer(id);
   }
   if (!root) {
-    blocksEl.innerHTML = '<div class="blocks-empty"><div class="blocks-empty-title">← 把右侧标注栏里的字段名拖到这里</div><div class="blocks-empty-sub">可拖入多个字段，拖到已有分块的边缘即可上下左右分屏</div></div>';
+    blocksEl.innerHTML = '<div class="blocks-empty"><div class="blocks-empty-title">← 把右侧编辑区里的字段名拖到这里</div><div class="blocks-empty-sub">可拖入多个字段，拖到已有分块的边缘即可上下左右分屏</div></div>';
   } else {
     blocksEl.appendChild(buildNode(root));
   }
-  // 已在左侧展示的字段，右侧标注栏不再显示；移除分块后自动回到右侧
+  // 已在左侧展示的字段，右侧编辑区不再显示；移除分块后自动回到右侧
   ui.setHiddenFields(new Set(all.map(l => l.fieldId)));
   updateBlocks();
 }
@@ -623,12 +629,4 @@ splitter.addEventListener('mousedown', (e) => {
   document.addEventListener('mouseup', up);
 });
 
-let zoom = parseFloat(localStorage.getItem(ZOOM_KEY) || '') || 0.85;
-function setZoom(z: number) {
-  zoom = Math.min(1.2, Math.max(0.6, Math.round(z * 100) / 100));
-  layoutEl.style.setProperty('--ann-zoom', String(zoom));
-  localStorage.setItem(ZOOM_KEY, String(zoom));
-}
-setZoom(zoom);
-document.getElementById('zoomOutBtn')!.addEventListener('click', () => setZoom(zoom - 0.05));
-document.getElementById('zoomInBtn')!.addEventListener('click', () => setZoom(zoom + 0.05));
+setupZoom(layoutEl, ZOOM_KEY, 0.85);

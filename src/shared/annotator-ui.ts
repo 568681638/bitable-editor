@@ -3,6 +3,7 @@ import {
   cleanUrl, segmentsToText, findUrlInSegments, extractUrlFromValue, hasNewlines,
   isUrl, esc, detectUrlType, renderUrlPreview,
 } from './common';
+import { describeError } from './errors';
 import { autosizeTextarea, trackManualResize, installLineSelectAll } from './textarea';
 
 const READONLY_TYPES = new Set([
@@ -31,7 +32,7 @@ export interface ShowRecordArgs {
   total: number;
 }
 
-// 标注面板（页头导航 + 字段编辑 + 保存/撤销）。
+// 编辑区（页头导航 + 字段编辑 + 保存/撤销）。
 // 依赖页面里已有的 #recordContent / #prevBtn / #nextBtn / #recordJump / #totalCount /
 // #saveBtn / #undoBtn / #refreshBtn；数据读写全部交给 options 里的回调。
 export function createAnnotatorUI(opts: AnnotatorOptions) {
@@ -436,7 +437,7 @@ export function createAnnotatorUI(opts: AnnotatorOptions) {
       modifiedFields = {};
     } catch (error) {
       console.error('保存失败:', error);
-      alert('保存失败: ' + (error instanceof Error ? error.message : '未知错误'));
+      alert('保存失败：' + describeError(error, 'write'));
     } finally {
       isSaving = false;
       saveBtn.textContent = '保存';

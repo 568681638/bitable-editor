@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>多维表格标注器 · 双栏面板</title>
+  <title>bitable-editor · 双栏面板</title>
 </head>
 <body class="panel-page">
   <div class="panel-layout">
@@ -15,9 +15,9 @@
     <div id="splitter" class="splitter" title="拖动调整左右宽度"></div>
     <div id="app">
       <div class="header">
-        <h3>多维表格标注器</h3>
+        <h3>bitable-editor</h3>
         <div class="header-actions">
-          <a id="helpLink" class="refresh-btn help-link" href="https://zyt.feishu.cn/wiki/OwMPw0mzciAyuskIqUFcsdmSnsE" target="_blank" rel="noopener noreferrer" title="使用教程">?</a>
+          <a id="helpLink" class="refresh-btn help-link" href="https://zyt.feishu.cn/wiki/BcnjwJ86BiTQJokiwHXcvi3Gnwd" target="_blank" rel="noopener noreferrer" title="使用教程">?</a>
           <button id="refreshBtn" class="refresh-btn" title="刷新视图记录列表">↻</button>
         </div>
         <div class="nav-controls">
@@ -30,10 +30,15 @@
       <div id="recordContent" class="content">
         <div class="loading">加载中...</div>
       </div>
+      <div id="autoContent" class="content auto-content"></div>
       <div class="footer">
+        <div class="mode-switch">
+          <button class="mode-btn active" data-mode="manual">人工编辑</button>
+          <button class="mode-btn" data-mode="auto">自动刷写</button>
+        </div>
         <div class="zoom-ctrl">
-          <button id="zoomOutBtn" class="zoom-btn" title="缩小标注栏字号">A−</button>
-          <button id="zoomInBtn" class="zoom-btn" title="放大标注栏字号">A＋</button>
+          <button id="zoomOutBtn" class="zoom-btn" title="缩小编辑区字号">A−</button>
+          <button id="zoomInBtn" class="zoom-btn" title="放大编辑区字号">A＋</button>
         </div>
         <button id="undoBtn" class="undo-btn" disabled>撤销</button>
         <button id="saveBtn" class="save-btn" disabled>保存</button>

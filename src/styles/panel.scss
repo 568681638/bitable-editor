@@ -41,26 +41,6 @@ body.dragging-field .viewer-item {
   background: #eef0f4;
 }
 
-.zoom-ctrl {
-  margin-right: auto;
-  display: flex;
-  gap: 4px;
-}
-
-.zoom-btn {
-  padding: 4px 8px;
-  background: #fff;
-  border: 1px solid #d9d9d9;
-  border-radius: 4px;
-  cursor: pointer;
-  font-size: 12px;
-
-  &:hover {
-    border-color: #4f7cff;
-    color: #4f7cff;
-  }
-}
-
 .conn-banner {
   padding: 6px 12px;
   background: #fff7e6;
@@ -189,7 +169,7 @@ body.dragging-field .viewer-item {
   font-family: inherit;
   line-height: 1.5;
   resize: vertical;
-  // 与右侧标注栏一致：每行不折行，过长时横向滚动（高度随内容撑开，见 shared/textarea.ts）
+  // 与右侧编辑区一致：每行不折行，过长时横向滚动（高度随内容撑开，见 shared/textarea.ts）
   white-space: pre;
   overflow-wrap: normal;
   overflow-x: auto;
@@ -257,7 +237,7 @@ body.dragging-field .viewer-item {
   min-height: 0;
 }
 
-// 全屏：铺满整个浏览器窗口，盖住右侧标注栏。只改样式不挪 DOM，iframe 不会重新加载；
+// 全屏：铺满整个浏览器窗口，盖住右侧编辑区。只改样式不挪 DOM，iframe 不会重新加载；
 // !important 用来盖过 positionViewers 写在行内的位置，退出后行内位置仍是最新的
 .viewer-item.fullscreen {
   position: fixed !important;

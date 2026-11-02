@@ -137,7 +137,7 @@ body {
 .content {
   flex: 1;
   overflow-y: auto;
-  padding: 16px 20px;
+  padding: 10px 8px; // 与自动刷写区一致
 }
 
 .loading {
@@ -149,17 +149,19 @@ body {
 .record-fields {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 8px;
 }
 
 .field-row {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 12px;
-  background: #fafafa;
-  border-radius: 8px;
-  border: 1px solid #e8e8e8;
+  gap: 2px;
+  padding: 6px 10px;
+  // 外框与自动刷写区的卡片（.af-sec）保持一致：白底、同样的边框色、圆角和阴影
+  background: #fff;
+  border-radius: 6px;
+  border: 1px solid #e3e7ef;
+  box-shadow: 0 1px 3px rgba(31, 45, 61, 0.05);
 }
 
 .field-row:hover {
@@ -173,9 +175,9 @@ body {
 }
 
 .field-value {
-  font-size: 14px;
+  font-size: 13px;
   color: #333;
-  min-height: 24px;
+  min-height: 22px;
 }
 
 .field-value input,
@@ -183,10 +185,10 @@ body {
 .field-value select {
   font-family: inherit; // 各类控件统一用页面字体（textarea 默认等宽、input 默认 Arial，同一栏里会不一致）
   width: 100%;
-  padding: 6px 10px;
+  padding: 4px 8px;
   border: 1px solid #d9d9d9;
   border-radius: 4px;
-  font-size: 14px;
+  font-size: 13px;
   outline: none;
   transition: border-color 0.2s;
   background: #fff;
@@ -263,6 +265,8 @@ body {
 }
 
 .footer {
+  flex-wrap: wrap;
+  gap: 8px;
   padding: 16px 20px;
   border-top: 1px solid #e8e8e8;
   background: #fafafa;
@@ -304,7 +308,6 @@ body {
   cursor: pointer;
   font-size: 14px;
   font-weight: 500;
-  margin-right: 8px;
   transition: background 0.2s;
 }
 
@@ -334,3 +337,381 @@ body {
   border-radius: 4px;
   margin-bottom: 16px;
 }
+
+// 底部左侧的 [ 人工编辑 | 自动刷写 ] 切换
+.mode-switch {
+  display: flex;
+}
+
+.mode-btn {
+  padding: 6px 12px;
+  background: #fff;
+  border: 1px solid #d9d9d9;
+  color: #333;
+  cursor: pointer;
+  font-size: 13px;
+  white-space: nowrap;
+
+  &:first-child { border-radius: 4px 0 0 4px; }
+  &:last-child { border-radius: 0 4px 4px 0; margin-left: -1px; }
+
+  &.active {
+    background: #4f7cff;
+    border-color: #4f7cff;
+    color: #fff;
+    position: relative;
+  }
+}
+
+.auto-content {
+  display: none;
+  padding: 10px 8px; // 比人工编辑的内容区更紧凑，给卡片多留点宽度
+}
+
+// 自动刷写模式：隐藏人工编辑的导航、内容和撤销/保存，保留切换条和字号按钮
+#app.mode-auto {
+  .nav-controls,
+  #recordContent,
+  .undo-btn,
+  .save-btn { display: none; }
+
+  .run-btn,
+  .filter-btn { display: inline-block; }
+
+  .auto-content { display: block; }
+}
+
+// 字号按钮：切换条后面紧跟，剩余空间由它推开撤销/保存
+.zoom-ctrl {
+  margin-left: 4px;
+  margin-right: auto;
+  display: flex;
+  gap: 4px;
+}
+
+.zoom-btn {
+  padding: 4px 8px;
+  background: #fff;
+  border: 1px solid #d9d9d9;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+
+  &:hover {
+    border-color: #4f7cff;
+    color: #4f7cff;
+  }
+}
+
+// 侧边栏：整体缩放，宽高按缩放反算，视觉上仍铺满（面板页自己有 .panel-layout #app 的规则）
+body.sidebar-zoom #app {
+  zoom: var(--ann-zoom, 1);
+  width: calc(100vw / var(--ann-zoom, 1));
+  height: calc(100vh / var(--ann-zoom, 1));
+  max-width: none;
+  margin: 0;
+}
+
+// ── 自动刷写面板 ──────────────────────────────────
+// 筛选 / 输入 / 输出三个板块：各自包成一张卡片，标题放在卡片里面，一眼能分清各块
+.af-sec {
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  background: #fff;
+  border: 1px solid #e3e7ef;
+  border-radius: 6px;
+  box-shadow: 0 1px 3px rgba(31, 45, 61, 0.05);
+
+  h4 {
+    font-size: 13px;
+    margin: 0 0 6px;
+    padding-bottom: 5px;
+    border-bottom: 1px solid #f0f2f5;
+    color: #333;
+  }
+}
+
+.af-group {
+  padding: 8px;
+  border: 1px solid #dfe3ea;
+  border-left: 3px solid #4f7cff;
+  border-radius: 4px;
+  background: #fafbfd;
+
+  .af-group { margin-top: 6px; background: #fff; }
+}
+
+.af-group-head,
+.af-group-add,
+.af-cond,
+.af-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.af-children { margin: 6px 0; display: flex; flex-direction: column; gap: 6px; }
+.af-neg { font-size: 12px; display: flex; align-items: center; gap: 3px; white-space: nowrap; }
+
+.af-row { margin-bottom: 6px; }
+.af-arrow { color: #999; }
+
+.af-sec select,
+.af-sec textarea,
+.af-sec input[type="text"] {
+  padding: 5px 6px;
+  border: 1px solid #d9d9d9;
+  border-radius: 4px;
+  font-size: 13px;
+  background: #fff;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.af-cond input[type="text"],
+.af-cond textarea { flex: 1; min-width: 80px; }
+.af-cond textarea { resize: vertical; font-family: inherit; }
+.af-row select { flex: 1; min-width: 100px; }
+
+.af-add {
+  padding: 4px 10px;
+  background: #fff;
+  border: 1px dashed #4f7cff;
+  border-radius: 4px;
+  color: #4f7cff;
+  cursor: pointer;
+  font-size: 12px;
+
+  &:hover { background: #f0f4ff; }
+}
+
+.af-x {
+  padding: 0 6px;
+  background: none;
+  border: none;
+  color: #999;
+  cursor: pointer;
+  font-size: 16px;
+
+  &:hover { color: #ff4d4f; }
+}
+
+.af-lock { font-size: 12px; color: #d46b08; white-space: nowrap; }
+
+.af-run { display: flex; align-items: center; gap: 8px; }
+
+.af-btn {
+  padding: 8px 24px;
+  background: #4f7cff;
+  border: none;
+  border-radius: 4px;
+  color: #fff;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 500;
+
+  &:hover { background: #3d6ae8; }
+  &.af-cancel { background: #ff4d4f; }
+}
+
+.af-status {
+  font-size: 13px;
+  color: #555;
+  line-height: 1.6;
+  word-break: break-all;
+
+  &.error { color: #ff4d4f; }
+  &.ok { color: #389e0d; }
+}
+
+.af-hint { padding: 24px 0; text-align: center; color: #999; &.af-err { color: #ff4d4f; } }
+
+.af-seps {
+  flex-basis: 100%;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  font-size: 12px;
+  color: #666;
+
+  label { display: flex; align-items: center; gap: 3px; cursor: pointer; white-space: nowrap; }
+}
+
+.af-seps .af-sep-custom { width: 56px; padding: 2px 4px; font-size: 12px; }
+
+// 失败明细
+.af-fail {
+  margin-top: 10px;
+  font-size: 13px;
+
+  summary { cursor: pointer; color: #ff4d4f; }
+}
+
+.af-fail-actions { margin: 8px 0; display: flex; gap: 6px; flex-wrap: wrap; }
+
+.af-fail-list {
+  max-height: 260px;
+  overflow-y: auto;
+  border: 1px solid #f0f0f0;
+  border-radius: 4px;
+  background: #fff;
+}
+
+.af-fail-item {
+  padding: 6px 8px;
+  border-bottom: 1px solid #f5f5f5;
+  color: #555;
+
+  .af-fail-id { color: #999; font-size: 12px; margin-left: 4px; }
+  .af-fail-err { color: #ff4d4f; word-break: break-all; }
+}
+
+// 自动刷写的“刷写 / 取消”按钮：放在底部右侧，只在自动刷写模式显示
+.run-btn {
+  display: none;
+  padding: 8px 24px;
+  background: #4f7cff;
+  border: none;
+  border-radius: 4px;
+  color: #fff;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 500;
+  transition: background 0.2s;
+
+  &:hover:not(:disabled) { background: #3d6ae8; }
+  &:disabled { background: #ccc; cursor: not-allowed; }
+  &.cancel { background: #ff4d4f; }
+}
+
+.af-h {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap; // 侧边栏很窄时，按钮整体换到下一行
+  gap: 6px;
+}
+
+// 筛选按钮（只算命中数，不刷写）：和“刷写”并排，样式保持一致
+.filter-btn {
+  display: none;
+  padding: 8px 24px;
+  background: #4f7cff;
+  border: none;
+  border-radius: 4px;
+  color: #fff;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 500;
+  transition: background 0.2s;
+
+  &:hover:not(:disabled) { background: #3d6ae8; }
+  &:disabled { background: #ccc; cursor: not-allowed; }
+}
+
+.af-count {
+  margin-left: 6px;
+  font-size: 12px;
+  font-weight: 400;
+  color: #389e0d;
+
+  &.stale { color: #d46b08; }
+}
+
+// 条件组的 × 放在组头部右上角：带底色和边框，比条件行里的无框 × 更重一点，用来区分；和“取反”隔开，不易误点
+.af-x-group {
+  margin-left: auto;
+  padding: 0 7px;
+  line-height: 20px;
+  background: #f0f0f0;
+  border: 1px solid #d9d9d9;
+  border-radius: 4px;
+  color: #666;
+
+  &:hover { background: #fff1f0; border-color: #ffa39e; color: #ff4d4f; }
+}
+
+.af-h-actions { display: flex; gap: 6px; }
+
+// 筛选结果预览（悬浮窗口，挂在 body 上）
+.af-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.af-modal-box {
+  display: flex;
+  flex-direction: column;
+  width: 96vw;
+  max-height: 88vh;
+  background: #fff;
+  border-radius: 6px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.3);
+  overflow: hidden;
+}
+
+.af-modal-head,
+.af-modal-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 14px;
+  font-size: 13px;
+  background: #fafafa;
+}
+
+.af-modal-head { border-bottom: 1px solid #e8e8e8; font-weight: 500; }
+.af-modal-foot { border-top: 1px solid #e8e8e8; color: #666; }
+.af-modal-body { flex: 1; overflow: auto; }
+
+.af-table {
+  border-collapse: collapse;
+  font-size: 12px;
+
+  th, td {
+    padding: 5px 10px;
+    border: 1px solid #eee;
+    max-width: 260px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-align: left;
+  }
+
+  th { position: sticky; top: 0; background: #f5f7fa; z-index: 1; }
+  td:first-child, th:first-child { color: #999; text-align: right; }
+  tbody tr:hover { background: #f0f4ff; }
+}
+
+// 筛选条件的导入 / 导出：低频操作，右下角灰色小字链接
+.af-filter-io {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: #bbb;
+}
+
+.af-link {
+  padding: 0;
+  background: none;
+  border: none;
+  color: #999;
+  cursor: pointer;
+  font-size: 12px;
+
+  &:hover:not(:disabled) { color: #4f7cff; text-decoration: underline; }
+  &:disabled { color: #ccc; cursor: not-allowed; }
+}
+
+.af-modal-actions { display: flex; gap: 6px; }

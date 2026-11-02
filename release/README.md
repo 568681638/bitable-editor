@@ -9,13 +9,44 @@ release/
 │   ├── deploy.sh     一键部署脚本
 │   └── supervisor.conf   supervisord 程序配置模板
 ├── server/
-│   └── server.mjs    生产服务：托管 dist/ + /api-proxy/ 通用代理
+│   ├── server.mjs    生产服务：托管 dist/ + /api-proxy/ 通用代理 + /api/functions 自动刷写函数接口
+│   └── functions/    自动刷写函数：.mjs（见 _template.mjs）或 .py（见 _template.py），热加载
 └── dist/             前端构建产物（npm run build 生成，不入库，要自己带过去）
 ```
 
 本项目部署在 **阿里云 PAI DSW 容器**中，PID 1 是 `/etc/dsw/bin/entrypoint`，进程管理用的是 `supervisord`（不是 systemd，`systemctl` / `pm2 startup` 都不能用）。
 
 > **服务端必须兼容 Node 14**（DSW 自带的是 14.x）：`server/server.mjs` 里不要用 `??=` / `||=` / `replaceAll` / `.at()` 等较新的写法，本机新版 Node 能跑不代表 DSW 上能跑。
+
+---
+
+## 扩充自动刷写函数（不用重启）
+
+**完整的扩展规则见 [`server/functions/README.md`](server/functions/README.md)**（函数定义、批量约定、出参格式、环境变量、本地测试），下面是摘要。
+
+在服务器的 `release/server/functions/` 下新增或修改 `.mjs` 文件即可，服务每次收到请求都会重新扫描目录：新增、修改、删除立即生效；以 `_` 开头的文件被忽略；某个文件语法错误只会在日志里报错，不影响其他函数。写法见 `functions/_template.mjs`。前端切到“自动刷写”面板时会重新读取函数列表（也可点面板里的 `↻ 函数`）。
+
+**批量计算**：所有函数（JS 和 Python）统一是批量接口，`run(rows)` 一次拿到一批行（面板每批 100 行），返回与 `rows` 等长、顺序一致的结果数组，方便把查询、模型推理合并成一次请求。某一行算不出来，就在对应位置返回一个 Error 对象（JS 的 `new Error('原因')` / Python 的 `ValueError('原因')`），只让这一行失败；某个出参这一行没有值、不想覆盖字段，就把它设为 `None` / `null`（该字段保留原值）；`run` 里直接抛异常则整批失败、刷写中断。
+
+**出参值怎么对应字段类型**：函数返回的值要直接是该字段类型在多维表格里的原生形态，面板不做宽松转换（不解析日期字符串、不拆分隔符），类型不对只会让这一行失败，原因写在失败明细里。
+
+| 目标字段类型 | 函数返回 |
+| --- | --- |
+| 文本 | 字符串（数字也行） |
+| 数字 / 货币 / 进度 / 评分 | 数字 |
+| 单选 | 选项名（字符串）。选项必须已存在，不会自动新增 |
+| 多选 | 选项名数组，如 `["紧急", "普通"]` |
+| 日期 | 毫秒时间戳（数字） |
+| 复选框 | `true` / `false` |
+| 电话 / 邮箱 | 字符串 |
+| 超链接 | 链接字符串，或 `{"link": "...", "text": "..."}` |
+| 人员 | 人员数组 `[{"id": "..."}]` |
+
+公式、附件、关联、地理位置、群组、自动编号等暂不支持写入，选了会在刷写前被拦住。
+
+**Python 函数**：直接把 `.py` 文件放进同一个目录，写法见 `functions/_template.py`（一个 `META` 加一个 `run(rows)`）。服务用系统的 `python3` 执行（可用环境变量 `PYTHON_BIN` 指定其他解释器），`functions/_python_executor.py` 是执行器，不要删。数据通过临时目录里的 JSON 文件传给 Python 和取回结果，不经过命令行参数和管道，没有大小限制，用完自动清理；每批启动一次 Python 进程，函数里 `print` 的内容进服务日志。
+
+注意：热加载只针对 `functions/` 下的文件本身，函数文件 `import` 的其他模块改了仍需重启服务。
 
 ---
 

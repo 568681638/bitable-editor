@@ -2,12 +2,17 @@ import { bitable, WidgetBaseEvent } from '@lark-base-open/js-sdk';
 import '../styles/annotator.scss';
 import { FType, FieldMeta, FieldOption, RecordData, installProxyFallback } from '../shared/common';
 import { createAnnotatorUI } from '../shared/annotator-ui';
+import { setupModeSwitch } from '../shared/mode-switch';
+import { setupZoom } from '../shared/zoom';
+import { describeError } from '../shared/errors';
+import { createAutoFlush } from '../shared/auto-flush';
 import type { MessageStatus, PanelCommand, SnapshotMessage, AckMessage, PongMessage } from '../shared/bridge';
 
 // ── 全局状态 ──────────────────────────────────────
 let currentTable: any = null;
 let currentView: any = null;
-let fields: FieldMeta[] = [];
+let fields: FieldMeta[] = []; // 当前视图可见的字段（人工编辑、预览 / 导出的列）
+let tableFields: FieldMeta[] = []; // 数据表的全部字段，含视图里隐藏的（自动刷写选字段用）
 // 记录按需分批加载：先只取视图里全部记录 ID（顺序与视图一致，总数 = ID 数），
 // 记录内容按 BLOCK_SIZE 一块块取，缓存在 recordCache 里
 const BLOCK_SIZE = 40;
@@ -32,12 +37,53 @@ installProxyFallback();
 const ui = createAnnotatorUI({
   urlPreview: true,
   onNavigate: (index) => { show(index, true); },
-  onRefresh: () => { refreshRecords(); },
+  onRefresh: () => {
+    refreshRecords();
+    // 顶部 ↻ 在自动刷写面板里时，顺带重新读取后端函数列表
+    if (autoMode) autoFlush.show();
+  },
   saveRecord: async (recordId, values) => {
     await persistRecord(recordId, values);
     publish();
   },
 });
+
+const autoFlush = createAutoFlush(document.getElementById('autoContent') as HTMLElement, {
+  getFields: () => fields,
+  getAllFields: () => tableFields,
+  getFieldOptions: async (fieldId) => {
+    // 每次都重新取，保证选项是最新的（别人可能刚改过）
+    const ff = await currentTable.getFieldById(fieldId);
+    const options = (await ff.getOptions()) as FieldOption[];
+    fieldOptionsCache[fieldId] = options;
+    return options;
+  },
+  getTableId: () => currentTableId,
+  loadAllRecords: async (onProgress) => {
+    const ids = recordIds.slice();
+    const all: RecordData[] = [];
+    const STEP = 200;
+    for (let i = 0; i < ids.length; i += STEP) {
+      all.push(...await withTimeout(fetchRecords(ids.slice(i, i + STEP)), '读取记录'));
+      onProgress(Math.min(i + STEP, ids.length), ids.length);
+    }
+    return all;
+  },
+  writeRecords: async (items) => {
+    await currentTable.setRecords(items.map(i => ({ recordId: i.recordId, fields: i.fields })));
+    for (const item of items) {
+      const record = recordCache.get(item.recordId);
+      if (record) Object.assign(record.fields, item.fields);
+    }
+    sync();
+  },
+}, document.getElementById('runBtn') as HTMLButtonElement, document.getElementById('filterBtn') as HTMLButtonElement);
+let autoMode = false;
+// 视图/字段变化（刷新、切换表格视图）后，自动刷写面板要重画，字段下拉才会同步
+const refreshAutoFlush = () => { if (autoMode) autoFlush.rerender(); };
+setupModeSwitch(ui.saveIfModified, (mode) => { autoMode = mode === 'auto'; if (autoMode) autoFlush.show(); });
+document.body.classList.add('sidebar-zoom');
+setupZoom(document.documentElement, 'annotator-sidebar-zoom-v2', 1);
 
 function currentRecord(): RecordData | undefined {
   return recordCache.get(recordIds[currentIndex]);
@@ -112,7 +158,7 @@ function ensureBlock(block: number): Promise<void> {
       .then((list) => { if (gen === loadGen) list.forEach(r => recordCache.set(r.recordId, r)); })
       .catch((error) => {
         console.error('加载记录失败:', error);
-        lastLoadError = error instanceof Error ? error.message : String(error);
+        lastLoadError = describeError(error, 'read');
         if (gen === loadGen) blockPromises.delete(block); // 允许之后重试
       })
       .finally(() => { if (gen === loadGen) loadingBlocks.delete(block); });
@@ -214,7 +260,7 @@ window.addEventListener('message', async (e) => {
         postToPanel({ type: 'ack', id: cmd.id, ok: true });
         sync();
       } catch (error) {
-        postToPanel({ type: 'ack', id: cmd.id, ok: false, error: error instanceof Error ? error.message : '未知错误' });
+        postToPanel({ type: 'ack', id: cmd.id, ok: false, error: describeError(error, 'write') });
       }
       break;
   }
@@ -258,6 +304,7 @@ async function refreshRecords() {
   try {
     // 1. 重新获取字段元数据（覆盖新增/删除/重命名的字段）
     const allFields: FieldMeta[] = await currentTable.getFieldMetaList();
+    tableFields = allFields;
     const fieldMap = new Map<string, FieldMeta>();
     allFields.forEach(f => fieldMap.set(f.id, f));
 
@@ -280,8 +327,10 @@ async function refreshRecords() {
     const kept = ids.indexOf(prevRecordId);
     currentIndex = kept >= 0 ? kept : Math.min(currentIndex, Math.max(0, ids.length - 1));
     await showLoaded();
+    refreshAutoFlush();
   } catch (e) {
     console.error('刷新失败', e);
+    alert('刷新失败：' + describeError(e, 'read'));
   }
 }
 
@@ -332,6 +381,7 @@ async function init() {
     currentTable = await bitable.base.getTableById(sel.tableId);
     currentTableId = sel.tableId;
     const allFields: FieldMeta[] = await currentTable.getFieldMetaList();
+    tableFields = allFields;
 
     const views = await currentTable.getViewMetaList();
     let viewId = sel.viewId;
@@ -367,9 +417,10 @@ async function init() {
       if (idx >= 0) currentIndex = idx;
     }
     await showLoaded();
+    refreshAutoFlush();
   } catch (error) {
     console.error('初始化失败:', error);
-    setStatus('error', error instanceof Error ? error.message : '未知错误');
+    setStatus('error', describeError(error, 'read') + '。可点击右上角 ↻ 刷新重试');
   }
 }
 

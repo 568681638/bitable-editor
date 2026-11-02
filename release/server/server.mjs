@@ -8,6 +8,10 @@ import { join, extname, sep } from 'path';
 import { fileURLToPath } from 'url';
 import https from 'https';
 import { URL } from 'url';
+import { readdir, mkdtemp, writeFile, unlink, rmdir } from 'fs/promises';
+import { tmpdir } from 'os';
+import { spawn } from 'child_process';
+import { pathToFileURL } from 'url';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = join(__dirname, '..', 'dist');
@@ -176,6 +180,162 @@ async function sendStatic(req, res, filePath) {
   res.end(req.method === 'HEAD' ? undefined : body);
 }
 
+// ── 函数注册表：热加载 functions/*.mjs 和 functions/*.py ─────────────
+// 每次请求都扫一遍目录，新增/修改/删除文件立即生效，不用重启服务。
+// 以 _ 开头的文件被忽略；某个文件加载失败只在日志里报错，不影响其他函数。
+const FUNCTIONS_DIR = join(__dirname, 'functions');
+const fnFileCache = new Map(); // 文件名 → { mtimeMs, defs }
+
+function validDef(d) {
+  const okParams = (list) => Array.isArray(list) && list.every(p => p && typeof p.name === 'string' && p.name);
+  return d && typeof d.id === 'string' && d.id && typeof d.name === 'string' && typeof d.run === 'function'
+    && okParams(d.inputs) && okParams(d.outputs);
+}
+
+// ── Python 函数：由 functions/_python_executor.py 加载 .py 并执行，一批行启动一次进程 ──
+// 数据经临时目录里的 JSON 文件传递（不走命令行参数和管道），数据量不受限制
+const PYTHON_BIN = process.env.PYTHON_BIN || (process.platform === 'win32' ? 'python' : 'python3');
+const PY_EXECUTOR = join(FUNCTIONS_DIR, '_python_executor.py');
+const PY_META_TIMEOUT = 15000;
+const PY_RUN_TIMEOUT = Number(process.env.PY_RUN_TIMEOUT_MS) || 300000; // 单批执行的超时，可用环境变量调大
+
+async function runPython(file, mode, input, timeoutMs) {
+  const dir = await mkdtemp(join(tmpdir(), 'autoflush-'));
+  const inPath = join(dir, 'in.json');
+  const outPath = join(dir, 'out.json');
+  try {
+    await writeFile(inPath, JSON.stringify(input === undefined ? {} : input), 'utf8');
+    await new Promise((resolve, reject) => {
+      const child = spawn(PYTHON_BIN, [PY_EXECUTOR, file, mode, inPath, outPath], { env: { ...process.env, PYTHONIOENCODING: 'utf-8' } });
+      const err = [];
+      let done = false;
+      const finish = (fn, v) => { if (done) return; done = true; clearTimeout(timer); fn(v); };
+      const timer = setTimeout(() => { child.kill(); finish(reject, new Error('Python 执行超时')); }, timeoutMs);
+      child.stdout.on('data', () => {});
+      child.stderr.on('data', c => err.push(c));
+      child.on('error', e => finish(reject, new Error('无法启动 ' + PYTHON_BIN + '：' + e.message)));
+      child.on('close', (code) => {
+        const text = Buffer.concat(err).toString('utf8').trim();
+        if (text) console.error('[python] ' + text);
+        if (code !== 0) return finish(reject, new Error(text.split(String.fromCharCode(10)).pop() || '退出码 ' + code));
+        finish(resolve, text);
+      });
+    });
+    try { return JSON.parse(await readFile(outPath, 'utf8')); }
+    catch { throw new Error('Python 没有产出合法的结果文件'); }
+  } finally {
+    // 不用 fs.rm（Node 14.14 才有）：删文件再删目录
+    await unlink(inPath).catch(() => {});
+    await unlink(outPath).catch(() => {});
+    await rmdir(dir).catch(() => {});
+  }
+}
+
+async function loadPyDef(full) {
+  const meta = await runPython(full, 'meta', undefined, PY_META_TIMEOUT);
+  return [{
+    id: meta.id, name: meta.name, inputs: meta.inputs, outputs: meta.outputs,
+    // 与 JS 函数同形：返回与 rows 等长的数组，失败的行是 Error
+    async run(rows) {
+      const data = await runPython(full, 'run', { rows }, PY_RUN_TIMEOUT);
+      if (!data || !Array.isArray(data.results)) throw new Error('Python 返回格式不对');
+      return data.results.map(r => (r.ok ? r.outputs : new Error(r.error)));
+    },
+  }].filter(validDef);
+}
+
+async function loadFunctions() {
+  let files = [];
+  try { files = (await readdir(FUNCTIONS_DIR)).filter(f => (f.endsWith('.mjs') || f.endsWith('.py')) && !f.startsWith('_')).sort(); }
+  catch (e) { console.error('[functions] 读取目录失败:', e.message); }
+  const seen = new Set(files);
+  for (const name of fnFileCache.keys()) if (!seen.has(name)) fnFileCache.delete(name);
+
+  const all = [];
+  const ids = new Set();
+  for (const file of files) {
+    const full = join(FUNCTIONS_DIR, file);
+    try {
+      const st = await stat(full);
+      let entry = fnFileCache.get(file);
+      if (!entry || entry.mtimeMs !== st.mtimeMs) {
+        // 带上 mtime 做查询串，绕开 Node 的模块缓存，重新加载改过的文件
+        let defs;
+        if (file.endsWith('.py')) {
+          defs = await loadPyDef(full);
+        } else {
+          const mod = await import(pathToFileURL(full).href + '?v=' + st.mtimeMs);
+          defs = (Array.isArray(mod.default) ? mod.default : [mod.default]).filter(validDef);
+        }
+        entry = { mtimeMs: st.mtimeMs, defs };
+        fnFileCache.set(file, entry);
+        console.log('[functions] 已加载 ' + file + '：' + (defs.map(d => d.id).join(', ') || '（没有有效的函数定义）'));
+      }
+      for (const d of entry.defs) {
+        if (ids.has(d.id)) { console.error('[functions] 函数 id 重复，忽略 ' + file + ' 里的 ' + d.id); continue; }
+        ids.add(d.id);
+        all.push(d);
+      }
+    } catch (e) {
+      // 失败的文件不缓存 mtime，下次请求会重试；同时保留它上一次加载成功的版本
+      console.error('[functions] 加载 ' + file + ' 失败:', e.message);
+      const old = fnFileCache.get(file);
+      if (old) for (const d of old.defs) if (!ids.has(d.id)) { ids.add(d.id); all.push(d); }
+    }
+  }
+  return all;
+}
+
+// ── 自动刷写函数接口 ──────────────────────────────
+// GET  /api/functions          → [{ id, name, inputs, outputs }]
+// POST /api/functions/<id>/run  body { rows: [{...入参}] } → { results: [{ ok: true, outputs } | { ok: false, error }] }
+const MAX_BODY = 64 * 1024 * 1024;
+
+function sendJson(res, status, data) {
+  const body = JSON.stringify(data);
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+  res.end(body);
+}
+
+function readJson(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > MAX_BODY) { reject(new Error('Body too large')); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); } catch { reject(new Error('Bad JSON')); } });
+    req.on('error', reject);
+  });
+}
+
+async function handleFunctions(req, res, path) {
+  if (path === '/api/functions' && req.method === 'GET') {
+    const FUNCTIONS = await loadFunctions();
+    return sendJson(res, 200, FUNCTIONS.map(({ id, name, inputs, outputs }) => ({ id, name, inputs, outputs })));
+  }
+  const m = path.match(/^\/api\/functions\/([^/]+)\/run$/);
+  if (m && req.method === 'POST') {
+    const fn = (await loadFunctions()).find(f => f.id === decodeURIComponent(m[1]));
+    if (!fn) return sendJson(res, 404, { error: 'Unknown function' });
+    let body;
+    try { body = await readJson(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    if (!body || !Array.isArray(body.rows)) return sendJson(res, 400, { error: 'rows is required' });
+    // 批量计算：函数一次拿到全部 rows，返回与 rows 等长的数组；Error 项表示该行失败
+    let outs;
+    try { outs = await fn.run(body.rows.map(r => r || {})); }
+    catch (e) { return sendJson(res, 500, { error: e instanceof Error ? e.message : String(e) }); }
+    if (!Array.isArray(outs) || outs.length !== body.rows.length) {
+      return sendJson(res, 500, { error: '函数 ' + fn.id + ' 必须返回与 rows 等长的数组（收到 ' + body.rows.length + ' 行，返回 ' + (Array.isArray(outs) ? outs.length : typeof outs) + '）' });
+    }
+    const results = outs.map(o => (o instanceof Error ? { ok: false, error: o.message } : { ok: true, outputs: o || {} }));
+    return sendJson(res, 200, { results });
+  }
+  sendJson(res, 404, { error: 'Not found' });
+}
+
 const server = createServer((req, res) => {
   // 通用代理: /api-proxy/<encodeURIComponent(目标URL)>
   if (req.url.startsWith('/api-proxy/')) {
@@ -187,6 +347,10 @@ const server = createServer((req, res) => {
       res.writeHead(400);
       return res.end('Bad proxy URL');
     }
+  }
+
+  if (req.url.startsWith('/api/functions')) {
+    return handleFunctions(req, res, req.url.split('?')[0]).catch((e) => { if (!res.headersSent) sendJson(res, 500, { error: e.message }); });
   }
 
   // 静态文件
