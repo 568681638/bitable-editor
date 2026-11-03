@@ -80,7 +80,7 @@ bash /zyt_users/yuntong.li/server/bitable-annotator/release/deploy/deploy.sh
 
 1. 把 supervisor 程序配置装到 `/etc/supervisor/conf.d/`，交给容器内的 supervisord 托管（自动重启 + 集中日志）
 2. 在 `~/.prestart.d/` 里注册一个启动前钩子——DSW 每次容器启动、跑 supervisord 之前会 source 这个钩子，把配置重新装回易失的 rootfs
-3. 停掉旧进程，立即拉起服务，并**真正访问一次端口**确认可用；失败会打印 node 版本和日志
+3. 停掉旧进程（先让 supervisor 停掉自己管的那份，再按命令行匹配，最后**按端口兜底**：不管旧进程从哪个目录启动，只要是占着端口的 node 进程都会被清掉；占端口的不是 node 就报错退出，不误杀），立即拉起服务，并**真正访问一次端口**确认可用；失败会打印 node 版本和日志
 
 > 脚本可以**从任意目录直接调用**（不需要 `cd`）；也是**幂等**的，反复跑没副作用。
 

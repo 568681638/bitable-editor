@@ -91,6 +91,36 @@ echo "✓ 启动钩子已安装 → ${PRESTART_HOOK}"
 # 匹配本项目的服务进程：当前入口，以及历代旧入口（项目根目录的 server.mjs、server/server.mjs），
 # 这样从旧目录结构升级后的第一次部署也能停掉旧进程，不会端口冲突
 PATTERN="node .*(bitable-annotator|${PROJECT_DIR}).*server\\.mjs"
+
+# 找出正在监听 ${PORT} 的进程 PID（每行一个）。优先用 lsof / ss；容器里这两个都没有时，直接读 /proc
+pids_on_port() {
+    local pids="" hex inodes ino fd
+    if command -v lsof >/dev/null 2>&1; then
+        pids=$(lsof -t -iTCP:"${PORT}" -sTCP:LISTEN 2>/dev/null || true)
+    elif command -v ss >/dev/null 2>&1; then
+        pids=$(ss -ltnp "sport = :${PORT}" 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2 || true)
+    fi
+    if [ -z "${pids}" ]; then
+        hex=$(printf '%04X' "${PORT}")
+        # /proc/net/tcp 里状态 0A 是 LISTEN；第 2 列末尾是 ":端口(十六进制)"，第 10 列是 socket 的 inode
+        inodes=$(awk -v h=":${hex}" '$4 == "0A" && substr($2, length($2) - 4) == h { print $10 }' /proc/net/tcp /proc/net/tcp6 2>/dev/null || true)
+        for ino in ${inodes}; do
+            for fd in /proc/[0-9]*/fd/*; do
+                if [ "$(readlink "${fd}" 2>/dev/null || true)" = "socket:[${ino}]" ]; then
+                    pids="${pids} $(echo "${fd}" | cut -d/ -f3)"
+                fi
+            done
+        done
+    fi
+    echo "${pids}" | tr ' ' '\n' | grep -v '^$' | sort -u || true
+}
+
+# 1) 先让 supervisor 停掉自己管的这份（否则它会在我们杀掉进程后立刻拉起一个新的，和下面手动启动的抢端口）
+if command -v supervisorctl >/dev/null 2>&1; then
+    supervisorctl stop "${NAME}" >/dev/null 2>&1 || true
+fi
+
+# 2) 按命令行匹配本项目的服务进程（含历代旧入口）
 if pgrep -f "${PATTERN}" >/dev/null; then
     echo "→ 检测到旧进程，正在停止..."
     pkill -f "${PATTERN}" || true
@@ -100,6 +130,26 @@ if pgrep -f "${PATTERN}" >/dev/null; then
     done
     pgrep -f "${PATTERN}" >/dev/null && pkill -9 -f "${PATTERN}" || true
 fi
+
+# 3) 再按端口兜底：不管旧进程是从哪个目录启动的（旧目录结构、改过名的目录），只要占着端口就清掉。
+#    只处理 node 进程；占端口的是别的程序就报错退出，不去误杀
+for pid in $(pids_on_port); do
+    [ "${pid}" = "$$" ] && continue
+    cmd=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)
+    case "${cmd}" in
+        *node*) ;;
+        *) echo "✗ 端口 ${PORT} 被非 node 进程占用（pid=${pid}: ${cmd}），为安全起见不自动结束，请手动处理或换端口 (PORT=xxxx)"; exit 1 ;;
+    esac
+    echo "→ 端口 ${PORT} 被旧进程占用（pid=${pid}: ${cmd}），正在停止..."
+    kill "${pid}" 2>/dev/null || true
+done
+for _ in 1 2 3 4 5; do
+    [ -z "$(pids_on_port)" ] && break
+    sleep 1
+done
+for pid in $(pids_on_port); do
+    kill -9 "${pid}" 2>/dev/null || true
+done
 
 nohup env PORT="${PORT}" NODE_ENV=production \
     "${NODE_BIN}" "${ENTRY}" \
