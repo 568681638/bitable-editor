@@ -95,7 +95,8 @@ body.dragging-field .viewer-item {
   font-size: 13px;
 }
 
-.block {
+.block,
+.group {
   position: relative;
   min-width: 0;
   min-height: 0;
@@ -121,9 +122,168 @@ body.dragging-field .viewer-item {
   &.drop-right::after { display: block; top: 0; bottom: 0; right: 0; width: 50%; }
   &.drop-top::after { display: block; left: 0; right: 0; top: 0; height: 50%; }
   &.drop-bottom::after { display: block; left: 0; right: 0; bottom: 0; height: 50%; }
-  // 字段不存在的分块：虚线框；拖字段进来时整块高亮，表示替换而不是分块
+  // 字段不存在的字段块：虚线框；拖字段进来时整块高亮，表示替换而不是字段块
   &.pending { border-style: dashed; background: #fafafa; }
   &.drop-replace::after { display: block; inset: 0; }
+}
+
+// 组合块：最外层有一圈组合框（顶部是操作条），里面是任意排布的字段块；开了共用渲染区时组内只留标题栏，组底部是共用的渲染区
+.group {
+  border: 2px solid #8c9cff;
+  border-radius: 8px;
+  background: #f3f5ff;
+}
+
+.group-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 6px;
+  background: #e6eaff;
+  font-size: 12px;
+  user-select: none;
+}
+
+.group-handle {
+  padding: 0 4px;
+  color: #4f5fd0;
+  font-weight: 600;
+  cursor: grab;
+}
+
+.group-share,
+.group-ungroup {
+  padding: 0 8px;
+  border: none;
+  border-radius: 3px;
+  background: none;
+  color: #4f7cff;
+  font-size: 12px;
+  cursor: pointer;
+
+  &:hover { background: #d5dcff; }
+}
+
+.group-share.on { background: #4f7cff; color: #fff; }
+.group-ungroup { margin-left: auto; }
+
+.group-inner {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 3px;
+}
+
+.group.shared > .share-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  margin: 0 3px 3px;
+  background: #fff;
+  border: 1px solid #d9d9d9;
+  border-radius: 4px;
+
+  &[hidden] { display: none; }
+}
+
+// 按自身高度排布：开了共用渲染区的组合块（组内只剩标题栏）、以及没有可渲染内容而收缩的组合块
+.group.shared > .group-inner,
+.group[data-fit] > .group-inner { flex: 0 0 auto; }
+
+.group.shared .group-inner > *,
+.group.shared .split.column > *,
+.group[data-fit] .group-inner > *,
+.group[data-fit] .split.column > * { flex: 0 0 auto !important; }
+
+// 当前提供渲染内容的成员
+.block.source-active .block-title::before {
+  content: '● ';
+  color: #52c41a;
+  font-size: 10px;
+}
+
+// 框选：矩形、选区外框和操作条（盖在渲染内容图层上面）
+.sel-layer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  pointer-events: none;
+  z-index: 3;
+}
+
+// 框选模式：选区图层接管预览窗格里的鼠标，十字光标
+body.marquee-mode .sel-layer {
+  pointer-events: auto;
+  cursor: crosshair;
+}
+
+#marqueeBtn:focus { outline: none; }
+
+#marqueeBtn.active {
+  background: #fff;
+  color: #4f7cff;
+}
+
+.marquee {
+  position: absolute;
+  background: rgba(79, 124, 255, 0.15);
+  border: 1px solid #4f7cff;
+}
+
+.sel-box {
+  position: absolute;
+  border: 2px dashed #4f7cff;
+  background: rgba(79, 124, 255, 0.08);
+  border-radius: 6px;
+}
+
+// 选区的顶部栏：外观和组合块的顶部栏一致（盖在选区最上面一条，选区是临时的，不占布局空间）
+.sel-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 6px;
+  background: #e6eaff;
+  border-radius: 4px 4px 0 0;
+  font-size: 12px;
+  pointer-events: auto;
+  user-select: none;
+
+  &.outside { top: auto; bottom: 100%; left: -2px; right: -2px; border: 2px dashed #4f7cff; border-bottom: none; }
+
+  .sel-handle {
+    padding: 0 4px;
+    color: #4f5fd0;
+    font-weight: 600;
+    cursor: grab;
+  }
+
+  .sel-actions {
+    margin-left: auto;
+    display: flex;
+    gap: 4px;
+  }
+
+  button {
+    padding: 0 8px;
+    border: none;
+    border-radius: 3px;
+    background: none;
+    color: #4f7cff;
+    font-size: 12px;
+    cursor: pointer;
+
+    &:hover { background: #d5dcff; }
+  }
 }
 
 .block-header {
@@ -205,6 +365,7 @@ body.dragging-field .viewer-item {
 // 没有可渲染内容的块：下方还有别的块时（panel.ts 里打上 data-fit）只占标题栏高度，
 // 下方没有东西时不打标记，按权重占满可用高度
 .block[data-fit],
+.group[data-fit],
 .split[data-fit] {
   flex: 0 0 auto !important;
 }
@@ -219,7 +380,7 @@ body.dragging-field .viewer-item {
   left: 0;
   right: 0;
   bottom: 0;
-  // 不加 overflow: hidden：渲染块本来就精确定位在各自占位上，不需要裁剪，
+  // 不加 overflow: hidden：渲染区本来就精确定位在各自占位上，不需要裁剪，
   // 而且图层只覆盖预览窗格，祖先的裁剪可能连带限制 fixed 的全屏块
   pointer-events: none;
   z-index: 1;
@@ -304,7 +465,7 @@ body.dragging-field .viewer-item {
   margin: auto;
 }
 
-// 分块之间的分隔线 / 预览窗格与侧边栏之间的分隔条
+// 字段块之间的分隔线 / 预览窗格与侧边栏之间的分隔条
 .block-splitter {
   flex: none;
   background: transparent;

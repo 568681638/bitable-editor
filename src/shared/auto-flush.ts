@@ -128,7 +128,7 @@ async function serverMessage(res: Response): Promise<string> {
   return `HTTP ${res.status}`;
 }
 
-export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, runBtn?: HTMLButtonElement, filterBtn?: HTMLButtonElement) {
+export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, runBtn?: HTMLButtonElement) {
   let fns: FnMeta[] = [];
   let fnState: 'idle' | 'loading' | 'ready' | 'error' = 'idle';
   let fnError = '';
@@ -286,7 +286,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       body = '<div class="af-hint">后端还没有注册任何函数（在服务器的 release/server/functions/ 目录里添加）</div>';
     } else {
       body = `
-        <section class="af-sec"><h4 class="af-h"><span>筛选 <span class="af-count"></span></span><span class="af-h-actions"><button class="af-add" data-act="preview-filtered" title="在悬浮窗口里查看符合筛选条件的记录（全部可见字段）"${running || exporting ? ' disabled' : ''}>预览结果</button><button class="af-add" data-act="export-filtered" title="把视图里符合筛选条件的记录（全部可见字段）导出为 CSV"${running || exporting ? ' disabled' : ''}>导出 CSV</button></span></h4>${renderNode(config.filter, [])}<div class="af-filter-io"><button class="af-link" data-act="filter-import" title="从文件导入筛选条件（会替换当前条件）"${running || exporting ? ' disabled' : ''}>导入条件</button><span>·</span><button class="af-link" data-act="filter-export" title="把当前筛选条件导出为文件，方便复用">导出条件</button></div></section>
+        <section class="af-sec"><h4 class="af-h"><span>筛选 <span class="af-count"></span></span><span class="af-h-actions"><button class="af-add" data-act="filter" title="读取视图记录，只计算命中数，不调用函数、不写入"${running || exporting ? ' disabled' : ''}>筛选</button><button class="af-add" data-act="preview-filtered" title="在悬浮窗口里查看符合筛选条件的记录（全部可见字段）"${running || exporting ? ' disabled' : ''}>预览结果</button><span class="af-menu-wrap"><button class="af-add af-more" data-act="filter-menu" title="更多：导出 CSV、导入 / 导出筛选条件">☰</button>${filterMenuOpen ? `<div class="menu af-menu"><button class="menu-item" data-act="export-filtered" title="把视图里符合筛选条件的记录（全部可见字段）导出为 CSV"${running || exporting ? ' disabled' : ''}>导出 CSV</button><button class="menu-item" data-act="filter-import" title="从文件导入筛选条件（会替换当前条件）"${running || exporting ? ' disabled' : ''}>筛选条件导入</button><button class="menu-item" data-act="filter-export" title="把当前筛选条件导出为文件，方便复用">筛选条件导出</button></div>` : ''}</span></span></h4>${renderNode(config.filter, [])}</section>
         <section class="af-sec"><h4>输入</h4>${renderInputs()}<button class="af-add" data-act="add-input">＋ 输入项</button></section>
         <section class="af-sec"><h4>输出</h4>${renderOutputs()}<button class="af-add" data-act="add-output">＋ 输出项</button></section>
         <div class="af-status${statusKind ? ' ' + statusKind : ''}">${esc(statusText).replace(/\n/g, '<br />')}</div>
@@ -382,6 +382,16 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     return { node, parent, index };
   }
 
+  // 筛选块右上角 ☰ 菜单：点菜单外面、按 Esc 收起（render 会整块重绘，所以展开状态记在这里）
+  let filterMenuOpen = false;
+  function closeFilterMenu() {
+    if (!filterMenuOpen) return;
+    filterMenuOpen = false;
+    render();
+  }
+  document.addEventListener('click', (e) => { if (!(e.target as HTMLElement).closest('.af-menu-wrap')) closeFilterMenu(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeFilterMenu(); });
+
   container.addEventListener('click', (e) => {
     const btn = (e.target as HTMLElement).closest('button[data-act]') as HTMLElement | null;
     if (!btn) return;
@@ -399,10 +409,12 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       case 'add-input': config.inputs.push({ param: '', fieldId: '' }); break;
       case 'add-output': config.outputs.push({ param: '', fieldId: '' }); break;
       case 'reload-fns': loadFunctions(); return;
-      case 'export-filtered': exportFiltered(); return;
+      case 'filter-menu': filterMenuOpen = !filterMenuOpen; render(); return;
+      case 'filter': applyFilter(); return;
       case 'preview-filtered': previewFiltered(); return;
-      case 'filter-export': exportFilterConditions(); return;
-      case 'filter-import': importFilterConditions(); return;
+      case 'export-filtered': closeFilterMenu(); exportFiltered(); return;
+      case 'filter-export': closeFilterMenu(); exportFilterConditions(); return;
+      case 'filter-import': closeFilterMenu(); importFilterConditions(); return;
     }
     saveConfig();
     render();
@@ -505,28 +517,32 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     return data.results;
   }
 
-  // ── 底部右侧的“筛选 / 刷写（取消）”按钮（在面板外，由侧边栏页面提供）──
+  // ── 底部右侧的“刷写（取消）”按钮（在面板外，由侧边栏页面提供）──
   function syncRunBtn() {
     if (runBtn) {
       runBtn.textContent = running ? '取消' : '刷写';
       runBtn.classList.toggle('cancel', running);
       runBtn.disabled = exporting || (!running && fnState !== 'ready');
     }
-    if (filterBtn) filterBtn.disabled = running || exporting || fnState !== 'ready';
   }
   runBtn?.addEventListener('click', () => {
     if (running) { cancelled = true; setStatus('正在取消…', ''); }
     else startRun();
   });
-  filterBtn?.addEventListener('click', () => { applyFilter(); });
 
   // 筛选板块标题旁的命中数：条件改过就提示需要重新筛选
   const filterSig = () => JSON.stringify(config.filter);
+  // 筛选 / 预览 / 导出读取记录时的进度，直接显示在命中数的位置，不再往状态区打印
+  let readProgress = '';
+  function setReadProgress(text: string) {
+    readProgress = text;
+    updateFilterCount();
+  }
   function updateFilterCount() {
     const el = container.querySelector('.af-count') as HTMLElement | null;
     if (!el) return;
     let text = '', stale = false;
-    if (exporting && !running) text = '读取记录中…';
+    if (exporting && !running) text = '读取记录中…' + readProgress;
     else if (filterResult && filterResult.sig === filterSig()) text = `命中 ${filterResult.matched} / 共 ${filterResult.total} 条`;
     else if (filterResult) { text = '条件已修改，需重新筛选'; stale = true; }
     el.textContent = text;
@@ -539,13 +555,13 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     const regexErr = checkRegexes(config.filter);
     if (regexErr) { setStatus(regexErr, 'error'); return; }
     exporting = true;
-    setStatus('正在读取视图记录…', '');
+    setReadProgress('');
     render();
     try {
-      const all = await host.loadAllRecords((done, total) => setStatus(`正在读取视图记录… ${done}/${total}`, ''));
+      const all = await host.loadAllRecords((done, total) => setReadProgress(` ${done}/${total}`));
       const matched = all.filter(r => evalGroup(config.filter, r));
       filterResult = { sig: filterSig(), matched: matched.length, total: all.length };
-      setStatus(`筛选完成：视图共 ${all.length} 条记录，命中 ${matched.length} 条`, 'ok');
+      setStatus('', ''); // 结果已显示在筛选标题旁的命中数里，不再重复打印；读取进度只在读取过程中显示
     } catch (e) {
       setStatus(`筛选失败：${describeError(e, 'read')}`, 'error');
     } finally {
@@ -564,10 +580,10 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     const regexErr = checkRegexes(config.filter);
     if (regexErr) { setStatus(regexErr, 'error'); return; }
     exporting = true;
-    setStatus('正在读取视图记录…', '');
+    setReadProgress('');
     render();
     try {
-      const all = await host.loadAllRecords((done, total) => setStatus(`正在读取视图记录… ${done}/${total}`, ''));
+      const all = await host.loadAllRecords((done, total) => setReadProgress(` ${done}/${total}`));
       const matched = all.filter(r => evalGroup(config.filter, r));
       filterResult = { sig: filterSig(), matched: matched.length, total: all.length };
       if (matched.length === 0) { setStatus(`视图共 ${all.length} 条记录，没有符合筛选条件的记录，未导出`, ''); return; }
@@ -724,17 +740,17 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     const regexErr = checkRegexes(config.filter);
     if (regexErr) { setStatus(regexErr, 'error'); return; }
     exporting = true;
-    setStatus('正在读取视图记录…', '');
+    setReadProgress('');
     render();
     let rows: string[][] | null = null;
     let total = 0;
     try {
-      const all = await host.loadAllRecords((done, n) => setStatus(`正在读取视图记录… ${done}/${n}`, ''));
+      const all = await host.loadAllRecords((done, n) => setReadProgress(` ${done}/${n}`));
       const matched = all.filter(r => evalGroup(config.filter, r));
       filterResult = { sig: filterSig(), matched: matched.length, total: all.length };
       total = all.length;
-      if (matched.length === 0) setStatus(`视图共 ${all.length} 条记录，没有符合筛选条件的记录`, '');
-      else { rows = filteredRows(matched); setStatus(`预览：命中 ${matched.length} / 共 ${all.length} 条`, 'ok'); }
+      if (matched.length === 0) setStatus(`视图共 ${all.length} 条记录，没有符合筛选条件的记录`, ''); // 没有结果窗口弹出，需要说明原因
+      else { rows = filteredRows(matched); setStatus('', ''); } // 命中数在筛选标题旁，窗口也会弹出
     } catch (e) {
       setStatus(`预览失败：${describeError(e, 'read')}`, 'error');
     } finally {

@@ -78,7 +78,7 @@ const autoFlush = createAutoFlush(document.getElementById('autoContent') as HTML
     }
     sync();
   },
-}, document.getElementById('runBtn') as HTMLButtonElement, document.getElementById('filterBtn') as HTMLButtonElement);
+}, document.getElementById('runBtn') as HTMLButtonElement);
 let autoMode = false;
 // 视图/字段变化（刷新、切换表格视图）后，自动刷写面板要重画，字段下拉才会同步
 const refreshAutoFlush = () => { if (autoMode) autoFlush.rerender(); };

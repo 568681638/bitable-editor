@@ -374,8 +374,7 @@ body {
   .undo-btn,
   .save-btn { display: none; }
 
-  .run-btn,
-  .filter-btn { display: inline-block; }
+  .run-btn { display: inline-block; }
 
   .auto-content { display: block; }
 }
@@ -593,23 +592,6 @@ body.sidebar-zoom #app {
   gap: 6px;
 }
 
-// 筛选按钮（只算命中数，不刷写）：和“刷写”并排，样式保持一致
-.filter-btn {
-  display: none;
-  padding: 8px 24px;
-  background: #4f7cff;
-  border: none;
-  border-radius: 4px;
-  color: #fff;
-  cursor: pointer;
-  font-size: 14px;
-  font-weight: 500;
-  transition: background 0.2s;
-
-  &:hover:not(:disabled) { background: #3d6ae8; }
-  &:disabled { background: #ccc; cursor: not-allowed; }
-}
-
 .af-count {
   margin-left: 6px;
   font-size: 12px;
@@ -632,7 +614,7 @@ body.sidebar-zoom #app {
   &:hover { background: #fff1f0; border-color: #ffa39e; color: #ff4d4f; }
 }
 
-.af-h-actions { display: flex; gap: 6px; }
+.af-h-actions { display: flex; align-items: stretch; gap: 6px; }
 
 // 筛选结果预览（悬浮窗口，挂在 body 上）
 .af-modal {
@@ -690,28 +672,11 @@ body.sidebar-zoom #app {
   tbody tr:hover { background: #f0f4ff; }
 }
 
-// 筛选条件的导入 / 导出：低频操作，右下角灰色小字链接
-.af-filter-io {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 6px;
-  margin-top: 8px;
-  font-size: 12px;
-  color: #bbb;
-}
-
-.af-link {
-  padding: 0;
-  background: none;
-  border: none;
-  color: #999;
-  cursor: pointer;
-  font-size: 12px;
-
-  &:hover:not(:disabled) { color: #4f7cff; text-decoration: underline; }
-  &:disabled { color: #ccc; cursor: not-allowed; }
-}
+// 筛选块右上角的 ☰ 菜单：导出 CSV、导入 / 导出筛选条件这些低频操作收在这里（样式沿用 ☰ 菜单的 .menu / .menu-item）
+.af-menu-wrap { position: relative; display: flex; }
+.af-more { height: 100%; line-height: 1; } // 和旁边的“预览结果”等高（☰ 字形比汉字高，不统一设行高会撑出高度差）
+.af-menu { font-weight: 400; }
+.af-menu .menu-item:disabled { color: #ccc; cursor: not-allowed; background: none; }
 
 .af-modal-actions { display: flex; gap: 6px; }
 

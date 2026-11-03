@@ -151,7 +151,7 @@ export function proxyUrl(url: string): string {
 }
 
 // 媒体直连失败（网络不通 / 混合内容 / CORS / PNA 等）时，自动改走服务器代理重试一次；
-// 走了代理还是失败，说明这个预览显示不出来，把编辑区里对应的预览区整块移除，不占位置
+// 走了代理还是失败，说明这个预览显示不出来，把编辑区里对应的渲染区整块移除，不占位置
 export function installProxyFallback() {
   document.addEventListener('error', (e) => {
     const el = e.target as HTMLElement | null;
@@ -172,8 +172,8 @@ export function installProxyFallback() {
   }, true);
 }
 
-// 预览显示不出来时：移除预览区，并在字段块的右上角（标题行右侧）写一句说明，让用户知道怎么回事。
-// from 可以是预览区里的任意元素，也可以是占位元素；找不到字段块或预览区已经被移除时什么都不做
+// 预览显示不出来时：移除渲染区，并在字段块的右上角（标题行右侧）写一句说明，让用户知道怎么回事。
+// from 可以是渲染区里的任意元素，也可以是占位元素；找不到字段块或渲染区已经被移除时什么都不做
 export function showPreviewNote(from: Element, text: string, title = '') {
   const box = from.closest('.url-preview') || from;
   const row = box.closest('.field-row');
@@ -201,8 +201,25 @@ export function isFramebuster(url: string): boolean {
   } catch { return false; }
 }
 
+// 网页预览：向服务端询问这个网页是否禁止被嵌入（X-Frame-Options / CSP frame-ancestors）。
+// 确定禁止的 ok 为 false；查不出来（服务端连不上、没有这个接口）按“可以嵌入”处理，不影响原有行为。
+// 结果按地址缓存在内存里；刷新时调用 clearEmbeddableCache 重新查
+const embeddableCache = new Map<string, Promise<{ ok: boolean; reason: string }>>();
+export function checkEmbeddable(url: string): Promise<{ ok: boolean; reason: string }> {
+  let p = embeddableCache.get(url);
+  if (!p) {
+    p = fetch(new URL('api/frame-check?url=' + encodeURIComponent(url), location.href).href)
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => ({ ok: !(d && d.embeddable === false), reason: (d && d.reason) || '' }))
+      .catch(() => ({ ok: true, reason: '' }));
+    embeddableCache.set(url, p);
+  }
+  return p;
+}
+export const clearEmbeddableCache = () => embeddableCache.clear();
+
 // 编辑区字段下方的预览。显示不出来的情况（走代理也加载失败、网页禁止嵌入）不留任何占位：
-// 图片 / 视频 / 音频加载失败时，由 installProxyFallback 把整个预览区移除；网页由 annotator-ui 先检查能否嵌入。
+// 图片 / 视频 / 音频加载失败时，由 installProxyFallback 把整个渲染区移除；网页由 annotator-ui 先检查能否嵌入。
 export function renderUrlPreview(url: string, type: string): string {
   const src = esc(proxyUrl(url));
   switch (type) {
