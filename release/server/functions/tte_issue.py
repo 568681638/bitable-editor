@@ -1,7 +1,6 @@
 # TTE 工单：按资产 ID 批量查工单，取工单描述和问题语录
-# 数据来源：feishu/apis/tte_client/tte_query.py 的 query_issues（一次请求查整批资产）
+# 自包含：用 _tte_client 里的 query_issues（一次请求查整批资产），只依赖 requests，不依赖其他项目
 import _asset_id
-import _feishu_root  # noqa: F401  让下面的 apis.* 可以 import
 
 META = {
     "id": "tte_issue",
@@ -15,7 +14,8 @@ META = {
 
 
 def run(rows):
-    from apis.tte_client.tte_query import query_issues
+    # 放到函数里再 import：依赖缺失时不影响函数注册，错误会在运行时明确报出
+    from _tte_client import query_issues
 
     ids = [str(r.get("asset_id", "")).strip() for r in rows]
     issues = {}

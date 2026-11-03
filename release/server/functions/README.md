@@ -17,7 +17,9 @@ functions/
 ├── _template.py            Python 函数模板（复制它开始写）
 ├── _python_executor.py     Python 执行器：服务用它加载并执行 .py 函数，不要删、不要改名
 ├── _asset_id.py            公共模块：资产 ID 格式检查（Python 函数里 import _asset_id）
-├── _feishu_root.py         公共模块：让 Python 函数能 import feishu 项目的 apis.*
+├── _config.py              公共模块：读取凭证和服务地址（环境变量 > _credentials.json > 默认值）
+├── _credentials.example.json  凭证模板；真实的 _credentials.json 不进 git，随 release 目录手动拷到服务器
+├── _tte_client.py          公共模块：TTE 工单查询客户端（自包含，只依赖 requests）
 ├── text_stats.mjs          示例（JS）
 ├── url_host.mjs            示例（JS）
 ├── asset_time.py           资产起止时间（Python，调资产服务）
@@ -105,8 +107,9 @@ Python 文件需要提供 `META`（字典）和 `run`（函数）。一个 `.py`
 - 服务用系统的 `python3` 执行（Windows 本机默认 `python`），可以用环境变量 `PYTHON_BIN` 指定别的解释器。
 - 每批调用启动一次 Python 进程；数据经临时目录里的 JSON 文件进出，没有大小限制，用完自动清理。
 - 函数里 `print` 的内容进服务日志，不会弄坏返回结果。
-- 执行器会把本目录加入 `sys.path`，所以 Python 函数里可以直接 `import _asset_id`、`import _feishu_root` 这类以 `_` 开头的公共模块。
-- 依赖放在**函数的 `run` 里再 import**（参考 `asset_time.py`）：模块导入慢或依赖缺失时，函数仍能注册成功、出现在列表里，错误会在运行时明确报出，而不是让函数从列表里消失。
+- 执行器会把本目录加入 `sys.path`，所以 Python 函数里可以直接 `import _asset_id`、`import _config` 这类以 `_` 开头的公共模块。
+- 函数要**自包含**：只依赖本目录里的文件和 PyPI 上的第三方库（如 `requests`），**不要 import 其他项目的代码**，否则部署到服务器就找不到。需要的客户端逻辑直接写进本目录的公共模块（参考 `_tte_client.py`）。
+- 依赖放在**函数的 `run` 里再 import**（参考 `tte_issue.py`）：模块导入慢或依赖缺失时，函数仍能注册成功、出现在列表里，错误会在运行时明确报出，而不是让函数从列表里消失。
 - 单批执行超时默认 300 秒，可用 `PY_RUN_TIMEOUT_MS` 调大；读取元信息超时 15 秒。
 
 ## 环境变量
@@ -115,12 +118,15 @@ Python 文件需要提供 `META`（字典）和 `run`（函数）。一个 `.py`
 | --- | --- | --- |
 | `PYTHON_BIN` | Python 解释器路径 | Linux `python3` / Windows `python` |
 | `PY_RUN_TIMEOUT_MS` | Python 单批执行超时（毫秒） | 300000 |
-| `FEISHU_ROOT` | feishu 项目根目录（`asset_time.py`、`tte_issue.py` 要 import 它的 `apis.*`） | `D:\claude\projects\feishu` |
 | `ASSET_WORKERS` | `asset_time.py` 并发查询资产的线程数 | 8 |
-| `ASSET_PRECHECK` | `asset_time.py` 是否先用 `check_asset_ids` 预检，`1` 开启 | 0（关闭） |
-| `ASSET_TYPE_NAME` | 开启预检时的资产类型 | `original_data` |
+| `ASSET_BASE_URL` | 资产服务网关地址 | `https://data.zytintra.com/gw/openapi/data/assets` |
+| `ASSET_API_KEY` | 资产服务的 apiKey | 无，写在 `_credentials.json` |
+| `TTE_BASE_URL` | TTE 开放接口地址 | `https://tte.zytintra.com/open-apis/v1` |
+| `TTE_APP_KEY` / `TTE_APP_SECRET` | TTE 开放接口的签名凭证 | 无，写在 `_credentials.json` |
 
-部署到服务器时，`FEISHU_ROOT` 必须指向服务器上的实际路径，并确认 `zyinfra`、`requests` 等依赖已安装。
+**凭证**：`ASSET_API_KEY`、`TTE_APP_KEY`、`TTE_APP_SECRET` 优先读同名环境变量，其次读本目录的 `_credentials.json`（模板见 `_credentials.example.json`）。`_credentials.json` 已加入 `.gitignore`，**不会进 git**，所以部署时要把本机这个文件随 `release/` 目录一起拷到服务器，或者在服务器上改用环境变量。缺少配置时函数会报出明确的错误，提示缺哪一项。
+
+依赖：服务器上的 `python3` 只需要装 `requests`。
 
 ## 热加载的细节
 
@@ -131,7 +137,7 @@ Python 文件需要提供 `META`（字典）和 `run`（函数）。一个 `.py`
 
 ## 资产 ID 的基本检查
 
-涉及资产 ID 的 Python 函数，请先过一遍 `_asset_id.format_error`：资产 ID 是 **10 位，字符只能是数字和大小写英文字母**（不要求三种都出现）。格式不对的 ID 直接判这一行失败，不要再发请求，因为无效 ID 去查资产服务会重试 3 次，每个要等几十秒。
+涉及资产 ID 的函数，请先过一遍 `_asset_id.format_error`：资产 ID 是 **10 位，字符只能是数字和大小写英文字母**（不要求三种都出现）。格式不对的 ID 直接判这一行失败，不要再发请求，因为无效 ID 去查资产服务会重试 3 次，每个要等几十秒。
 
 ```python
 import _asset_id
