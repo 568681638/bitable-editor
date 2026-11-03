@@ -1,6 +1,6 @@
 // 多行文本框的两项共用能力：随内容撑开高度、分两步的 Ctrl+A
 
-// 默认高度上限：窗口高度的比例（右侧编辑区）。超出后文本框内部滚动。左侧渲染块的标题栏要给渲染区让位，调用时传更小的比例
+// 默认高度上限：窗口高度的比例（侧边栏）。超出后文本框内部滚动。预览窗格渲染块的标题栏要给渲染区让位，调用时传更小的比例
 const MAX_HEIGHT_RATIO = 0.5;
 
 // 按内容（包括折行）撑开高度：没有换行时与单行输入框一样高（rows=1），最大不超过窗口高度的 maxRatio。
@@ -12,7 +12,7 @@ export function autosizeTextarea(ta: HTMLTextAreaElement, maxRatio = MAX_HEIGHT_
   ta.classList.toggle('single-line', !ta.value.includes('\n'));
   ta.style.height = 'auto';
   const extra = ta.offsetHeight - ta.clientHeight; // 边框 + 横向滚动条的厚度
-  // 页面可能被缩放（面板页右栏有 zoom）：屏幕像素 / CSS 像素，上限要按屏幕像素算
+  // 页面可能被缩放（面板页侧边栏有 zoom）：屏幕像素 / CSS 像素，上限要按屏幕像素算
   const scale = ta.getBoundingClientRect().height / ta.offsetHeight || 1;
   const cap = Math.floor((window.innerHeight * maxRatio) / scale);
   const height = Math.min(ta.scrollHeight + extra, cap);

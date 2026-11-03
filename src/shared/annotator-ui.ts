@@ -18,7 +18,7 @@ export const FIELD_DRAG_TYPE = 'application/x-annotator-field';
 export interface AnnotatorOptions {
   // URL 字段下方是否渲染预览
   urlPreview: boolean;
-  // 字段标签可拖出（双栏面板里拖到左侧展示）
+  // 字段标签可拖出（双栏面板里拖到预览窗格展示）
   draggableFields?: boolean;
   onNavigate(index: number): void;
   onRefresh(): void;
@@ -112,7 +112,7 @@ export function createAnnotatorUI(opts: AnnotatorOptions) {
       const value = current.fields[field.id];
       const ctrl = renderFieldControl(field, value);
       return `<div class="field-row" data-field-id="${field.id}">
-      <div class="field-label"${opts.draggableFields ? ' draggable="true" title="拖到左侧面板展示"' : ''}>${esc(field.name)}</div>
+      <div class="field-label"${opts.draggableFields ? ' draggable="true" title="拖到预览窗格展示"' : ''}>${esc(field.name)}</div>
       <div class="field-value">${ctrl}</div>
     </div>`;
     }).join('');
@@ -140,7 +140,7 @@ export function createAnnotatorUI(opts: AnnotatorOptions) {
     recordContent.querySelectorAll('textarea').forEach(el => autosizeTextarea(el as HTMLTextAreaElement));
   }
 
-  // 隐藏的字段（已被拖到左侧展示）只切换可见性，不重渲染，保留其他字段里未保存的输入
+  // 隐藏的字段（已被拖到预览窗格展示）只切换可见性，不重渲染，保留其他字段里未保存的输入
   function applyHiddenFields() {
     recordContent.querySelectorAll<HTMLElement>('.field-row').forEach(row => {
       row.hidden = hiddenFields.has(row.dataset.fieldId || '');
@@ -153,7 +153,7 @@ export function createAnnotatorUI(opts: AnnotatorOptions) {
     autosizeAllTextareas(); // 刚显示出来的字段此前是隐藏的，量不出高度
   }
 
-  // 容器尺寸变化（拖分隔线、缩放、改窗口大小）会改变折行和高度上限，需要重新计算
+  // 容器尺寸变化（拖分隔条、缩放、改窗口大小）会改变折行和高度上限，需要重新计算
   new ResizeObserver(() => autosizeAllTextareas()).observe(recordContent);
 
   // ── 字段控件分发 ────────────────────────────────

@@ -23,6 +23,7 @@ body {
 }
 
 .header {
+  --ctl-h: 28px; // 标题栏里按钮 / 输入框的统一高度：人工编辑（有导航）和自动刷写（没有导航）两种模式下标题栏等高
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -41,7 +42,9 @@ body {
 }
 
 .refresh-btn {
-  padding: 4px 10px;
+  box-sizing: border-box;
+  height: var(--ctl-h);
+  padding: 0 8px;
   background: rgba(255, 255, 255, 0.2);
   border: 1px solid rgba(255, 255, 255, 0.3);
   border-radius: 4px;
@@ -50,15 +53,6 @@ body {
   font-size: 18px;
   line-height: 1;
   transition: all 0.2s;
-}
-
-.help-link {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 15px;
-  font-weight: 600;
-  text-decoration: none;
 }
 
 .refresh-btn:hover {
@@ -71,18 +65,21 @@ body {
 
 .header-actions {
   display: flex;
-  gap: 6px;
+  gap: 4px;
+  align-items: center;
 }
 
 .nav-controls {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 4px;
 }
 
 .nav-btn {
   white-space: nowrap;
-  padding: 6px 10px;
+  box-sizing: border-box;
+  height: var(--ctl-h);
+  padding: 0 8px;
   background: rgba(255, 255, 255, 0.2);
   border: 1px solid rgba(255, 255, 255, 0.3);
   border-radius: 4px;
@@ -102,8 +99,10 @@ body {
 }
 
 .jump-input {
-  width: 56px;
-  padding: 4px 6px;
+  box-sizing: border-box;
+  height: var(--ctl-h);
+  width: 48px;
+  padding: 0 4px;
   background: rgba(255, 255, 255, 0.15);
   border: 1px solid rgba(255, 255, 255, 0.3);
   border-radius: 4px;
@@ -405,9 +404,9 @@ body {
 
 // 侧边栏：整体缩放，宽高按缩放反算，视觉上仍铺满（面板页自己有 .panel-layout #app 的规则）
 body.sidebar-zoom #app {
-  zoom: var(--ann-zoom, 1);
-  width: calc(100vw / var(--ann-zoom, 1));
-  height: calc(100vh / var(--ann-zoom, 1));
+  zoom: var(--ann-zoom, 1.05);
+  width: calc(100vw / var(--ann-zoom, 1.05));
+  height: calc(100vh / var(--ann-zoom, 1.05));
   max-width: none;
   margin: 0;
 }

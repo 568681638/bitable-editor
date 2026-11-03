@@ -88,7 +88,7 @@ if (!opener) {
   setInterval(ping, 3000);
 }
 
-// ── 左侧分块布局（树：split 节点按行/列切分，leaf 节点对应一个字段）──
+// ── 预览窗格分块布局（树：split 节点按行/列切分，leaf 节点对应一个字段）──
 // fieldName：导入时对应不上字段的分块记着原字段名，等用户拖字段进来替换（见 isPending）
 interface Leaf { kind: 'leaf'; id: string; fieldId: string; size: number; fieldName?: string; }
 interface Split { kind: 'split'; dir: 'row' | 'column'; children: LayoutNode[]; size: number; }
@@ -101,7 +101,7 @@ const LAST_TABLE_KEY = 'annotator-panel-last-table'; // 上次看的数据表，
 const WIDTH_KEY = 'annotator-panel-width';
 const ZOOM_KEY = 'annotator-panel-zoom-v4'; // 之前的版本会把默认值也自动存下来，换个 key 让它们失效
 const BLOCK_DRAG_TYPE = 'application/x-annotator-block';
-// 左侧块标题栏里多行字段值的高度上限：窗口高度的比例。标题栏撑得越高，下面的渲染区越小，所以比右侧编辑区（50%）收得更紧
+// 预览窗格块标题栏里多行字段值的高度上限：窗口高度的比例。标题栏撑得越高，下面的渲染区越小，所以比侧边栏（50%）收得更紧
 const BLOCK_VALUE_MAX_RATIO = 0.3;
 
 function validNode(n: any): boolean {
@@ -150,7 +150,7 @@ const viewerLayer = document.getElementById('viewerLayer') as HTMLElement;
 const viewerEls = new Map<string, HTMLElement>(); // 分块 id → 渲染内容元素
 const bodyObserver = new ResizeObserver(() => positionViewers());
 
-// 左侧块标题栏里的多行值：尺寸变化时重新撑开（只在宽度变化时重算，避免自己改高度又触发自己）
+// 预览窗格块标题栏里的多行值：尺寸变化时重新撑开（只在宽度变化时重算，避免自己改高度又触发自己）
 const valueObserver = new ResizeObserver((entries) => {
   for (const entry of entries) {
     const ta = entry.target as HTMLTextAreaElement;
@@ -344,7 +344,7 @@ function updateBlock(leaf: Leaf) {
 
   // 标题栏：字段名 | 字段值（左右结构，悬停看全文）。
   // 值里没有换行 → 单行输入框（过长用省略号）；有换行 → 多行输入框，保留换行。都只读，可选中复制。
-  // 多行框与右侧编辑区同一套规则：每行不折行（横向滚动）、高度随内容撑开、Ctrl+A 分两步；上限更紧（BLOCK_VALUE_MAX_RATIO）
+  // 多行框与侧边栏同一套规则：每行不折行（横向滚动）、高度随内容撑开、Ctrl+A 分两步；上限更紧（BLOCK_VALUE_MAX_RATIO）
   const valueInput = el.querySelector('input.block-value') as HTMLInputElement;
   const valueArea = el.querySelector('textarea.block-value') as HTMLTextAreaElement;
   const multiline = text.includes('\n');
@@ -369,7 +369,7 @@ function updateBlock(leaf: Leaf) {
   const bodyKey = field ? '' : 'x';
   if (body.dataset.key !== bodyKey) {
     body.dataset.key = bodyKey;
-    body.innerHTML = field ? '' : '<div class="block-hint">该字段不在当前视图中<br>把右侧的字段拖到这里可替换</div>';
+    body.innerHTML = field ? '' : '<div class="block-hint">该字段不在当前视图中<br>把侧边栏里的字段拖到这里可替换</div>';
   }
 }
 
@@ -417,7 +417,7 @@ function createBlockEl(leaf: Leaf): HTMLElement {
       <input class="block-value" readonly placeholder="（空）" />
       <textarea class="block-value block-value-multi" rows="2" wrap="off" readonly hidden></textarea>
       <a class="block-open" target="_blank" rel="noopener noreferrer" title="在新窗口打开">↗</a>
-      <button class="block-close" title="移除该分块（字段回到右侧编辑区）">✕</button>
+      <button class="block-close" title="移除该分块（字段回到侧边栏）">✕</button>
     </div><div class="block-body"></div>`;
   bodyObserver.observe(el.querySelector('.block-body') as HTMLElement);
   const area = el.querySelector('textarea.block-value') as HTMLTextAreaElement;
@@ -478,16 +478,16 @@ function renderBlocks() {
     removeViewer(id);
   }
   if (!root) {
-    blocksEl.innerHTML = '<div class="blocks-empty"><div class="blocks-empty-title">← 把右侧编辑区里的字段名拖到这里</div><div class="blocks-empty-sub">可拖入多个字段，拖到已有分块的边缘即可上下左右分屏</div><div class="blocks-empty-sub"><a href="' + HELP_URL + '" target="_blank" rel="noopener noreferrer">不知道怎么用？查看使用教程</a></div></div>';
+    blocksEl.innerHTML = '<div class="blocks-empty"><div class="blocks-empty-title">← 把侧边栏里的字段名拖到这里</div><div class="blocks-empty-sub">可拖入多个字段，拖到已有分块的边缘即可上下左右分屏</div><div class="blocks-empty-sub"><a href="' + HELP_URL + '" target="_blank" rel="noopener noreferrer">不知道怎么用？查看使用教程</a></div></div>';
   } else {
     blocksEl.appendChild(buildNode(root));
   }
-  // 已在左侧展示的字段，右侧编辑区不再显示；移除分块后自动回到右侧
+  // 已在预览窗格展示的字段，侧边栏不再显示；移除分块后自动回到侧边栏
   ui.setHiddenFields(new Set(all.map(l => l.fieldId)));
   updateBlocks();
 }
 
-// ── 布局导入 / 导出：把当前数据表的左侧分块布局存成文件，方便分享给别人 ──
+// ── 布局导入 / 导出：把当前数据表的预览窗格分块布局存成文件，方便分享给别人 ──
 // 布局记在浏览器 localStorage 里，换电脑、换浏览器、发给同事都带不走，所以提供文件导出。
 // 文件里每个分块除了字段 ID，还带上字段名：对方是另一张表（字段 ID 不同）时，按字段名重新匹配。
 const LAYOUT_FILE_TYPE = 'bitable-editor-layout';
@@ -502,7 +502,7 @@ function layoutNotice(text: string, isError = false) {
 }
 
 function exportLayout() {
-  if (!root) { layoutNotice('当前没有布局可导出：先把字段拖到左侧', true); return; }
+  if (!root) { layoutNotice('当前没有布局可导出：先把字段拖到预览窗格', true); return; }
   const names = new Map((snapshot?.fields || []).map(f => [f.id, f.name]));
   const withNames = (n: LayoutNode): any => n.kind === 'leaf'
     ? { kind: 'leaf', fieldId: n.fieldId, fieldName: names.get(n.fieldId) || n.fieldName || '', size: n.size }
@@ -564,12 +564,12 @@ function importLayout() {
       const missing: string[] = [];
       const mapped = normalize(mapImportedLayout(data.layout, snapshot.fields, missing));
       if (!mapped) throw new Error('布局文件是空的，未导入');
-      if (root && !confirm('导入会替换当前表格的左侧布局，确定吗？')) return;
+      if (root && !confirm('导入会替换当前表格的预览窗格布局，确定吗？')) return;
       root = mapped;
       saveLayout();
       renderBlocks();
       const uniq = [...new Set(missing)];
-      layoutNotice(uniq.length ? `已导入布局，有 ${missing.length} 个分块的字段在当前视图里找不到：${uniq.join('、')}。把右侧字段拖到这些分块上即可替换` : '已导入布局', uniq.length > 0);
+      layoutNotice(uniq.length ? `已导入布局，有 ${missing.length} 个分块的字段在当前视图里找不到：${uniq.join('、')}。把侧边栏里的字段拖到这些分块上即可替换` : '已导入布局', uniq.length > 0);
     } catch (e) {
       layoutNotice(`导入失败：${e instanceof Error ? e.message : String(e)}`, true);
     }
@@ -582,7 +582,7 @@ const { close: closeMenu } = setupMenu();
 document.getElementById('layoutExportBtn')!.addEventListener('click', () => { closeMenu(); exportLayout(); });
 document.getElementById('layoutImportBtn')!.addEventListener('click', () => { closeMenu(); importLayout(); });
 
-// ── 分隔线拖动：只改相邻两块，其余保持 ─────────────
+// ── 分块分隔线拖动：只改相邻两块，其余保持 ─────────────
 function startResize(e: MouseEvent, split: Split, childEls: HTMLElement[], i: number) {
   e.preventDefault();
   const horizontal = split.dir === 'row';
@@ -738,7 +738,7 @@ renderBlocks();
 // 教程链接被服务端配置覆盖后，空状态里的链接也要跟着更新
 document.addEventListener('config-loaded', () => { if (!root) renderBlocks(); });
 
-// ── 左右两栏之间拖动调整宽度；右栏字号缩放 ────────
+// ── 分隔条：拖动调整预览窗格与侧边栏的宽度；侧边栏字号缩放 ────────
 const layoutEl = document.querySelector('.panel-layout') as HTMLElement;
 const splitter = document.getElementById('splitter') as HTMLElement;
 const savedWidth = parseInt(localStorage.getItem(WIDTH_KEY) || '');
@@ -761,4 +761,4 @@ splitter.addEventListener('mousedown', (e) => {
   document.addEventListener('mouseup', up);
 });
 
-setupZoom(layoutEl, ZOOM_KEY, 0.85);
+setupZoom(layoutEl, ZOOM_KEY, 0.85 * 1.05);

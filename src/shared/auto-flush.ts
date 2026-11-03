@@ -1,10 +1,10 @@
 import { describeError, describedError } from './errors';
-import { FType, FieldMeta, FieldOption, RecordData, esc, segmentsToText } from './common';
+import { FieldMeta, FieldOption, RecordData, esc } from './common';
 import { buildPreviewHtml } from './preview-page';
 import { WRITABLE_TYPES, FIELD_TYPE_NAMES, needsOptions, toFieldValue } from './field-value';
 
 // ── 自动刷写面板：筛选记录 → 取输入字段调用后端函数 → 把输出写回字段 ──────────
-// 函数由后端注册（release/server/functions.mjs），这里只通过 /api/functions 读元信息、批量调用
+// 函数由后端注册（release/server/functions/ 目录下的 .mjs / .py，热加载），这里只通过 /api/functions 读元信息、批量调用
 
 export interface AutoFlushHost {
   /** 选择类字段的全部选项（单选、多选写入时用来把名字换成选项 ID） */

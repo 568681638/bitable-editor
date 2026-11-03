@@ -13,7 +13,7 @@
       <div id="blocks" class="blocks"></div>
       <div id="viewerLayer" class="viewer-layer"></div>
     </section>
-    <div id="splitter" class="splitter" title="拖动调整左右宽度"></div>
+    <div id="splitter" class="splitter" title="拖动调整预览窗格与侧边栏的宽度"></div>
     <div id="app">
       <div class="header">
         <h3>bitable-editor</h3>
@@ -24,8 +24,8 @@
               <a id="helpLink" class="menu-item" target="_blank" rel="noopener noreferrer">使用教程</a>
               <button class="menu-item menu-group" data-submenu>双栏布局<span class="menu-arrow">▸</span></button>
               <div class="submenu" hidden>
-                <button id="layoutImportBtn" class="menu-item sub" title="从文件导入左侧布局（会替换当前表格的布局）">布局导入</button>
-                <button id="layoutExportBtn" class="menu-item sub" title="把当前表格的左侧布局导出为文件，方便分享给别人">布局导出</button>
+                <button id="layoutImportBtn" class="menu-item sub" title="从文件导入预览窗格的布局（会替换当前表格的布局）">布局导入</button>
+                <button id="layoutExportBtn" class="menu-item sub" title="把当前表格的预览窗格布局导出为文件，方便分享给别人">布局导出</button>
               </div>
             </div>
           </div>
@@ -48,8 +48,8 @@
           <button class="mode-btn" data-mode="auto">自动刷写</button>
         </div>
         <div class="zoom-ctrl">
-          <button id="zoomOutBtn" class="zoom-btn" title="缩小编辑区字号">A−</button>
-          <button id="zoomInBtn" class="zoom-btn" title="放大编辑区字号">A＋</button>
+          <button id="zoomOutBtn" class="zoom-btn" title="缩小侧边栏字号">A−</button>
+          <button id="zoomInBtn" class="zoom-btn" title="放大侧边栏字号">A＋</button>
         </div>
         <button id="undoBtn" class="undo-btn" disabled>撤销</button>
         <button id="saveBtn" class="save-btn" disabled>保存</button>

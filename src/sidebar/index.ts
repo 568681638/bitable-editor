@@ -85,7 +85,7 @@ const refreshAutoFlush = () => { if (autoMode) autoFlush.rerender(); };
 setupMenu();
 setupModeSwitch(ui.saveIfModified, (mode) => { autoMode = mode === 'auto'; if (autoMode) autoFlush.show(); });
 document.body.classList.add('sidebar-zoom');
-setupZoom(document.documentElement, 'annotator-sidebar-zoom-v2', 1);
+setupZoom(document.documentElement, 'annotator-sidebar-zoom-v2', 1.05);
 
 function currentRecord(): RecordData | undefined {
   return recordCache.get(recordIds[currentIndex]);

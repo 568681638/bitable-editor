@@ -9,7 +9,8 @@ release/
 │   ├── deploy.sh     一键部署脚本
 │   └── supervisor.conf   supervisord 程序配置模板
 ├── server/
-│   ├── server.mjs    生产服务：托管 dist/ + /api-proxy/ 通用代理 + /api/functions 自动刷写函数接口
+│   ├── server.mjs    生产服务：托管 dist/ + /api-proxy/ 通用代理 + /api/functions 自动刷写函数接口 + /api/config 运行时配置
+│   ├── config.json   运行时配置（目前只有教程链接 helpUrl）
 │   └── functions/    自动刷写函数：.mjs（见 _template.mjs）或 .py（见 _template.py），热加载
 └── dist/             前端构建产物（npm run build 生成，不入库，要自己带过去）
 ```
@@ -17,6 +18,12 @@ release/
 本项目部署在 **阿里云 PAI DSW 容器**中，PID 1 是 `/etc/dsw/bin/entrypoint`，进程管理用的是 `supervisord`（不是 systemd，`systemctl` / `pm2 startup` 都不能用）。
 
 > **服务端必须兼容 Node 14**（DSW 自带的是 14.x）：`server/server.mjs` 里不要用 `??=` / `||=` / `replaceAll` / `.at()` 等较新的写法，本机新版 Node 能跑不代表 DSW 上能跑。
+
+---
+
+## 运行时配置（不用重新构建、不用重启）
+
+`server/config.json` 目前只有一项 `helpUrl`（☰ 菜单里「使用教程」的链接，也用于双栏面板预览窗格空状态里的教程链接）。服务每次收到 `/api/config` 请求都会重新读这个文件，在服务器上改完保存、用户刷新页面即生效。文件不存在、内容不合法或链接不是 http(s) 时，前端回落到 `src/shared/common.ts` 里内置的默认值。
 
 ---
 
