@@ -121,6 +121,9 @@ body.dragging-field .viewer-item {
   &.drop-right::after { display: block; top: 0; bottom: 0; right: 0; width: 50%; }
   &.drop-top::after { display: block; left: 0; right: 0; top: 0; height: 50%; }
   &.drop-bottom::after { display: block; left: 0; right: 0; bottom: 0; height: 50%; }
+  // 字段不存在的分块：虚线框；拖字段进来时整块高亮，表示替换而不是分块
+  &.pending { border-style: dashed; background: #fafafa; }
+  &.drop-replace::after { display: block; inset: 0; }
 }
 
 .block-header {
@@ -325,4 +328,25 @@ body.dragging-field .viewer-item {
   transition: background 0.15s;
 
   &:hover { background: #4f7cff; }
+}
+
+// 布局导入 / 导出的结果提示：浮在左侧区域顶部，几秒后自动消失
+.layout-msg {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 20;
+  display: none;
+  max-width: 80%;
+  padding: 6px 12px;
+  background: #fff;
+  border: 1px solid #b7eb8f;
+  border-radius: 4px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  color: #389e0d;
+  font-size: 12px;
+
+  &:not(:empty) { display: block; }
+  &.error { border-color: #ffd591; color: #d46b08; }
 }

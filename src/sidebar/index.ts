@@ -4,6 +4,7 @@ import { FType, FieldMeta, FieldOption, RecordData, installProxyFallback } from 
 import { createAnnotatorUI } from '../shared/annotator-ui';
 import { setupModeSwitch } from '../shared/mode-switch';
 import { setupZoom } from '../shared/zoom';
+import { setupMenu } from '../shared/menu';
 import { describeError } from '../shared/errors';
 import { createAutoFlush } from '../shared/auto-flush';
 import type { MessageStatus, PanelCommand, SnapshotMessage, AckMessage, PongMessage } from '../shared/bridge';
@@ -81,6 +82,7 @@ const autoFlush = createAutoFlush(document.getElementById('autoContent') as HTML
 let autoMode = false;
 // 视图/字段变化（刷新、切换表格视图）后，自动刷写面板要重画，字段下拉才会同步
 const refreshAutoFlush = () => { if (autoMode) autoFlush.rerender(); };
+setupMenu();
 setupModeSwitch(ui.saveIfModified, (mode) => { autoMode = mode === 'auto'; if (autoMode) autoFlush.show(); });
 document.body.classList.add('sidebar-zoom');
 setupZoom(document.documentElement, 'annotator-sidebar-zoom-v2', 1);
@@ -220,6 +222,7 @@ function publish() {
   const state = viewState();
   postToPanel({
     type: 'snapshot',
+    tableId: currentTableId,
     status: state.status,
     fields,
     options: fieldOptionsCache,

@@ -123,6 +123,63 @@ function proxyRequest(targetUrl, req, res, redirects = 0) {
   proxyReq.end();
 }
 
+// ── 网页能否被 iframe 嵌入的检查：/api/frame-check?url=<目标URL> → { embeddable: true|false|null, reason } ──
+// 只看响应头：X-Frame-Options（DENY / SAMEORIGIN 都不能被我们嵌入）和 CSP 的 frame-ancestors（没有 * 就视为禁止）。
+// embeddable 为 null 表示没查出来（目标连不上、超时等），前端按“可以嵌入”处理。结果缓存 10 分钟。
+const FRAME_CHECK_TTL = 10 * 60 * 1000;
+const frameCheckCache = new Map();
+
+function judgeFrameHeaders(headers) {
+  const xfo = String(headers['x-frame-options'] || '').toLowerCase();
+  if (xfo.includes('deny') || xfo.includes('sameorigin') || xfo.includes('allow-from')) {
+    return { embeddable: false, reason: 'X-Frame-Options: ' + xfo };
+  }
+  const csp = String(headers['content-security-policy'] || '');
+  const m = csp.match(/frame-ancestors([^;]*)/i);
+  if (m && m[1].split(/\s+/).indexOf('*') < 0) {
+    return { embeddable: false, reason: 'CSP frame-ancestors:' + m[1] };
+  }
+  return { embeddable: true, reason: 'no frame restrictions' };
+}
+
+function frameCheckOnce(targetUrl, redirects) {
+  return new Promise((resolve) => {
+    let parsed;
+    try { parsed = new URL(targetUrl); } catch { return resolve({ embeddable: null, reason: 'bad url' }); }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return resolve({ embeddable: null, reason: 'unsupported protocol' });
+    const bareHost = parsed.hostname.replace(/^\[|\]$/g, '');
+    if (isIP(bareHost) && isBlockedIP(bareHost)) return resolve({ embeddable: null, reason: 'address not allowed' });
+    const client = parsed.protocol === 'https:' ? https : http;
+    const req = client.request({
+      hostname: parsed.hostname,
+      port: parsed.port || undefined,
+      path: parsed.pathname + parsed.search,
+      method: 'GET',
+      headers: { host: parsed.host, 'user-agent': 'Mozilla/5.0 bitable-editor-frame-check', accept: 'text/html' },
+      lookup: safeLookup,
+    }, (res) => {
+      res.destroy(); // 只要响应头，不读内容
+      const status = res.statusCode;
+      if ([301, 302, 303, 307, 308].includes(status) && res.headers.location) {
+        if (redirects >= MAX_REDIRECTS) return resolve({ embeddable: null, reason: 'too many redirects' });
+        return resolve(frameCheckOnce(new URL(res.headers.location, parsed).href, redirects + 1));
+      }
+      resolve(judgeFrameHeaders(res.headers));
+    });
+    req.on('error', (err) => resolve({ embeddable: null, reason: err.message }));
+    req.setTimeout(8000, () => { req.destroy(); resolve({ embeddable: null, reason: 'timeout' }); });
+    req.end();
+  });
+}
+
+async function frameCheck(targetUrl) {
+  const hit = frameCheckCache.get(targetUrl);
+  if (hit && Date.now() - hit.at < FRAME_CHECK_TTL) return hit.result;
+  const result = await frameCheckOnce(targetUrl, 0);
+  if (result.embeddable !== null) frameCheckCache.set(targetUrl, { at: Date.now(), result });
+  return result;
+}
+
 const gzipAsync = promisify(gzip);
 const brotliAsync = promisify(brotliCompress);
 const COMPRESSIBLE = new Set(['.html', '.js', '.css', '.json', '.svg']);
@@ -347,6 +404,18 @@ const server = createServer((req, res) => {
       res.writeHead(400);
       return res.end('Bad proxy URL');
     }
+  }
+
+  if (req.url.startsWith('/api/frame-check')) {
+    const target = new URL(req.url, 'http://localhost').searchParams.get('url') || '';
+    return frameCheck(target).then(r => sendJson(res, 200, r), e => sendJson(res, 500, { error: e.message }));
+  }
+
+  // 运行时配置：每次请求都重新读 config.json，服务端改完保存即生效，不用重新构建 / 重启
+  if (req.url.split('?')[0] === '/api/config') {
+    return readFile(join(__dirname, 'config.json'), 'utf8')
+      .then(t => JSON.parse(t), () => ({}))
+      .then(cfg => sendJson(res, 200, cfg), () => sendJson(res, 200, {}));
   }
 
   if (req.url.startsWith('/api/functions')) {

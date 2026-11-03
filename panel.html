@@ -9,6 +9,7 @@
   <div class="panel-layout">
     <section class="viewer">
       <div id="connBanner" class="conn-banner" hidden>与侧边栏的连接已断开，请回到多维表格侧边栏确认插件仍在运行（或重新点击 ⧉）</div>
+      <div id="layoutMsg" class="layout-msg"></div>
       <div id="blocks" class="blocks"></div>
       <div id="viewerLayer" class="viewer-layer"></div>
     </section>
@@ -17,7 +18,17 @@
       <div class="header">
         <h3>bitable-editor</h3>
         <div class="header-actions">
-          <a id="helpLink" class="refresh-btn help-link" href="https://zyt.feishu.cn/wiki/BcnjwJ86BiTQJokiwHXcvi3Gnwd" target="_blank" rel="noopener noreferrer" title="使用教程">?</a>
+          <div class="menu-wrap">
+            <button id="menuBtn" class="refresh-btn" title="更多功能">☰</button>
+            <div id="menu" class="menu" hidden>
+              <a id="helpLink" class="menu-item" target="_blank" rel="noopener noreferrer">使用教程</a>
+              <button class="menu-item menu-group" data-submenu>双栏布局<span class="menu-arrow">▸</span></button>
+              <div class="submenu" hidden>
+                <button id="layoutImportBtn" class="menu-item sub" title="从文件导入左侧布局（会替换当前表格的布局）">布局导入</button>
+                <button id="layoutExportBtn" class="menu-item sub" title="把当前表格的左侧布局导出为文件，方便分享给别人">布局导出</button>
+              </div>
+            </div>
+          </div>
           <button id="refreshBtn" class="refresh-btn" title="刷新视图记录列表">↻</button>
         </div>
         <div class="nav-controls">

@@ -715,3 +715,75 @@ body.sidebar-zoom #app {
 }
 
 .af-modal-actions { display: flex; gap: 6px; }
+
+// “预览为什么没显示”的说明：固定在字段块的右上角（和字段名在同一行的最右边），不依赖字段名的宽度
+.field-row { position: relative; }
+
+.preview-note {
+  position: absolute;
+  top: 7px;
+  right: 10px;
+  max-width: 55%;
+  font-size: 12px;
+  font-weight: 400;
+  color: #999;
+  text-align: right;
+  line-height: 1.4;
+  cursor: help;
+}
+
+// 给说明留出位置：字段名很长时在说明左边换行，不会压在一起
+.field-label:has(.preview-note) { padding-right: 45%; }
+
+// 顶部栏最左边的 ☰“更多功能”菜单（侧边栏和双栏面板共用）：后续新增的功能入口都放这里，不用再挤占顶部栏的位置
+.menu-wrap { position: relative; }
+
+.menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 50;
+  min-width: 140px;
+  padding: 4px;
+  background: #fff;
+  border: 1px solid #e3e7ef;
+  border-radius: 6px;
+  box-shadow: 0 4px 14px rgba(31, 45, 61, 0.18);
+}
+
+.menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 6px 10px;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  color: #333;
+  font-size: 13px;
+  text-align: left;
+  text-decoration: none;
+  white-space: nowrap;
+  cursor: pointer;
+
+  &:hover { background: #f0f4ff; color: #4f7cff; }
+  &.sub { padding-left: 22px; } // 二级项缩进
+}
+
+.menu-arrow { margin-left: 10px; color: #999; font-size: 11px; transition: transform 0.15s; }
+.menu-group.open .menu-arrow { transform: rotate(90deg); }
+
+// 第一次使用时 ☰ 上的小红点，打开过菜单就消失
+.refresh-btn.has-dot { position: relative; }
+.refresh-btn.has-dot::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 7px;
+  height: 7px;
+  background: #ff4d4f;
+  border: 1px solid #fff;
+  border-radius: 50%;
+}

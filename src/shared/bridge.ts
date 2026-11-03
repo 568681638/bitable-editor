@@ -8,6 +8,7 @@ export type MessageStatus = { kind: 'loading' | 'empty' | 'error'; text: string 
 // 插件 → 面板
 export interface SnapshotMessage {
   type: 'snapshot';
+  tableId: string; // 当前数据表 ID：面板按它区分各表格各自的左侧分块布局
   status: MessageStatus;
   fields: FieldMeta[];
   options: Record<string, FieldOption[]>;

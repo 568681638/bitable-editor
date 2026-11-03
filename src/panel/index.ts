@@ -3,11 +3,12 @@ import '../styles/panel.scss';
 import {
   FType, FieldMeta, RecordData,
   esc, isUrl, cleanUrl, segmentsToText, findUrlInSegments, extractUrlFromValue,
-  detectUrlType, proxyUrl, resolveImageUrl, isFramebuster, installProxyFallback,
+  detectUrlType, proxyUrl, resolveImageUrl, isFramebuster, installProxyFallback, HELP_URL,
 } from '../shared/common';
 import { createAnnotatorUI, FIELD_DRAG_TYPE } from '../shared/annotator-ui';
 import { setupModeSwitch } from '../shared/mode-switch';
 import { setupZoom } from '../shared/zoom';
+import { setupMenu } from '../shared/menu';
 import { describedError } from '../shared/errors';
 import { autosizeTextarea, trackManualResize, installLineSelectAll } from '../shared/textarea';
 import type { HostMessage, PanelCommand, SnapshotMessage } from '../shared/bridge';
@@ -59,6 +60,7 @@ window.addEventListener('message', (e) => {
     lastPong = Date.now();
     gotPong = true;
     snapshot = msg;
+    if (msg.tableId && msg.tableId !== currentTableId) switchTable(msg.tableId, msg.fields);
     if (msg.status) ui.showMessage(msg.status.kind, msg.status.text);
     else if (msg.record) ui.showRecord({ fields: msg.fields, options: msg.options, record: msg.record, index: msg.index, total: msg.total });
     else ui.showMessage('error', '未收到记录数据，请在侧边栏点击 ↻ 刷新');
@@ -87,12 +89,15 @@ if (!opener) {
 }
 
 // ── 左侧分块布局（树：split 节点按行/列切分，leaf 节点对应一个字段）──
-interface Leaf { kind: 'leaf'; id: string; fieldId: string; size: number; }
+// fieldName：导入时对应不上字段的分块记着原字段名，等用户拖字段进来替换（见 isPending）
+interface Leaf { kind: 'leaf'; id: string; fieldId: string; size: number; fieldName?: string; }
 interface Split { kind: 'split'; dir: 'row' | 'column'; children: LayoutNode[]; size: number; }
 type LayoutNode = Leaf | Split;
 type Zone = 'left' | 'right' | 'top' | 'bottom';
 
-const LAYOUT_KEY = 'annotator-panel-layout-v2';
+const LAYOUT_KEY = 'annotator-panel-layout-v2'; // 旧版：所有表格共用一份，只用于迁移
+const layoutKeyOf = (tableId: string) => `annotator-panel-layout-v3:${tableId}`; // 现在：每个数据表各存一份
+const LAST_TABLE_KEY = 'annotator-panel-last-table'; // 上次看的数据表，打开页面时先按它恢复布局，避免等快照时闪一下空白
 const WIDTH_KEY = 'annotator-panel-width';
 const ZOOM_KEY = 'annotator-panel-zoom-v4'; // 之前的版本会把默认值也自动存下来，换个 key 让它们失效
 const BLOCK_DRAG_TYPE = 'application/x-annotator-block';
@@ -105,16 +110,34 @@ function validNode(n: any): boolean {
   return n.kind === 'split' && (n.dir === 'row' || n.dir === 'column') && Array.isArray(n.children) && n.children.every(validNode);
 }
 
-function loadLayout(): LayoutNode | null {
+function parseLayout(raw: string | null): LayoutNode | null {
   try {
-    const n = JSON.parse(localStorage.getItem(LAYOUT_KEY) || '');
+    const n = JSON.parse(raw || '');
     if (validNode(n)) return normalize(n);
   } catch { /* ignore */ }
   return null;
 }
 
-let root: LayoutNode | null = loadLayout();
-const saveLayout = () => localStorage.setItem(LAYOUT_KEY, JSON.stringify(root));
+let currentTableId = localStorage.getItem(LAST_TABLE_KEY) || '';
+let root: LayoutNode | null = currentTableId ? parseLayout(localStorage.getItem(layoutKeyOf(currentTableId))) : null;
+const saveLayout = () => { if (currentTableId) localStorage.setItem(layoutKeyOf(currentTableId), JSON.stringify(root)); };
+
+// 侧边栏切到了另一张数据表：保存的是各表自己的布局（字段 ID 是表内的，跨表没有意义），换表就换成那张表的布局。
+// 旧版所有表共用一份布局：第一次遇到字段能对上的那张表，把旧布局迁给它，然后删掉旧的，不再套到别的表上
+function switchTable(tableId: string, fields: FieldMeta[]) {
+  currentTableId = tableId;
+  localStorage.setItem(LAST_TABLE_KEY, tableId);
+  root = parseLayout(localStorage.getItem(layoutKeyOf(tableId)));
+  if (!root) {
+    const legacy = parseLayout(localStorage.getItem(LAYOUT_KEY));
+    if (legacy && leaves(legacy).some(l => fields.some(f => f.id === l.fieldId))) {
+      root = legacy;
+      saveLayout();
+      localStorage.removeItem(LAYOUT_KEY);
+    }
+  }
+  renderBlocks();
+}
 
 const blocksEl = document.getElementById('blocks') as HTMLElement;
 const blockEls = new Map<string, HTMLElement>();
@@ -263,8 +286,9 @@ function insertBeside(target: Leaf, added: Leaf, zone: Zone) {
 }
 
 // ── 字段值 → 展示内容 ─────────────────────────────
-function fieldName(fieldId: string): string {
-  return snapshot?.fields.find(f => f.id === fieldId)?.name || '（字段不在当前视图）';
+// 分块的字段在当前视图里找不到（跨表导入的布局、或字段后来被移出视图）：保留分块位置，等用户拖字段进来替换
+function isPending(leaf: Leaf): boolean {
+  return !!snapshot && !snapshot.fields.some(f => f.id === leaf.fieldId);
 }
 
 function valueToText(value: any): string {
@@ -306,7 +330,9 @@ function updateBlock(leaf: Leaf) {
   const el = blockEls.get(leaf.id);
   if (!el) return;
   const field = snapshot?.fields.find(f => f.id === leaf.fieldId);
-  (el.querySelector('.block-title') as HTMLElement).textContent = fieldName(leaf.fieldId);
+  const pending = !field && isPending(leaf);
+  el.classList.toggle('pending', pending);
+  (el.querySelector('.block-title') as HTMLElement).textContent = field ? field.name : (leaf.fieldName || '（字段不在当前视图）');
 
   const content = blockContent(field, snapshot?.record || null);
   const { url } = content;
@@ -343,7 +369,7 @@ function updateBlock(leaf: Leaf) {
   const bodyKey = field ? '' : 'x';
   if (body.dataset.key !== bodyKey) {
     body.dataset.key = bodyKey;
-    body.innerHTML = field ? '' : '<div class="block-hint">该字段不在当前视图中</div>';
+    body.innerHTML = field ? '' : '<div class="block-hint">该字段不在当前视图中<br>把右侧的字段拖到这里可替换</div>';
   }
 }
 
@@ -452,7 +478,7 @@ function renderBlocks() {
     removeViewer(id);
   }
   if (!root) {
-    blocksEl.innerHTML = '<div class="blocks-empty"><div class="blocks-empty-title">← 把右侧编辑区里的字段名拖到这里</div><div class="blocks-empty-sub">可拖入多个字段，拖到已有分块的边缘即可上下左右分屏</div></div>';
+    blocksEl.innerHTML = '<div class="blocks-empty"><div class="blocks-empty-title">← 把右侧编辑区里的字段名拖到这里</div><div class="blocks-empty-sub">可拖入多个字段，拖到已有分块的边缘即可上下左右分屏</div><div class="blocks-empty-sub"><a href="' + HELP_URL + '" target="_blank" rel="noopener noreferrer">不知道怎么用？查看使用教程</a></div></div>';
   } else {
     blocksEl.appendChild(buildNode(root));
   }
@@ -460,6 +486,101 @@ function renderBlocks() {
   ui.setHiddenFields(new Set(all.map(l => l.fieldId)));
   updateBlocks();
 }
+
+// ── 布局导入 / 导出：把当前数据表的左侧分块布局存成文件，方便分享给别人 ──
+// 布局记在浏览器 localStorage 里，换电脑、换浏览器、发给同事都带不走，所以提供文件导出。
+// 文件里每个分块除了字段 ID，还带上字段名：对方是另一张表（字段 ID 不同）时，按字段名重新匹配。
+const LAYOUT_FILE_TYPE = 'bitable-editor-layout';
+const layoutMsgEl = document.getElementById('layoutMsg') as HTMLElement;
+let layoutMsgTimer: number | undefined;
+
+function layoutNotice(text: string, isError = false) {
+  layoutMsgEl.textContent = text;
+  layoutMsgEl.classList.toggle('error', isError);
+  window.clearTimeout(layoutMsgTimer);
+  layoutMsgTimer = window.setTimeout(() => { layoutMsgEl.textContent = ''; }, 8000);
+}
+
+function exportLayout() {
+  if (!root) { layoutNotice('当前没有布局可导出：先把字段拖到左侧', true); return; }
+  const names = new Map((snapshot?.fields || []).map(f => [f.id, f.name]));
+  const withNames = (n: LayoutNode): any => n.kind === 'leaf'
+    ? { kind: 'leaf', fieldId: n.fieldId, fieldName: names.get(n.fieldId) || n.fieldName || '', size: n.size }
+    : { kind: 'split', dir: n.dir, size: n.size, children: n.children.map(withNames) };
+  const text = JSON.stringify({ type: LAYOUT_FILE_TYPE, version: 1, layout: withNames(root) }, null, 2);
+  const pad = (x: number) => String(x).padStart(2, '0');
+  const d = new Date();
+  const name = `双栏布局_${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.json`;
+  const url = URL.createObjectURL(new Blob([text], { type: 'application/json;charset=utf-8' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  layoutNotice('已导出布局');
+}
+
+// 导入的布局里每个分块的字段对应到当前数据表：ID 和名字都对得上就用 ID；否则按字段名找（名字唯一才算）；
+// 找不到的分块保留位置（记下原字段名，等用户拖字段进来替换）。分块 ID 全部重新生成，避免和现有的冲突
+function mapImportedLayout(raw: any, fields: FieldMeta[], missing: string[], depth = 0): LayoutNode | null {
+  if (!raw || depth > 12 || typeof raw !== 'object') return null;
+  const size = typeof raw.size === 'number' && raw.size > 0 ? raw.size : 1;
+  if (raw.kind === 'leaf') {
+    const name = typeof raw.fieldName === 'string' ? raw.fieldName : '';
+    const id = String(raw.fieldId ?? '');
+    const byId = fields.find(f => f.id === id);
+    let hit = byId && (!name || byId.name === name) ? byId : undefined;
+    if (!hit && name) {
+      const same = fields.filter(f => f.name === name);
+      if (same.length === 1) hit = same[0];
+    }
+    if (!hit) {
+      missing.push(name || id);
+      return { kind: 'leaf', id: newId(), fieldId: id || `missing:${newId()}`, size, fieldName: name || undefined };
+    }
+    return { kind: 'leaf', id: newId(), fieldId: hit.id, size };
+  }
+  if (raw.kind === 'split' && (raw.dir === 'row' || raw.dir === 'column') && Array.isArray(raw.children)) {
+    const children = raw.children.map((c: any) => mapImportedLayout(c, fields, missing, depth + 1)).filter((c: LayoutNode | null): c is LayoutNode => !!c);
+    return children.length ? { kind: 'split', dir: raw.dir, size, children } : null;
+  }
+  throw new Error('布局文件里有无法识别的内容');
+}
+
+function importLayout() {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.json,application/json';
+  input.addEventListener('change', async () => {
+    const file = input.files && input.files[0];
+    if (!file) return;
+    try {
+      let data: any;
+      try { data = JSON.parse(await file.text()); } catch { throw new Error('文件不是合法的 JSON'); }
+      if (!data || data.type !== LAYOUT_FILE_TYPE) throw new Error('这不是本插件导出的布局文件');
+      if (!snapshot) throw new Error('还没有连上侧边栏，无法对应字段，请稍后再试');
+      const missing: string[] = [];
+      const mapped = normalize(mapImportedLayout(data.layout, snapshot.fields, missing));
+      if (!mapped) throw new Error('布局文件是空的，未导入');
+      if (root && !confirm('导入会替换当前表格的左侧布局，确定吗？')) return;
+      root = mapped;
+      saveLayout();
+      renderBlocks();
+      const uniq = [...new Set(missing)];
+      layoutNotice(uniq.length ? `已导入布局，有 ${missing.length} 个分块的字段在当前视图里找不到：${uniq.join('、')}。把右侧字段拖到这些分块上即可替换` : '已导入布局', uniq.length > 0);
+    } catch (e) {
+      layoutNotice(`导入失败：${e instanceof Error ? e.message : String(e)}`, true);
+    }
+  });
+  input.click();
+}
+
+// 顶部栏的 ☰ 菜单（逻辑在 shared/menu.ts）；选了菜单项后收起
+const { close: closeMenu } = setupMenu();
+document.getElementById('layoutExportBtn')!.addEventListener('click', () => { closeMenu(); exportLayout(); });
+document.getElementById('layoutImportBtn')!.addEventListener('click', () => { closeMenu(); importLayout(); });
 
 // ── 分隔线拖动：只改相邻两块，其余保持 ─────────────
 function startResize(e: MouseEvent, split: Split, childEls: HTMLElement[], i: number) {
@@ -500,7 +621,7 @@ function startResize(e: MouseEvent, split: Split, childEls: HTMLElement[], i: nu
 const ZONES: Zone[] = ['left', 'right', 'top', 'bottom'];
 
 function clearDropMarks() {
-  blocksEl.querySelectorAll('.block').forEach(el => ZONES.forEach(z => el.classList.remove('drop-' + z)));
+  blocksEl.querySelectorAll('.block').forEach(el => { el.classList.remove('drop-replace'); ZONES.forEach(z => el.classList.remove('drop-' + z)); });
   blocksEl.querySelector('.drop-hint')?.remove();
 }
 
@@ -572,6 +693,7 @@ blocksEl.addEventListener('dragover', (e) => {
   const t = dropTarget(e);
   if (!t) return;
   if (t.blank) showDropHint(t.blank);
+  else if (isField && isPending(t.leaf)) t.el.classList.add('drop-replace');
   else t.el.classList.add('drop-' + t.zone);
 });
 blocksEl.addEventListener('dragleave', (e) => {
@@ -585,6 +707,14 @@ blocksEl.addEventListener('drop', (e) => {
   endDrag();
   if (fieldId) {
     if (leaves(root).some(l => l.fieldId === fieldId)) return; // 同一字段只放一块
+    if (t && !t.blank && isPending(t.leaf)) {
+      // 落在“字段不存在”的分块上：替换字段，保留分块的位置和大小
+      t.leaf.fieldId = fieldId;
+      delete t.leaf.fieldName;
+      saveLayout();
+      renderBlocks();
+      return;
+    }
     const added: Leaf = { kind: 'leaf', id: newId(), fieldId, size: 1 };
     if (!root) root = added;
     else if (t) insertBeside(t.leaf, added, t.zone);
@@ -605,6 +735,8 @@ blocksEl.addEventListener('drop', (e) => {
 document.addEventListener('dragend', endDrag);
 
 renderBlocks();
+// 教程链接被服务端配置覆盖后，空状态里的链接也要跟着更新
+document.addEventListener('config-loaded', () => { if (!root) renderBlocks(); });
 
 // ── 左右两栏之间拖动调整宽度；右栏字号缩放 ────────
 const layoutEl = document.querySelector('.panel-layout') as HTMLElement;

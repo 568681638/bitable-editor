@@ -1,9 +1,10 @@
 import {
   FType, FieldMeta, FieldOption, RecordData,
   cleanUrl, segmentsToText, findUrlInSegments, extractUrlFromValue, hasNewlines,
-  isUrl, esc, detectUrlType, renderUrlPreview,
+  isUrl, esc, detectUrlType, renderUrlPreview, isFramebuster,
 } from './common';
 import { describeError } from './errors';
+import { showPreviewNote } from './common';
 import { autosizeTextarea, trackManualResize, installLineSelectAll } from './textarea';
 
 const READONLY_TYPES = new Set([
@@ -117,6 +118,7 @@ export function createAnnotatorUI(opts: AnnotatorOptions) {
     }).join('');
 
     recordContent.innerHTML = `<div class="record-fields">${fieldsHtml}</div>`;
+    hydrateFramePreviews();
     applyHiddenFields();
     attachFieldListeners();
     setupTextareas();
@@ -181,7 +183,49 @@ export function createAnnotatorUI(opts: AnnotatorOptions) {
 
   function urlPreviewHtml(url: string): string {
     if (!opts.urlPreview) return '';
-    return `<div class="url-preview">${renderUrlPreview(url, detectUrlType(url))}</div>`;
+    const type = detectUrlType(url);
+    if (type === 'webpage') {
+      // 已知会破框的网站：不渲染预览区，改在字段块右上角写一句说明（占位元素，渲染后由 hydrateFramePreviews 处理）
+      if (isFramebuster(url)) return `<span hidden data-preview-note="该站点不支持嵌入，无法预览" data-preview-title="这个站点嵌入后会反复触发登录重载，所以不渲染预览，可以直接点开链接查看"></span>`;
+      // 先隐藏，等服务端检查完“能不能被嵌入”再决定显示还是移除（见 hydrateFramePreviews）
+      return `<div class="url-preview" hidden data-frame-url="${esc(url)}"></div>`;
+    }
+    const inner = renderUrlPreview(url, type);
+    return inner ? `<div class="url-preview">${inner}</div>` : '';
+  }
+
+  // 网页预览：向服务端询问这个网页是否禁止被嵌入（X-Frame-Options / CSP frame-ancestors）。
+  // 确定禁止的就不显示；查不出来（服务端连不上、没有这个接口）按“可以嵌入”处理，不影响原有行为
+  const embeddableCache = new Map<string, Promise<{ ok: boolean; reason: string }>>();
+  function checkEmbeddable(url: string): Promise<{ ok: boolean; reason: string }> {
+    let p = embeddableCache.get(url);
+    if (!p) {
+      p = fetch(new URL('api/frame-check?url=' + encodeURIComponent(url), location.href).href)
+        .then(r => (r.ok ? r.json() : null))
+        .then(d => ({ ok: !(d && d.embeddable === false), reason: (d && d.reason) || '' }))
+        .catch(() => ({ ok: true, reason: '' }));
+      embeddableCache.set(url, p);
+    }
+    return p;
+  }
+
+  function hydrateFramePreviews() {
+    recordContent.querySelectorAll<HTMLElement>('.url-preview[data-frame-url]').forEach(box => {
+      const url = box.dataset.frameUrl || '';
+      checkEmbeddable(url).then(({ ok, reason }) => {
+        if (!box.isConnected) return; // 已经切到别的记录
+        if (ok) {
+          box.innerHTML = renderUrlPreview(url, 'webpage');
+          box.hidden = false;
+        } else {
+          showPreviewNote(box, '该网页禁止被嵌入，无法预览', `网页的响应头禁止被嵌入（${reason}），所以不渲染预览，可以直接点开链接查看`);
+        }
+      });
+    });
+    // 已知不渲染的站点：把说明写到字段块右上角
+    recordContent.querySelectorAll<HTMLElement>('span[data-preview-note]').forEach(el => {
+      showPreviewNote(el, el.dataset.previewNote || '', el.dataset.previewTitle || '');
+    });
   }
 
   // ── 控件渲染 ────────────────────────────────────

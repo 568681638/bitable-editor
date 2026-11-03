@@ -1,3 +1,17 @@
+// 使用教程的链接（☰ 菜单里的“使用教程”和双栏面板的空状态引导都用它）。
+// 这里是内置默认值；服务端 release/server/config.json 的 helpUrl 会在运行时覆盖它（见 loadConfig），改那个文件即可，不用重新构建
+export let HELP_URL = 'https://zyt.feishu.cn/wiki/BcnjwJ86BiTQJokiwHXcvi3Gnwd';
+
+// 从服务端取运行时配置；取不到（比如纯静态托管、服务没起）就保持默认值
+export async function loadConfig(): Promise<void> {
+  try {
+    const res = await fetch('/api/config', { cache: 'no-store' });
+    if (!res.ok) return;
+    const cfg = await res.json();
+    if (typeof cfg.helpUrl === 'string' && /^https?:\/\//i.test(cfg.helpUrl)) HELP_URL = cfg.helpUrl;
+  } catch { /* 用默认值 */ }
+}
+
 // ── 类型定义 ──────────────────────────────────────
 export interface FieldMeta {
   id: string;
@@ -136,24 +150,48 @@ export function proxyUrl(url: string): string {
   return url;
 }
 
-// 媒体直连失败（网络不通 / 混合内容 / CORS / PNA 等）时，自动改走服务器代理重试一次
+// 媒体直连失败（网络不通 / 混合内容 / CORS / PNA 等）时，自动改走服务器代理重试一次；
+// 走了代理还是失败，说明这个预览显示不出来，把编辑区里对应的预览区整块移除，不占位置
 export function installProxyFallback() {
   document.addEventListener('error', (e) => {
     const el = e.target as HTMLElement | null;
     if (!el || !['IMG', 'VIDEO', 'AUDIO', 'SOURCE'].includes(el.tagName)) return;
     const raw = el.getAttribute('src');
-    if (!raw || !/^https?:\/\//i.test(raw) || el.dataset.proxied) return;
-    el.dataset.proxied = '1';
-    el.setAttribute('src', toProxy(raw));
-    const media = el.tagName === 'SOURCE' ? el.parentElement as HTMLMediaElement | null : null;
-    if (media && typeof media.load === 'function') media.load();
-    e.stopPropagation();
+    if (!raw) return;
+    const alreadyProxied = !!el.dataset.proxied || raw.indexOf('api-proxy/') === 0;
+    if (!alreadyProxied && /^https?:\/\//i.test(raw)) {
+      el.dataset.proxied = '1';
+      el.setAttribute('src', toProxy(raw));
+      const media = el.tagName === 'SOURCE' ? el.parentElement as HTMLMediaElement | null : null;
+      if (media && typeof media.load === 'function') media.load();
+      e.stopPropagation();
+      return;
+    }
+    const kind = el.tagName === 'IMG' ? '图片' : (el.closest('audio') ? '音频' : '视频');
+    showPreviewNote(el, `${kind}加载失败，无法预览`, `直连和服务端中转都没能加载这个${kind}：${raw}`);
   }, true);
+}
+
+// 预览显示不出来时：移除预览区，并在字段块的右上角（标题行右侧）写一句说明，让用户知道怎么回事。
+// from 可以是预览区里的任意元素，也可以是占位元素；找不到字段块或预览区已经被移除时什么都不做
+export function showPreviewNote(from: Element, text: string, title = '') {
+  const box = from.closest('.url-preview') || from;
+  const row = box.closest('.field-row');
+  if (!row || !box.isConnected) return;
+  box.remove();
+  const label = row.querySelector('.field-label');
+  if (!label) return;
+  label.querySelector('.preview-note')?.remove();
+  const note = document.createElement('span');
+  note.className = 'preview-note';
+  note.textContent = text;
+  if (title) note.title = title;
+  label.appendChild(note);
 }
 
 // ── 会执行破框代码的域名（不渲染 iframe，只展示链接） ──
 const FRAMEBUSTER_DOMAINS = [
-  'tte.zytintra.com',
+  'tte.zytintra.com', // 嵌入后会反复触发登录重载（实测），不渲染
 ];
 
 export function isFramebuster(url: string): boolean {
@@ -163,20 +201,17 @@ export function isFramebuster(url: string): boolean {
   } catch { return false; }
 }
 
+// 编辑区字段下方的预览。显示不出来的情况（走代理也加载失败、网页禁止嵌入）不留任何占位：
+// 图片 / 视频 / 音频加载失败时，由 installProxyFallback 把整个预览区移除；网页由 annotator-ui 先检查能否嵌入。
 export function renderUrlPreview(url: string, type: string): string {
   const src = esc(proxyUrl(url));
-  const fallbackLink = `<a href="${src}" target="_blank" rel="noopener noreferrer">${src}</a>`;
   switch (type) {
-    case 'video': return `<video controls style="width:100%;"><source src="${src}" type="video/mp4">${fallbackLink}</video>`;
-    case 'image': {
-      const imgSrc = esc(resolveImageUrl(proxyUrl(url)));
-      return `<img src="${imgSrc}" alt="预览" style="width:100%;object-fit:contain;" onerror="this.style.display='none';this.nextElementSibling.style.display=''" /><span style="display:none">${fallbackLink}</span>`;
-    }
-    case 'audio': return `<audio controls style="max-width:100%;"><source src="${src}">${fallbackLink}</audio>`;
-    case 'webpage': {
-      if (isFramebuster(url)) return fallbackLink;
-      return `<iframe src="${src}" style="width:100%;aspect-ratio:16/9;border:1px solid #ddd;border-radius:4px;" sandbox="allow-scripts allow-same-origin allow-popups">${fallbackLink}</iframe>`;
-    }
-    default: return fallbackLink;
+    case 'video': return `<video controls style="width:100%;"><source src="${src}" type="video/mp4"></video>`;
+    case 'image': return `<img src="${esc(resolveImageUrl(proxyUrl(url)))}" alt="预览" style="width:100%;object-fit:contain;" />`;
+    case 'audio': return `<audio controls style="max-width:100%;"><source src="${src}"></audio>`;
+    case 'webpage':
+      if (isFramebuster(url)) return '';
+      return `<iframe src="${src}" style="width:100%;aspect-ratio:16/9;border:1px solid #ddd;border-radius:4px;" sandbox="allow-scripts allow-same-origin allow-popups"></iframe>`;
+    default: return '';
   }
 }

@@ -11,7 +11,12 @@
     <div class="header">
       <h3>bitable-editor</h3>
       <div class="header-actions">
-        <a id="helpLink" class="refresh-btn help-link" href="https://zyt.feishu.cn/wiki/BcnjwJ86BiTQJokiwHXcvi3Gnwd" target="_blank" rel="noopener noreferrer" title="使用教程">?</a>
+        <div class="menu-wrap">
+          <button id="menuBtn" class="refresh-btn" title="更多功能">☰</button>
+          <div id="menu" class="menu" hidden>
+            <a id="helpLink" class="menu-item" target="_blank" rel="noopener noreferrer">使用教程</a>
+          </div>
+        </div>
         <button id="openPanelBtn" class="refresh-btn" title="在新标签页打开双栏面板（左侧自选字段展示，右侧编辑）">⧉</button>
         <button id="refreshBtn" class="refresh-btn" title="刷新视图记录列表">↻</button>
       </div>
