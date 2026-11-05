@@ -23,7 +23,7 @@ body {
 }
 
 .header {
-  --ctl-h: 28px; // 标题栏里按钮 / 输入框的统一高度：人工编辑（有导航）和自动刷写（没有导航）两种模式下标题栏等高
+  --ctl-h: 28px; // 标题栏里按钮 / 输入框的统一高度：人工编辑（有导航）和批处理（没有导航）两种模式下标题栏等高
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -136,7 +136,7 @@ body {
 .content {
   flex: 1;
   overflow-y: auto;
-  padding: 10px 8px; // 与自动刷写区一致
+  padding: 10px 8px; // 与批处理区一致
 }
 
 .loading {
@@ -156,7 +156,7 @@ body {
   flex-direction: column;
   gap: 2px;
   padding: 6px 10px;
-  // 外框与自动刷写区的卡片（.af-sec）保持一致：白底、同样的边框色、圆角和阴影
+  // 外框与批处理区的卡片（.af-sec）保持一致：白底、同样的边框色、圆角和阴影
   background: #fff;
   border-radius: 6px;
   border: 1px solid #e3e7ef;
@@ -337,7 +337,7 @@ body {
   margin-bottom: 16px;
 }
 
-// 底部左侧的 [ 人工编辑 | 自动刷写 ] 切换
+// 底部左侧的 [ 人工编辑 | 批处理 ] 切换
 .mode-switch {
   display: flex;
 }
@@ -367,7 +367,7 @@ body {
   padding: 10px 8px; // 比人工编辑的内容区更紧凑，给卡片多留点宽度
 }
 
-// 自动刷写模式：隐藏人工编辑的导航、内容和撤销/保存，保留切换条和字号按钮
+// 批处理模式：隐藏人工编辑的导航、内容和撤销/保存，保留切换条和字号按钮
 #app.mode-auto {
   .nav-controls,
   #recordContent,
@@ -410,7 +410,7 @@ body.sidebar-zoom #app {
   margin: 0;
 }
 
-// ── 自动刷写面板 ──────────────────────────────────
+// ── 批处理面板 ──────────────────────────────────
 // 筛选 / 输入 / 输出三个板块：各自包成一张卡片，标题放在卡片里面，一眼能分清各块
 .af-sec {
   margin-bottom: 8px;
@@ -566,7 +566,7 @@ body.sidebar-zoom #app {
   .af-fail-err { color: #ff4d4f; word-break: break-all; }
 }
 
-// 自动刷写的“刷写 / 取消”按钮：放在底部右侧，只在自动刷写模式显示
+// 批处理的“运行 / 取消”按钮：放在底部右侧，只在批处理模式显示
 .run-btn {
   display: none;
   padding: 8px 24px;
@@ -602,6 +602,7 @@ body.sidebar-zoom #app {
 }
 
 // 条件组的 × 放在组头部右上角：带底色和边框，比条件行里的无框 × 更重一点，用来区分；和“取反”隔开，不易误点
+.af-x-group:disabled { opacity: 0.4; cursor: not-allowed; &:hover { background: #f0f0f0; border-color: #d9d9d9; color: #666; } }
 .af-x-group {
   margin-left: auto;
   padding: 0 7px;
@@ -674,7 +675,7 @@ body.sidebar-zoom #app {
 
 // 筛选块右上角的 ☰ 菜单：导出 CSV、导入 / 导出筛选条件这些低频操作收在这里（样式沿用 ☰ 菜单的 .menu / .menu-item）
 .af-menu-wrap { position: relative; display: flex; }
-.af-more { height: 100%; line-height: 1; } // 和旁边的“预览结果”等高（☰ 字形比汉字高，不统一设行高会撑出高度差）
+.af-more { height: 100%; line-height: 1; } // 和旁边的“预览”等高（☰ 字形比汉字高，不统一设行高会撑出高度差）
 .af-menu { font-weight: 400; }
 .af-menu .menu-item:disabled { color: #ccc; cursor: not-allowed; background: none; }
 
@@ -751,3 +752,82 @@ body.sidebar-zoom #app {
   border: 1px solid #fff;
   border-radius: 50%;
 }
+
+// 历史记录窗口（挂在 body 上，沿用预览窗口的 .af-modal）：按天分组的条目列表，每条是一套完整配置的摘要
+.af-hist-box { width: min(560px, 94vw); }
+.af-hist-search { padding: 8px 14px; border-bottom: 1px solid #e8e8e8; background: #fff; }
+.af-hist-search input { width: 100%; padding: 5px 8px; border: 1px solid #d9d9d9; border-radius: 4px; font-size: 13px; outline: none; &:focus { border-color: #4f7cff; } }
+.af-hist-msg { padding: 6px 14px; border-bottom: 1px solid #e8e8e8; background: #f6ffed; color: #389e0d; font-size: 12px; &.error { background: #fff7e6; color: #d46b08; } &[hidden] { display: none; } }
+.af-hist-list { padding: 0 14px 10px; font-size: 13px; }
+.af-hist-day { position: sticky; top: 0; z-index: 1; padding: 8px 0 4px; background: #fff; color: #999; font-size: 12px; font-weight: 600; }
+// 选择栏：左边空心圆全选，中间已选数量，右边批量删除
+.af-hist-bar { display: flex; align-items: center; gap: 8px; padding: 6px 14px; border-bottom: 1px solid #e8e8e8; background: #fafafa; font-size: 12px; color: #666; }
+.af-hist-selinfo { flex: 1; }
+.af-hist-bar .af-add:disabled { color: #ccc; cursor: not-allowed; }
+
+// 空心圆：点选；选中是实心蓝底带对勾，全选栏里选了一部分时显示横杠
+.af-hist-check {
+  flex: none;
+  position: relative;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 1.5px solid #bfbfbf;
+  border-radius: 50%;
+  background: #fff;
+  cursor: pointer;
+
+  &:hover { border-color: #4f7cff; }
+  &.on { border-color: #4f7cff; background: #4f7cff; }
+  &.on::after { content: ''; position: absolute; left: 4px; top: 1px; width: 4px; height: 8px; border: solid #fff; border-width: 0 2px 2px 0; transform: rotate(45deg); }
+  &.part { border-color: #4f7cff; }
+  &.part::after { content: ''; position: absolute; left: 3px; top: 6px; width: 7px; height: 2px; background: #4f7cff; }
+}
+
+.af-hist-item {
+  position: relative;
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  border: 1px solid #e3e7ef;
+  border-radius: 6px;
+
+  &:hover { border-color: #4f7cff; background: #f7f9ff; }
+}
+.af-hist-item > .af-hist-check { position: absolute; top: 9px; left: 10px; }
+.af-hist-x {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  padding: 0 6px;
+  border: none;
+  background: none;
+  color: #999;
+  font-size: 18px;
+  line-height: 1.2;
+  cursor: pointer;
+
+  &:hover { color: #ff4d4f; }
+}
+.af-hist-title { display: flex; align-items: center; gap: 8px; margin: 0 24px 2px 24px; }
+.af-hist-kind {
+  padding: 0 6px;
+  border-radius: 3px;
+  background: #eef2ff;
+  color: #4f5fd0;
+  font-size: 12px;
+  font-weight: 600;
+
+  &.run { background: #fff1e6; color: #d46b08; }
+}
+.af-hist-time { flex: none; color: #999; font-size: 12px; }
+// 名称：显示在类型标签后面，占满剩余宽度；没命名时是淡色的“＋ 命名”，悬停才明显
+.af-hist-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; color: #333; cursor: text; &:hover { color: #4f7cff; } &.empty { flex: none; color: #bbb; font-weight: 400; font-size: 12px; } }
+.af-hist-name-input { flex: 1; min-width: 0; padding: 1px 6px; border: 1px solid #4f7cff; border-radius: 3px; font-size: 13px; outline: none; }
+.af-hist-line { color: #555; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.af-hist-line.stat { color: #389e0d; &.bad { color: #d46b08; } }
+.af-hist-btns { margin-top: 6px; }
+.af-hist-btns-left { display: flex; flex-wrap: wrap; gap: 6px; }
+
+// 标题行里的「历史」按钮：只在批处理模式显示
+.history-btn { display: none; align-items: center; justify-content: center; }
+#app.mode-auto .history-btn { display: inline-flex; }

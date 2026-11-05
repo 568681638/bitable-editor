@@ -511,3 +511,86 @@ body.marquee-mode .sel-layer {
   &:not(:empty) { display: block; }
   &.error { border-color: #ffd591; color: #d46b08; }
 }
+
+// ── 侧边栏收起：隐藏侧边栏，分隔条留在右边缘；分隔条上的小按钮负责收起 / 展开 ──
+.panel-layout.collapsed {
+  #app { display: none; }
+  .splitter { cursor: default; }
+}
+
+.splitter { position: relative; }
+
+.splitter-toggle {
+  position: absolute;
+  top: 50%;
+  left: -4px; // 往左多伸 4px：正好贴到预览窗格里字段块的右边缘（.blocks 的右内边距就是 4px），不压到字段块也不压到侧边栏
+  z-index: 10;
+  transform: translateY(-50%);
+  width: calc(100% + 4px);
+  height: 120px;
+  padding: 0;
+  border: none;
+  border-radius: 3px;
+  background: #aab2c3;
+  color: #fff;
+  font-size: 8px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.45; // 平时半透明，不抢眼；进入热区（含左边看不见的那段，::before 算按钮的一部分）才变实
+  transition: background 0.15s, font-size 0.15s, opacity 0.15s;
+
+  // 看不见的扩大热区：按钮本身不变宽，鼠标靠近（主要是左边的预览窗格一侧）就能点中
+  &::before {
+    content: '';
+    position: absolute;
+    top: -8px;
+    bottom: -8px;
+    left: -8px;
+    right: 0;
+  }
+
+  // 悬停反馈：变主色、箭头放大，让人知道这里能点
+  &:hover { opacity: 1; background: #4f7cff; font-size: 10px; }
+}
+
+// ── 记录导航（上一条 / 跳转 / 下一条）：拖侧边栏标题名「bitable-editor」到预览窗格放成字段块 ──
+.header h3[draggable="true"] { cursor: grab; user-select: none; }
+
+// 标题行块：侧边栏标题行的副本，整行蓝底；☰ 菜单要伸到块外面，所以这种块不裁剪溢出
+.block-header-clone {
+  overflow: visible;
+  min-height: min-content; // 被挤压时也不低于标题行自己的高度（块不裁剪溢出，矮了标题行会漏到块外面）
+
+  .header {
+    --ctl-h: 28px;
+    border-radius: 5px;
+    border-bottom: none;
+    padding: 10px 14px;
+  }
+
+  // 标题名同时是字段块的“拖动把手”（.block-title），这里换回标题行的外观
+  .header h3.block-title {
+    flex: none;
+    max-width: none;
+    padding: 0;
+    font-size: 18px;
+    font-weight: 600;
+    color: #fff;
+    cursor: grab;
+  }
+
+  .menu { z-index: 30; }
+  .menu.up { top: auto; bottom: calc(100% + 6px); }
+  .menu.left { right: auto; left: 0; }
+  [data-proxy="marqueeBtn"].active { background: #fff; color: #4f7cff; }
+
+  .block-close {
+    padding: 0 8px;
+    background: rgba(255, 255, 255, 0.2);
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    color: #fff;
+    font-size: 14px;
+
+    &:hover { background: #ff4d4f; color: #fff; }
+  }
+}

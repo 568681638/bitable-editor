@@ -13,7 +13,7 @@ import type { MessageStatus, PanelCommand, SnapshotMessage, AckMessage, PongMess
 let currentTable: any = null;
 let currentView: any = null;
 let fields: FieldMeta[] = []; // 当前视图可见的字段（人工编辑、预览 / 导出的列）
-let tableFields: FieldMeta[] = []; // 数据表的全部字段，含视图里隐藏的（自动刷写选字段用）
+let tableFields: FieldMeta[] = []; // 数据表的全部字段，含视图里隐藏的（批处理选字段用）
 // 记录按需分批加载：先只取视图里全部记录 ID（顺序与视图一致，总数 = ID 数），
 // 记录内容按 BLOCK_SIZE 一块块取，缓存在 recordCache 里
 const BLOCK_SIZE = 40;
@@ -40,7 +40,7 @@ const ui = createAnnotatorUI({
   onNavigate: (index) => { show(index, true); },
   onRefresh: () => {
     refreshRecords();
-    // 顶部 ↻ 在自动刷写面板里时，顺带重新读取后端函数列表
+    // 顶部 ↻ 在批处理面板里时，顺带重新读取后端函数列表
     if (autoMode) autoFlush.show();
   },
   saveRecord: async (recordId, values) => {
@@ -80,9 +80,10 @@ const autoFlush = createAutoFlush(document.getElementById('autoContent') as HTML
   },
 }, document.getElementById('runBtn') as HTMLButtonElement);
 let autoMode = false;
-// 视图/字段变化（刷新、切换表格视图）后，自动刷写面板要重画，字段下拉才会同步
+// 视图/字段变化（刷新、切换表格视图）后，批处理面板要重画，字段下拉才会同步
 const refreshAutoFlush = () => { if (autoMode) autoFlush.rerender(); };
 setupMenu();
+document.getElementById('historyBtn')!.addEventListener('click', () => autoFlush.openHistory());
 setupModeSwitch(ui.saveIfModified, (mode) => { autoMode = mode === 'auto'; if (autoMode) autoFlush.show(); });
 document.body.classList.add('sidebar-zoom');
 setupZoom(document.documentElement, 'annotator-sidebar-zoom-v2', 1.05);

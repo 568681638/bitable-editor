@@ -13,10 +13,12 @@
       <div id="blocks" class="blocks"></div>
       <div id="viewerLayer" class="viewer-layer"></div>
     </section>
-    <div id="splitter" class="splitter" title="拖动调整预览窗格与侧边栏的宽度"></div>
+    <div id="splitter" class="splitter" title="拖动调整预览窗格与侧边栏的宽度">
+      <button id="collapseBtn" class="splitter-toggle" type="button" title="收起侧边栏">▶</button>
+    </div>
     <div id="app">
       <div class="header">
-        <h3>bitable-editor</h3>
+        <h3 id="navHandle" draggable="true" title="拖到左边预览窗格，放一份标题行（含上一条 / 下一条、☰、⬚、↻）过去；侧边栏上的标题行保留，收起侧边栏后也能用">bitable-editor</h3>
         <div class="header-actions">
           <div class="menu-wrap">
             <button id="menuBtn" class="refresh-btn" title="更多功能">☰</button>
@@ -46,7 +48,7 @@
       <div class="footer">
         <div class="mode-switch">
           <button class="mode-btn active" data-mode="manual">人工编辑</button>
-          <button class="mode-btn" data-mode="auto">自动刷写</button>
+          <button class="mode-btn" data-mode="auto">批处理</button>
         </div>
         <div class="zoom-ctrl">
           <button id="zoomOutBtn" class="zoom-btn" title="缩小侧边栏字号">A−</button>

@@ -1,4 +1,4 @@
-// 底部左侧的 [ 人工编辑 | 自动刷写 ] 切换：给 #app 加/去 mode-auto，由样式决定显示哪块内容
+// 底部左侧的 [ 人工编辑 | 批处理 ] 切换：给 #app 加/去 mode-auto，由样式决定显示哪块内容
 export function setupModeSwitch(saveIfModified: () => Promise<void>, onMode?: (mode: 'manual' | 'auto') => void) {
   const app = document.getElementById('app') as HTMLElement;
   const buttons = Array.from(document.querySelectorAll<HTMLButtonElement>('.mode-btn'));

@@ -1,13 +1,13 @@
 import { FType, FieldMeta, FieldOption } from './common';
 
-// ── 自动刷写：把函数返回的值，转成各类型字段在“多维表格插件 SDK”里写入所需的单元格结构 ──
+// ── 批处理：把函数返回的值，转成各类型字段在“多维表格插件 SDK”里写入所需的单元格结构 ──
 // 写入结构（见 SDK 类型定义）：文本 [{type:'text',text}]、数字 number、单选 {id,text}、多选 [{id,text}]、
 // 日期 毫秒时间戳 number、复选框 boolean、电话/邮箱 string、超链接 [{type:'url',text,link}]、人员 [{id}]。
 // 函数返回值就按该类型在多维表格里的原生形态给（数字给数字、复选框给 true/false、日期给毫秒时间戳……），
 // 这里不做宽松兼容（不解析日期字符串、不拆分隔符、不猜真假词），类型不对直接报错。
 // 唯一的转换是单选/多选：函数给选项名，这里换成选项 ID（函数不可能知道选项 ID）。
 
-/** 当前支持写入的字段类型（其余类型，如公式、附件、关联，选了会在刷写前被拦住并提示） */
+/** 当前支持写入的字段类型（其余类型，如公式、附件、关联，选了会在运行前被拦住并提示） */
 export const WRITABLE_TYPES = new Set<number>([
   FType.TEXT, FType.NUMBER, FType.CURRENCY, FType.PROGRESS, FType.RATING,
   FType.SINGLE_SELECT, FType.MULTI_SELECT, FType.DATE_TIME, FType.CHECKBOX,

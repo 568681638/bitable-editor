@@ -1,4 +1,4 @@
-# 自动刷写的 Python 函数执行器：由 server.mjs 调用，不要直接运行。
+# 批处理的 Python 函数执行器：由 server.mjs 调用，不要直接运行。
 #   python _python_executor.py <函数文件.py> meta <输入文件> <输出文件>   → 把该文件的 META 写进输出文件
 #   python _python_executor.py <函数文件.py> run  <输入文件> <输出文件>   → 读输入文件 {"rows": [...]}，把 {"results": [...]} 写进输出文件
 # 数据全部走文件（JSON，UTF-8），不经过命令行参数和管道，数据量不受限制；

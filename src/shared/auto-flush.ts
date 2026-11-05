@@ -3,7 +3,7 @@ import { FieldMeta, FieldOption, RecordData, esc } from './common';
 import { buildPreviewHtml } from './preview-page';
 import { WRITABLE_TYPES, FIELD_TYPE_NAMES, needsOptions, toFieldValue } from './field-value';
 
-// ── 自动刷写面板：筛选记录 → 取输入字段调用后端函数 → 把输出写回字段 ──────────
+// ── 批处理面板：筛选记录 → 取输入字段调用后端函数 → 把输出写回字段 ──────────
 // 函数由后端注册（release/server/functions/ 目录下的 .mjs / .py，热加载），这里只通过 /api/functions 读元信息、批量调用
 
 export interface AutoFlushHost {
@@ -41,6 +41,13 @@ const SEPS: [string, string][] = [[',', '英文逗号 ,'], ['\n', '换行']];
 const DEFAULT_SEP = ',';
 const CUSTOM_SEP = '__custom__'; // sep 取这个值时，用 customSep 作为拆分符
 const CALL_BATCH = 100; // 每批调用函数并写回的记录数（函数是批量接口，一批一次请求）
+
+// 历史记录（类比浏览历史）：每次筛选 / 预览 / 导出 / 运行都记一条，连同当时整套配置（筛选 + 输入 + 输出），之后可以一键恢复
+type HistoryKind = 'filter' | 'preview' | 'export' | 'run';
+interface HistoryEntry { id: string; time: number; kind: HistoryKind; name?: string; config: Config; matched: number; total: number; result?: string; ok?: boolean }
+const HISTORY_LIMIT = 50; // 超出时先丢最旧的未命名记录，命名过的优先保留
+const HISTORY_NAME_MAX = 40;
+const HISTORY_KINDS: Record<HistoryKind, string> = { filter: '筛选', preview: '预览', export: '导出 CSV', run: '运行' };
 
 const emptyGroup = (): Group => ({ kind: 'group', logic: 'and', negate: false, children: [] });
 const newConfig = (): Config => ({ filter: emptyGroup(), inputs: [], outputs: [] });
@@ -135,10 +142,10 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
   let config = newConfig();
   let configTable = '';
   let running = false;
-  let exporting = false; // 正在读取全部记录做筛选 / 导出（期间不能刷写）
+  let exporting = false; // 正在读取全部记录做筛选 / 导出（期间不能运行）
   // 最近一次筛选的结果：只记条数和当时的条件签名，条件改了就判定为过期
   let filterResult: { sig: string; matched: number; total: number } | null = null;
-  // 最近一次刷写中失败的行（含当时送给函数的输入），供展开查看 / 复制 / 导出
+  // 最近一次运行中失败的行（含当时送给函数的输入），供展开查看 / 复制 / 导出
   let failures: { index: number; recordId: string; inputs: string[]; error: string }[] = [];
   let failureHeaders: string[] = [];
   let failOpen = false;
@@ -164,6 +171,39 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     }
   }
   const saveConfig = () => { try { localStorage.setItem(storeKey(), JSON.stringify(config)); } catch { /* ignore */ } };
+
+  // ── 历史记录 ────────────────────────────────────
+  const historyKey = () => `annotator-auto-flush-history:${host.getTableId()}`;
+  function readHistory(): HistoryEntry[] {
+    try {
+      const list = JSON.parse(localStorage.getItem(historyKey()) || '[]');
+      return Array.isArray(list) ? list.filter(e => e && e.config && e.config.filter) : [];
+    } catch { return []; }
+  }
+  function writeHistory(list: HistoryEntry[]) {
+    let kept = list;
+    for (let i = kept.length - 1; i >= 0 && kept.length > HISTORY_LIMIT; i--) if (!kept[i].name) kept = kept.filter((_, k) => k !== i);
+    try { localStorage.setItem(historyKey(), JSON.stringify(kept.slice(0, HISTORY_LIMIT))); } catch { /* ignore */ }
+  }
+  const cloneConfig = (): Config => JSON.parse(JSON.stringify(config));
+
+  // 连续两次用同一套配置做同一件事（筛选 / 预览 / 导出）只留最新一条；运行每次都单独记
+  function recordHistory(kind: HistoryKind, matched: number, total: number): string {
+    const list = readHistory();
+    const top = list[0];
+    const same = kind !== 'run' && top && top.kind === kind && JSON.stringify(top.config) === JSON.stringify(config);
+    const entry: HistoryEntry = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), time: Date.now(), kind, config: cloneConfig(), matched, total };
+    if (same && top.name) entry.name = top.name; // 顶上那条被同配置的新记录顶替时，名字沿用
+    writeHistory([entry, ...(same ? list.slice(1) : list)]);
+    return entry.id;
+  }
+  function updateHistory(id: string, patch: Partial<HistoryEntry>) {
+    const list = readHistory();
+    const entry = list.find(e => e.id === id);
+    if (!entry) return;
+    Object.assign(entry, patch);
+    writeHistory(list);
+  }
 
   // ── 函数元信息 ──────────────────────────────────
   // silent：已经有函数列表时静默重读（后端热加载了新函数），不闪“加载中”
@@ -238,7 +278,9 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       <div class="af-group-head">
         <select data-act="logic"><option value="and"${node.logic === 'and' ? ' selected' : ''}>满足全部（且）</option><option value="or"${node.logic === 'or' ? ' selected' : ''}>满足任一（或）</option></select>
         <label class="af-neg"><input type="checkbox" data-act="negate"${node.negate ? ' checked' : ''} />取反</label>
-        ${path.length ? '<button class="af-x af-x-group" data-act="del" title="删除整个条件组（包含组内所有条件）">×</button>' : ''}
+        ${path.length ? '<button class="af-x af-x-group" data-act="del" title="删除整个条件组（包含组内所有条件）">×</button>'
+          // 最外层的初始组：× 清空里面的全部条件，并把“且 / 或”“取反”恢复成初始状态
+          : clearBtn('clear-filter', '筛选条件，并恢复到初始状态', node.children.length === 0 && node.logic === 'and' && !node.negate)}
       </div>
       <div class="af-children">${node.children.map((ch, i) => renderNode(ch, [...path, i])).join('')}</div>
       <div class="af-group-add">
@@ -274,6 +316,10 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     </div>`).join('');
   }
 
+  // 块右上角的 ×：一键清空这个块里的内容（块里本来就是空的、或正在运行时置灰）
+  const clearBtn = (act: string, what: string, empty: boolean) =>
+    `<button class="af-x af-x-group" data-act="${act}" title="清空全部${what}"${empty || running || exporting ? ' disabled' : ''}>×</button>`;
+
   function render() {
     loadConfig();
     const keepScroll = container.scrollTop;
@@ -286,9 +332,9 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       body = '<div class="af-hint">后端还没有注册任何函数（在服务器的 release/server/functions/ 目录里添加）</div>';
     } else {
       body = `
-        <section class="af-sec"><h4 class="af-h"><span>筛选 <span class="af-count"></span></span><span class="af-h-actions"><button class="af-add" data-act="filter" title="读取视图记录，只计算命中数，不调用函数、不写入"${running || exporting ? ' disabled' : ''}>筛选</button><button class="af-add" data-act="preview-filtered" title="在悬浮窗口里查看符合筛选条件的记录（全部可见字段）"${running || exporting ? ' disabled' : ''}>预览结果</button><span class="af-menu-wrap"><button class="af-add af-more" data-act="filter-menu" title="更多：导出 CSV、导入 / 导出筛选条件">☰</button>${filterMenuOpen ? `<div class="menu af-menu"><button class="menu-item" data-act="export-filtered" title="把视图里符合筛选条件的记录（全部可见字段）导出为 CSV"${running || exporting ? ' disabled' : ''}>导出 CSV</button><button class="menu-item" data-act="filter-import" title="从文件导入筛选条件（会替换当前条件）"${running || exporting ? ' disabled' : ''}>筛选条件导入</button><button class="menu-item" data-act="filter-export" title="把当前筛选条件导出为文件，方便复用">筛选条件导出</button></div>` : ''}</span></span></h4>${renderNode(config.filter, [])}</section>
-        <section class="af-sec"><h4>输入</h4>${renderInputs()}<button class="af-add" data-act="add-input">＋ 输入项</button></section>
-        <section class="af-sec"><h4>输出</h4>${renderOutputs()}<button class="af-add" data-act="add-output">＋ 输出项</button></section>
+        <section class="af-sec"><h4 class="af-h"><span>筛选 <span class="af-count"></span></span><span class="af-h-actions"><button class="af-add" data-act="filter" title="读取视图记录，只计算命中数，不调用函数、不写入"${running || exporting ? ' disabled' : ''}>筛选</button><button class="af-add" data-act="preview-filtered" title="在悬浮窗口里查看符合筛选条件的记录（全部可见字段）"${running || exporting ? ' disabled' : ''}>预览</button><span class="af-menu-wrap"><button class="af-add af-more" data-act="filter-menu" title="更多：导出 CSV、导入 / 导出筛选条件">☰</button>${filterMenuOpen ? `<div class="menu af-menu"><button class="menu-item" data-act="export-filtered" title="把视图里符合筛选条件的记录（全部可见字段）导出为 CSV"${running || exporting ? ' disabled' : ''}>导出 CSV</button><button class="menu-item" data-act="filter-import" title="从文件导入筛选条件（会替换当前条件）"${running || exporting ? ' disabled' : ''}>筛选条件导入</button><button class="menu-item" data-act="filter-export" title="把当前筛选条件导出为文件，方便复用">筛选条件导出</button></div>` : ''}</span></span></h4>${renderNode(config.filter, [])}</section>
+        <section class="af-sec"><h4 class="af-h"><span>输入</span>${clearBtn('clear-inputs', '输入项', config.inputs.length === 0)}</h4>${renderInputs()}<button class="af-add" data-act="add-input">＋ 输入项</button></section>
+        <section class="af-sec"><h4 class="af-h"><span>输出</span>${clearBtn('clear-outputs', '输出项', config.outputs.length === 0)}</h4>${renderOutputs()}<button class="af-add" data-act="add-output">＋ 输出项</button></section>
         <div class="af-status${statusKind ? ' ' + statusKind : ''}">${esc(statusText).replace(/\n/g, '<br />')}</div>
         ${renderFailures()}`;
     }
@@ -357,7 +403,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
 
   async function onFailAction(act: string, btn: HTMLElement) {
     try {
-      if (act === 'fail-csv') { downloadCsv(toCsv(failureTable()), '刷写失败行'); return; }
+      if (act === 'fail-csv') { downloadCsv(toCsv(failureTable()), '批处理失败行'); return; }
       await copyText(act === 'fail-ids' ? failures.map(f => f.recordId).join('\n') : toTsv(failureTable()));
       const old = btn.textContent;
       btn.textContent = '已复制';
@@ -406,6 +452,9 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
         if (rowEl) { config[rowEl.dataset.list as 'inputs' | 'outputs'].splice(Number(rowEl.dataset.idx), 1); }
         else if (nodeEl) { const { parent, index } = nodeAt(nodeEl.dataset.path!); parent?.children.splice(index, 1); }
         break;
+      case 'clear-filter': config.filter = emptyGroup(); break;
+      case 'clear-inputs': config.inputs = []; ensureInputs(); break; // 输出还在的话，它必需的输入项会重新补成空行
+      case 'clear-outputs': config.outputs = []; break;
       case 'add-input': config.inputs.push({ param: '', fieldId: '' }); break;
       case 'add-output': config.outputs.push({ param: '', fieldId: '' }); break;
       case 'reload-fns': loadFunctions(); return;
@@ -517,10 +566,10 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     return data.results;
   }
 
-  // ── 底部右侧的“刷写（取消）”按钮（在面板外，由侧边栏页面提供）──
+  // ── 底部右侧的“运行（取消）”按钮（在面板外，由侧边栏页面提供）──
   function syncRunBtn() {
     if (runBtn) {
-      runBtn.textContent = running ? '取消' : '刷写';
+      runBtn.textContent = running ? '取消' : '运行';
       runBtn.classList.toggle('cancel', running);
       runBtn.disabled = exporting || (!running && fnState !== 'ready');
     }
@@ -561,6 +610,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       const all = await host.loadAllRecords((done, total) => setReadProgress(` ${done}/${total}`));
       const matched = all.filter(r => evalGroup(config.filter, r));
       filterResult = { sig: filterSig(), matched: matched.length, total: all.length };
+      recordHistory('filter', matched.length, all.length);
       setStatus('', ''); // 结果已显示在筛选标题旁的命中数里，不再重复打印；读取进度只在读取过程中显示
     } catch (e) {
       setStatus(`筛选失败：${describeError(e, 'read')}`, 'error');
@@ -586,6 +636,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       const all = await host.loadAllRecords((done, total) => setReadProgress(` ${done}/${total}`));
       const matched = all.filter(r => evalGroup(config.filter, r));
       filterResult = { sig: filterSig(), matched: matched.length, total: all.length };
+      recordHistory('export', matched.length, all.length);
       if (matched.length === 0) { setStatus(`视图共 ${all.length} 条记录，没有符合筛选条件的记录，未导出`, ''); return; }
       downloadCsv(toCsv(filteredRows(matched)), '筛选结果');
       setStatus(`已导出 ${matched.length} 条符合筛选条件的记录（视图共 ${all.length} 条）`, 'ok');
@@ -749,6 +800,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       const matched = all.filter(r => evalGroup(config.filter, r));
       filterResult = { sig: filterSig(), matched: matched.length, total: all.length };
       total = all.length;
+      recordHistory('preview', matched.length, all.length);
       if (matched.length === 0) setStatus(`视图共 ${all.length} 条记录，没有符合筛选条件的记录`, ''); // 没有结果窗口弹出，需要说明原因
       else { rows = filteredRows(matched); setStatus('', ''); } // 命中数在筛选标题旁，窗口也会弹出
     } catch (e) {
@@ -760,6 +812,259 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       setStatus(keep.text, keep.kind);
     }
     if (rows) openPreview(rows, total);
+  }
+
+  // ── 历史记录窗口：按天分组、可搜索；恢复全部，或只恢复筛选条件 ──
+  function describeFilter(g: Group): string {
+    const names = new Map(host.getAllFields().map(f => [f.id, f.name]));
+    const walk = (n: Cond | Group, top: boolean): string => {
+      if (n.kind === 'cond') {
+        if (!n.fieldId) return '';
+        const op = OPS.find(([v]) => v === n.op)?.[1] || n.op;
+        return `${names.get(n.fieldId) ?? '（字段已不存在）'} ${op}${NO_VALUE_OPS.has(n.op) ? '' : ` “${n.value}”`}`;
+      }
+      const inner = n.children.map(c => walk(c, false)).filter(Boolean).join(n.logic === 'and' ? ' 且 ' : ' 或 ');
+      if (!inner) return '';
+      return n.negate ? `非（${inner}）` : top || n.children.length < 2 ? inner : `（${inner}）`;
+    };
+    return walk(g, true) || '无（全部记录）';
+  }
+
+  function describeIo(c: Config): string {
+    const names = new Map(host.getAllFields().map(f => [f.id, f.name]));
+    const fieldName = (id: string) => (id ? names.get(id) ?? '（字段已不存在）' : '未选字段');
+    const ins = c.inputs.map(i => `${i.param || '未选参数'} ← ${fieldName(i.fieldId)}`);
+    const outs = c.outputs.map(o => `${findOutput(o.param)?.out.label || o.param || '未选参数'} → ${fieldName(o.fieldId)}`);
+    return [ins.length ? `输入：${ins.join('，')}` : '', outs.length ? `输出：${outs.join('，')}` : ''].filter(Boolean).join('；') || '未配置输入 / 输出';
+  }
+
+  function restoreHistory(entry: HistoryEntry, only: 'all' | 'filter'): boolean {
+    if (running || exporting) { alert('正在读取记录或运行中，完成后再恢复历史配置'); return false; }
+    const hasContent = config.filter.children.length > 0 || config.inputs.length > 0 || config.outputs.length > 0;
+    const cur = JSON.stringify(config);
+    // 当前配置没跑过（历史里找不到一模一样的）：恢复会把它覆盖掉，先确认
+    if (hasContent && !readHistory().some(h => JSON.stringify(h.config) === cur) &&
+        !confirm('当前配置还没有筛选 / 运行过，恢复历史配置会覆盖它，确定吗？')) return false;
+    const saved = JSON.parse(JSON.stringify(entry.config)) as Config;
+    config = only === 'filter' ? { ...config, filter: saved.filter } : { ...newConfig(), ...saved };
+    migrateSeps(config.filter);
+    saveConfig();
+    const when = new Date(entry.time);
+    const pad2 = (n: number) => String(n).padStart(2, '0');
+    setStatus(`已恢复 ${when.getMonth() + 1}-${when.getDate()} ${pad2(when.getHours())}:${pad2(when.getMinutes())} 的${only === 'filter' ? '筛选条件' : '整套配置'}`, 'ok');
+    render();
+    return true;
+  }
+
+  // ── 历史记录导出 / 导入（JSON 文件）：和筛选条件一样，字段除了 ID 还带上字段名，换一张表时按字段名重新对应 ──
+  const HISTORY_FILE_TYPE = 'bitable-editor-history';
+
+  function entryForExport(e: HistoryEntry): any {
+    const byId = new Map(host.getAllFields().map(f => [f.id, f.name]));
+    const io = (m: Mapping) => ({ param: m.param, fieldId: m.fieldId, fieldName: byId.get(m.fieldId) ?? '' });
+    return {
+      time: e.time, kind: e.kind, ...(e.name ? { name: e.name } : {}), matched: e.matched, total: e.total,
+      ...(e.result ? { result: e.result } : {}), ...(e.ok !== undefined ? { ok: e.ok } : {}),
+      config: { filter: filterForExport(e.config.filter), inputs: e.config.inputs.map(io), outputs: e.config.outputs.map(io) },
+    };
+  }
+
+  function exportHistory(entries: HistoryEntry[]) {
+    saveFile(JSON.stringify({ type: HISTORY_FILE_TYPE, version: 1, entries: entries.map(entryForExport) }, null, 2), '历史记录', 'json', 'application/json');
+  }
+
+  // 校验并清洗：只保留认识的内容；某条结构不对就跳过这一条，不影响其他条。返回新增条数、跳过条数、对不上的字段名
+  function parseHistoryFile(text: string): { entries: HistoryEntry[]; skipped: number; missing: string[] } {
+    let data: any;
+    try { data = JSON.parse(text); } catch { throw new Error('文件不是合法的 JSON'); }
+    if (!data || data.type !== HISTORY_FILE_TYPE || !Array.isArray(data.entries)) throw new Error('这不是本插件导出的历史记录文件');
+    const all = host.getAllFields();
+    const missing: string[] = [];
+    const mapField = (id: string, name: string): string => {
+      if (!id && !name) return '';
+      const byId = all.find(f => f.id === id);
+      if (byId && (!name || byId.name === name)) return id;
+      const byName = name ? all.filter(f => f.name === name) : [];
+      if (byName.length === 1) return byName[0].id;
+      missing.push(name || id);
+      return '';
+    };
+    const io = (raw: any): Mapping[] => {
+      if (!Array.isArray(raw)) throw new Error('输入 / 输出的结构不对');
+      return raw.map((m: any) => ({ param: String(m?.param ?? ''), fieldId: mapField(String(m?.fieldId ?? ''), String(m?.fieldName ?? '')) }));
+    };
+    const entries: HistoryEntry[] = [];
+    let skipped = 0;
+    for (const raw of data.entries) {
+      try {
+        if (!raw || !(raw.kind in HISTORY_KINDS) || !raw.config) throw new Error('bad');
+        const filter = parseFilter(raw.config.filter);
+        mapImportedFields(filter, missing);
+        const time = Number(raw.time);
+        entries.push({
+          id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), // 重新生成，避免和已有的冲突
+          time: Number.isFinite(time) && time > 0 ? time : Date.now(),
+          kind: raw.kind, ...(typeof raw.name === 'string' && raw.name.trim() ? { name: raw.name.trim().slice(0, HISTORY_NAME_MAX) } : {}), config: { filter, inputs: io(raw.config.inputs), outputs: io(raw.config.outputs) },
+          matched: Number(raw.matched) || 0, total: Number(raw.total) || 0,
+          ...(typeof raw.result === 'string' ? { result: raw.result } : {}), ...(typeof raw.ok === 'boolean' ? { ok: raw.ok } : {}),
+        });
+      } catch { skipped++; }
+    }
+    return { entries, skipped, missing };
+  }
+
+  function openHistory() {
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const dayLabel = (t: number) => {
+      const d = new Date(t), today = new Date();
+      const diff = Math.round((new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime() - new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()) / 86400000);
+      return diff === 0 ? '今天' : diff === 1 ? '昨天' : `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    };
+    const overlay = document.createElement('div');
+    overlay.className = 'af-modal';
+    overlay.innerHTML = `<div class="af-modal-box af-hist-box" role="dialog" aria-modal="true">
+      <div class="af-modal-head"><span>历史记录（最多 ${HISTORY_LIMIT} 条，命名过的优先保留）</span><button class="af-x" data-close title="关闭">×</button></div>
+      <div class="af-hist-search"><input type="text" data-search placeholder="搜索名称、字段名、条件、函数…" /></div>
+      <div class="af-hist-bar"><button type="button" class="af-hist-check" data-selall title="全选 / 取消全选（当前列表里显示的记录）"></button><span class="af-hist-selinfo" data-selinfo></span><button class="af-add" data-import title="从文件导入历史记录（和现有的合并，不会覆盖）">导入</button><button class="af-add" data-export-all disabled title="先勾选要导出的记录">导出</button><button class="af-add" data-delsel disabled title="先勾选要删除的记录">删除</button></div>
+      <div class="af-hist-msg" data-msg hidden></div>
+      <div class="af-modal-body af-hist-list"></div>
+    </div>`;
+    const listEl = overlay.querySelector('.af-hist-list') as HTMLElement;
+    const searchEl = overlay.querySelector('[data-search]') as HTMLInputElement;
+    const msgEl = overlay.querySelector('[data-msg]') as HTMLElement;
+    const selAllEl = overlay.querySelector('[data-selall]') as HTMLElement;
+    const selInfoEl = overlay.querySelector('[data-selinfo]') as HTMLElement;
+    const delSelEl = overlay.querySelector('[data-delsel]') as HTMLElement;
+    const exportAllEl = overlay.querySelector('[data-export-all]') as HTMLElement;
+    let shownIds: string[] = []; // 当前列表里显示的记录（全选针对它们）
+    const selected = new Set<string>(); // 勾选的历史记录 id（批量导出 / 删除）
+    const notice = (text: string, isError = false) => { msgEl.textContent = text; msgEl.hidden = !text; msgEl.classList.toggle('error', isError); };
+
+    const draw = () => {
+      const items = readHistory().map(e => {
+        const when = new Date(e.time);
+        const lines = [`筛选：${describeFilter(e.config.filter)}`, describeIo(e.config)];
+        const stat = e.kind === 'run' && e.result ? e.result : `命中 ${e.matched} / 共 ${e.total} 条`;
+        return { e, when, lines, stat, text: [e.name || '', HISTORY_KINDS[e.kind], ...lines, stat].join('\n').toLowerCase() };
+      });
+      const q = searchEl.value.trim().toLowerCase();
+      const shown = q ? items.filter(i => i.text.includes(q)) : items;
+      shownIds = shown.map(i => i.e.id);
+      const keep = listEl.scrollTop; // 重画列表不要跳回顶部
+      for (const id of [...selected]) if (!items.some(i => i.e.id === id)) selected.delete(id);
+      const shownSel = shown.filter(i => selected.has(i.e.id)).length;
+      selAllEl.classList.toggle('on', shown.length > 0 && shownSel === shown.length);
+      selAllEl.classList.toggle('part', shownSel > 0 && shownSel < shown.length);
+      selInfoEl.textContent = selected.size ? `已选 ${selected.size} / 共 ${items.length} 条` : `共 ${items.length} 条`;
+      (delSelEl as HTMLButtonElement).disabled = (exportAllEl as HTMLButtonElement).disabled = selected.size === 0;
+      delSelEl.title = selected.size ? `删除勾选的 ${selected.size} 条历史记录` : '先勾选要删除的记录';
+      exportAllEl.title = selected.size ? `把勾选的 ${selected.size} 条历史记录导出为文件，方便备份或分享给别人` : '先勾选要导出的记录';
+      if (!shown.length) { listEl.innerHTML = `<div class="af-hint">${items.length ? '没有匹配的历史记录' : '还没有历史记录：筛选、预览、导出或运行之后，会自动记在这里'}</div>`; return; }
+      let lastDay = '';
+      listEl.innerHTML = shown.map(({ e, when, lines, stat }) => {
+        const day = dayLabel(e.time);
+        const head = day !== lastDay ? `<div class="af-hist-day">${esc(day)}</div>` : '';
+        lastDay = day;
+        return `${head}<div class="af-hist-item" data-id="${esc(e.id)}">
+          <button type="button" class="af-hist-check${selected.has(e.id) ? ' on' : ''}" data-h="sel" title="选择这条记录，可批量导出 / 删除"></button>
+          <button type="button" class="af-hist-x" data-h="del" title="删除这条历史记录">×</button>
+          <div class="af-hist-title"><span class="af-hist-kind ${e.kind}">${HISTORY_KINDS[e.kind]}</span><span class="af-hist-name${e.name ? '' : ' empty'}" data-h="rename" title="点击给这条记录命名 / 改名，方便以后查找">${e.name ? esc(e.name) : '＋ 命名'}</span><span class="af-hist-time">${pad(when.getHours())}:${pad(when.getMinutes())}:${pad(when.getSeconds())}</span></div>
+          ${lines.map(l => `<div class="af-hist-line" title="${esc(l)}">${esc(l)}</div>`).join('')}
+          <div class="af-hist-line stat${e.ok === false ? ' bad' : ''}" title="${esc(stat)}">${esc(stat)}</div>
+          <div class="af-hist-btns"><span class="af-hist-btns-left"><button class="af-add" data-h="all" title="把筛选、输入、输出整套换成这条记录当时的配置">恢复全部</button><button class="af-add" data-h="filter" title="只替换筛选条件，输入 / 输出保持不变">仅恢复筛选</button><button class="af-add" data-h="export" title="把这条历史记录导出为文件">导出</button></span></div>
+        </div>`;
+      }).join('');
+      listEl.scrollTop = keep;
+    };
+
+    const close = () => { overlay.remove(); document.removeEventListener('keydown', onKey); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close(); };
+    overlay.addEventListener('click', (e) => {
+      const t = e.target as HTMLElement;
+      if (t === overlay || t.closest('[data-close]')) { close(); return; }
+      if (t.closest('[data-export-all]')) {
+        const list = readHistory().filter(h => selected.has(h.id));
+        if (!list.length) notice('先勾选要导出的历史记录', true);
+        else { exportHistory(list); notice(`已导出 ${list.length} 条历史记录`); }
+        return;
+      }
+      if (t.closest('[data-selall]')) { // 全选 / 取消全选：针对当前搜索结果里显示的记录
+        const ids = shownIds;
+        if (ids.length && ids.every(id => selected.has(id))) ids.forEach(id => selected.delete(id));
+        else ids.forEach(id => selected.add(id));
+        draw();
+        return;
+      }
+      if (t.closest('[data-delsel]')) {
+        if (selected.size && confirm(`删除勾选的 ${selected.size} 条历史记录，确定吗？`)) {
+          writeHistory(readHistory().filter(h => !selected.has(h.id)));
+          selected.clear();
+          draw();
+        }
+        return;
+      }
+      if (t.closest('[data-import]')) {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = '.json,application/json';
+        input.addEventListener('change', async () => {
+          const file = input.files && input.files[0];
+          if (!file) return;
+          try {
+            const { entries, skipped, missing } = parseHistoryFile(await file.text());
+            if (!entries.length) throw new Error(skipped ? `文件里的 ${skipped} 条记录都无法识别` : '文件里没有历史记录');
+            writeHistory([...readHistory(), ...entries].sort((a, b) => b.time - a.time));
+            draw();
+            const uniq = [...new Set(missing)];
+            notice(`已导入 ${entries.length} 条历史记录（最多保留最近 ${HISTORY_LIMIT} 条）` + (skipped ? `，跳过 ${skipped} 条无法识别的` : '') +
+              (uniq.length ? `；有字段在当前表格里找不到：${uniq.join('、')}，恢复后请在对应位置重新选择` : ''), skipped > 0 || uniq.length > 0);
+          } catch (err) {
+            notice(`导入失败：${err instanceof Error ? err.message : String(err)}`, true);
+          }
+        });
+        input.click();
+        return;
+      }
+      const btn = t.closest('[data-h]') as HTMLElement | null;
+      const id = (btn?.closest('.af-hist-item') as HTMLElement | null)?.dataset.id;
+      if (!btn || !id) return;
+      if (btn.dataset.h === 'export') {
+        const one = readHistory().find(h => h.id === id);
+        if (one) { exportHistory([one]); notice('已导出这条历史记录'); }
+        return;
+      }
+      if (btn.dataset.h === 'rename') { // 原地换成输入框：回车 / 失焦保存，Esc 放弃，留空就是取消命名
+        const cur = readHistory().find(h => h.id === id)?.name || '';
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'af-hist-name-input';
+        input.value = cur;
+        input.maxLength = HISTORY_NAME_MAX;
+        input.placeholder = '给这条记录起个名字';
+        let done = false;
+        const finish = (save: boolean) => {
+          if (done) return;
+          done = true;
+          if (save) updateHistory(id, { name: input.value.trim() || undefined });
+          draw();
+        };
+        input.addEventListener('keydown', (ev) => { ev.stopPropagation(); if (ev.key === 'Enter') finish(true); else if (ev.key === 'Escape') finish(false); });
+        input.addEventListener('blur', () => finish(true));
+        btn.replaceWith(input);
+        input.focus();
+        input.select();
+        return;
+      }
+      if (btn.dataset.h === 'sel') { if (!selected.delete(id)) selected.add(id); draw(); return; }
+      if (btn.dataset.h === 'del') { selected.delete(id); writeHistory(readHistory().filter(h => h.id !== id)); draw(); return; }
+      const entry = readHistory().find(h => h.id === id);
+      if (entry && restoreHistory(entry, btn.dataset.h === 'filter' ? 'filter' : 'all')) close();
+    });
+    searchEl.addEventListener('input', draw);
+    document.addEventListener('keydown', onKey);
+    draw();
+    document.body.appendChild(overlay); // 挂在 body 上，不受面板缩放影响
+    searchEl.focus();
   }
 
   async function startRun() {
@@ -776,6 +1081,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     failureHeaders = config.inputs.map(i => `${i.param}(${fieldById.get(i.fieldId)?.name ?? i.fieldId})`);
     const inputCols = config.inputs.map(i => i.fieldId);
     const optionsOf = new Map<string, FieldOption[]>(); // 单选/多选输出字段的选项
+    let historyId = '';
     try {
       const all = await host.loadAllRecords((done, total) => setStatus(`正在读取视图记录… ${done}/${total}`, ''));
       const matched = all.filter(r => evalGroup(config.filter, r));
@@ -787,6 +1093,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
         setStatus('已取消', '');
         return;
       }
+      historyId = recordHistory('run', matched.length, all.length);
 
       // 按函数分组：同一个函数的多个输出，一次调用拿齐
       const byFn = new Map<string, { fn: FnMeta; outs: { name: string; fieldId: string }[] }>();
@@ -844,8 +1151,10 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
         (skipped ? `，跳过 ${skipped} 条（函数没有返回内容，未写入）` : '') +
         (failed ? '（详见下方失败明细）' : '');
       setStatus(summary, failed || cancelled ? 'error' : 'ok');
+      if (historyId) updateHistory(historyId, { result: summary, ok: !(failed || cancelled) });
     } catch (e) {
       setStatus(`中断：${describeError(e, 'write')}\n已写入 ${written} 条，其余记录未处理`, 'error');
+      if (historyId) updateHistory(historyId, { result: `中断：已写入 ${written} 条，其余记录未处理`, ok: false });
     } finally {
       running = false;
       const keep = { text: statusText, kind: statusKind };
@@ -855,11 +1164,13 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
   }
 
   return {
-    /** 切到自动刷写时调用：首次加载函数列表，之后只刷新字段下拉 */
+    /** 切到批处理时调用：首次加载函数列表，之后只刷新字段下拉 */
     show() {
       if (fnState === 'idle' || fnState === 'error') loadFunctions();
       else { render(); loadFunctions(true); }
     },
+    /** 打开历史记录窗口（入口是侧边栏标题行里的「历史」按钮，只在批处理模式显示） */
+    openHistory,
     /** 只按最新字段重画，不重新读函数列表 */
     rerender() { if (!running && !exporting) render(); },
   };

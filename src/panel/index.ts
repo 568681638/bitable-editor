@@ -45,7 +45,7 @@ const ui = createAnnotatorUI({
 });
 
 setupModeSwitch(ui.saveIfModified);
-document.getElementById('autoContent')!.innerHTML = '<div class="empty-state"><p>自动刷写请在多维表格侧边栏里使用</p></div>';
+document.getElementById('autoContent')!.innerHTML = '<div class="empty-state"><p>批处理请在多维表格侧边栏里使用</p></div>';
 
 window.addEventListener('message', (e) => {
   if (e.origin !== location.origin || e.source !== opener || !e.data) return;
@@ -107,6 +107,11 @@ const ZOOM_KEY = 'annotator-panel-zoom-v4'; // 之前的版本会把默认值也
 const BLOCK_DRAG_TYPE = 'application/x-annotator-block';
 const GROUP_DRAG_TYPE = 'application/x-annotator-group'; // 框选后拖动选区的把手
 const NODE_DRAG_TYPE = 'application/x-annotator-node'; // 拖动组合框的把手（整组移动）
+const HEADER_DRAG_TYPE = 'application/x-annotator-header'; // 拖动侧边栏标题名（同时带 FIELD_DRAG_TYPE，走字段拖入的同一套落点逻辑）
+// 侧边栏的标题行也能做成字段块：fieldId 取这个固定值，不对应任何字段。
+// 和字段不同，拖的是副本：侧边栏上的标题行原样保留，预览窗格里的那份把按钮操作转给侧边栏上的原按钮（侧边栏收起了也能用）
+const HEADER_ID = '__header__';
+const isHeaderLeaf = (l: Leaf) => l.fieldId === HEADER_ID;
 // 预览窗格块标题栏里多行字段值的高度上限：窗口高度的比例。标题栏撑得越高，下面的渲染区越小，所以比侧边栏（50%）收得更紧
 const BLOCK_VALUE_MAX_RATIO = 0.3;
 
@@ -170,7 +175,10 @@ const valueObserver = new ResizeObserver((entries) => {
   }
 });
 window.addEventListener('resize', () => {
-  blockEls.forEach(el => autosizeTextarea(el.querySelector('textarea.block-value') as HTMLTextAreaElement, BLOCK_VALUE_MAX_RATIO));
+  blockEls.forEach(el => {
+    const ta = el.querySelector('textarea.block-value') as HTMLTextAreaElement | null;
+    if (ta) autosizeTextarea(ta, BLOCK_VALUE_MAX_RATIO);
+  });
 });
 
 function positionViewers() {
@@ -322,7 +330,7 @@ function insertBeside(target: Leaf | Group, added: LayoutNode, zone: Zone) {
 // ── 字段值 → 展示内容 ─────────────────────────────
 // 字段块的字段在当前视图里找不到（跨表导入的布局、或字段后来被移出视图）：保留字段块位置，等用户拖字段进来替换
 function isPending(leaf: Leaf): boolean {
-  return !!snapshot && !snapshot.fields.some(f => f.id === leaf.fieldId);
+  return !isHeaderLeaf(leaf) && !!snapshot && !snapshot.fields.some(f => f.id === leaf.fieldId);
 }
 
 function valueToText(value: any): string {
@@ -363,6 +371,12 @@ function renderViewer(url: string): string {
 function updateBlock(leaf: Leaf) {
   const el = blockEls.get(leaf.id);
   if (!el) return;
+  if (isHeaderLeaf(leaf)) { // 标题行块：只有标题行
+    (el.querySelector('.block-body') as HTMLElement).hidden = true;
+    el.classList.add('compact');
+    removeViewer(leaf.id);
+    return;
+  }
   const field = snapshot?.fields.find(f => f.id === leaf.fieldId);
   const pending = !field && isPending(leaf);
   el.classList.toggle('pending', pending);
@@ -482,9 +496,12 @@ function applyFit(node: LayoutNode) {
   if (node.kind === 'group') { applyFit(node.child); return; }
   if (node.kind === 'leaf') return;
   const flexible: LayoutNode[] = [];
+  // 上下排列时，没有可渲染内容的块只占自身高度：下方还有别的块，或同级里有会伸展的块（有渲染内容的）都算。
+  // 同级全是这类块时，最后一个占满剩余高度，免得下面空出一片
+  const anyFlexible = node.dir === 'column' && node.children.some(c => !isCompactNode(c));
   node.children.forEach((child, i) => {
     const hasBelow = node.dir === 'column' && i < node.children.length - 1;
-    const fit = hasBelow && isCompactNode(child);
+    const fit = (hasBelow || anyFlexible) && isCompactNode(child);
     nodeEls.get(child)?.toggleAttribute('data-fit', fit);
     if (!fit) flexible.push(child);
     applyFit(child);
@@ -500,6 +517,7 @@ function applyFit(node: LayoutNode) {
 
 function updateBlocks() {
   leaves(root).forEach(updateBlock);
+  syncHeaderClone();
   groups(root).filter(g => g.shared).forEach(updateShare);
   if (root) {
     nodeEls.get(root)?.removeAttribute('data-fit');
@@ -513,18 +531,24 @@ function createBlockEl(leaf: Leaf): HTMLElement {
   const el = document.createElement('div');
   el.className = 'block';
   el.dataset.blockId = leaf.id;
-  el.innerHTML = `<div class="block-header">
+  if (isHeaderLeaf(leaf)) {
+    el.classList.add('block-header-clone');
+    el.appendChild(buildHeaderClone());
+    el.insertAdjacentHTML('beforeend', '<div class="block-body"></div>');
+  } else {
+    el.innerHTML = `<div class="block-header">
       <span class="block-title" draggable="true" title="拖动字段名可调整位置"></span>
       <input class="block-value" readonly placeholder="（空）" />
       <textarea class="block-value block-value-multi" rows="2" wrap="off" readonly hidden></textarea>
       <a class="block-open" target="_blank" rel="noopener noreferrer" title="在新窗口打开">↗</a>
       <button class="block-close" title="移除该字段块（字段回到侧边栏）">✕</button>
     </div><div class="block-body"></div>`;
+    const area = el.querySelector('textarea.block-value') as HTMLTextAreaElement;
+    installLineSelectAll(area);
+    trackManualResize(area);
+    valueObserver.observe(area);
+  }
   bodyObserver.observe(el.querySelector('.block-body') as HTMLElement);
-  const area = el.querySelector('textarea.block-value') as HTMLTextAreaElement;
-  installLineSelectAll(area);
-  trackManualResize(area);
-  valueObserver.observe(area);
   (el.querySelector('.block-close') as HTMLElement).addEventListener('click', () => {
     removeLeaf(leaf);
     saveLayout();
@@ -606,6 +630,84 @@ function buildNode(node: LayoutNode): HTMLElement {
   return el;
 }
 
+// ── 标题行块：侧边栏标题行的副本 ──
+// 副本里带 id 的元素记下原 id（data-proxy）再去掉 id；点击 / 回车都转给侧边栏上同 id 的原元素，
+// 按钮的可用状态、记录序号、框选高亮每次刷新时从原元素同步过来。☰ 菜单是副本自己的，只有菜单项转给原按钮
+const sidebarHeader = document.querySelector('#app > .header') as HTMLElement;
+const origEl = (id: string | undefined) => (id ? document.getElementById(id) : null);
+
+function buildHeaderClone(): HTMLElement {
+  const h = sidebarHeader.cloneNode(true) as HTMLElement;
+  h.querySelectorAll<HTMLElement>('[id]').forEach(n => { n.dataset.proxy = n.id; n.removeAttribute('id'); });
+  const title = h.querySelector('h3') as HTMLElement;
+  delete title.dataset.proxy;
+  title.className = 'block-title'; // 和字段块一样：拖标题名调整位置
+  title.title = '拖动标题名可调整位置';
+  h.querySelector('.header-actions')!.insertAdjacentHTML('beforeend', '<button type="button" class="refresh-btn block-close" title="移除这个标题行块（侧边栏上的标题行不受影响）">✕</button>');
+  const menu = h.querySelector('.menu') as HTMLElement;
+  const menuBtn = h.querySelector('[data-proxy="menuBtn"]') as HTMLElement;
+  // 展开方向按实际空间定：下方放不下、上方更宽裕就往上展开；左边放不下就改成左对齐往右展开。展开 / 二级菜单展开后高度变了，都要重新判断
+  const placeMenu = () => {
+    menu.classList.remove('up', 'left');
+    if (menu.hidden) return;
+    const wrap = menu.parentElement!.getBoundingClientRect();
+    const r = menu.getBoundingClientRect();
+    const below = window.innerHeight - wrap.bottom, above = wrap.top;
+    if (r.height + 6 > below && above > below) menu.classList.add('up');
+    if (r.left < 0) menu.classList.add('left');
+  };
+  menuBtn.addEventListener('click', (e) => { e.stopPropagation(); menu.hidden = !menu.hidden; placeMenu(); });
+  document.addEventListener('click', (e) => { if (!menu.contains(e.target as Node)) menu.hidden = true; });
+  h.addEventListener('click', (e) => {
+    const t = e.target as HTMLElement;
+    const group = t.closest('[data-submenu]') as HTMLElement | null;
+    if (group) { // 二级菜单展开 / 收起，不收起整个菜单
+      e.stopPropagation();
+      const sub = group.nextElementSibling as HTMLElement;
+      sub.hidden = !sub.hidden;
+      group.classList.toggle('open', !sub.hidden);
+      placeMenu();
+      return;
+    }
+    const proxy = (t.closest('[data-proxy]') as HTMLElement | null)?.dataset.proxy;
+    if (!proxy || proxy === 'menuBtn' || proxy === 'recordJump') return;
+    if (proxy === 'helpLink') { menu.hidden = true; return; } // 链接自己会打开
+    if (menu.contains(t)) menu.hidden = true;
+    origEl(proxy)?.click();
+  });
+  h.addEventListener('keydown', (e) => {
+    const t = e.target as HTMLInputElement;
+    if (e.key !== 'Enter' || t.dataset.proxy !== 'recordJump') return;
+    const src = origEl('recordJump') as HTMLInputElement;
+    src.value = t.value;
+    src.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }));
+    t.value = src.value; // 输入无效时原输入框会恢复成当前序号
+  });
+  return h;
+}
+
+function syncHeaderClone() {
+  const leaf = leaves(root).find(isHeaderLeaf);
+  const h = leaf && blockEls.get(leaf.id)?.querySelector('.header');
+  if (!h) return;
+  h.querySelectorAll<HTMLElement>('[data-proxy]').forEach(el => {
+    const src = origEl(el.dataset.proxy);
+    if (!src) return;
+    if (el instanceof HTMLInputElement) {
+      el.disabled = (src as HTMLInputElement).disabled;
+      el.max = (src as HTMLInputElement).max;
+      if (document.activeElement !== el) el.value = (src as HTMLInputElement).value;
+    } else if (el instanceof HTMLButtonElement) {
+      el.disabled = (src as HTMLButtonElement).disabled;
+      el.classList.toggle('active', src.classList.contains('active'));
+    } else if (el instanceof HTMLAnchorElement) {
+      el.href = (src as HTMLAnchorElement).href;
+    } else if (el.classList.contains('index-display')) {
+      el.textContent = src.textContent;
+    }
+  });
+}
+
 function renderBlocks() {
   blocksEl.innerHTML = '';
   nodeEls.clear();
@@ -685,6 +787,7 @@ function mapImportedLayout(raw: any, fields: FieldMeta[], missing: string[], dep
   if (!raw || depth > 12 || typeof raw !== 'object') return null;
   const sizeOf = (r: any) => typeof r.size === 'number' && r.size > 0 ? r.size : 1;
   const mapLeaf = (r: any): Leaf => {
+    if (r.fieldId === HEADER_ID) return { kind: 'leaf', id: newId(), fieldId: HEADER_ID, size: sizeOf(r) };
     const name = typeof r.fieldName === 'string' ? r.fieldName : '';
     const id = String(r.fieldId ?? '');
     const byId = fields.find(f => f.id === id);
@@ -1017,6 +1120,7 @@ function setMarqueeMode(on: boolean) {
   document.body.classList.toggle('marquee-mode', on);
   marqueeBtn.classList.toggle('active', on);
   if (!on) marqueeBtn.blur(); // 点过的按钮还占着焦点，按 Esc 时浏览器会给它画出黑色焦点框
+  syncHeaderClone();
 }
 marqueeBtn.addEventListener('click', () => {
   const on = !document.body.classList.contains('marquee-mode');
@@ -1091,7 +1195,7 @@ blocksEl.addEventListener('dragover', (e) => {
   if (!t) return;
   if (isGroup && insideSel(t.node)) return; // 不能落在选区自己身上
   if (t.blank) { showDropHint(t.blank); return; }
-  const rep = isField ? replaceTarget(t) : undefined;
+  const rep = isField && !types.includes(HEADER_DRAG_TYPE) ? replaceTarget(t) : undefined;
   if (rep) blockEls.get(rep.id)?.classList.add('drop-replace');
   else t.el.classList.add('drop-' + t.zone);
 });
@@ -1108,7 +1212,7 @@ blocksEl.addEventListener('drop', (e) => {
   endDrag();
   if (fieldId) {
     if (leaves(root).some(l => l.fieldId === fieldId)) return; // 同一字段只放一块
-    const rep = t ? replaceTarget(t) : undefined;
+    const rep = t && fieldId !== HEADER_ID ? replaceTarget(t) : undefined;
     if (rep) {
       // 落在“字段不存在”的字段块上：替换字段，保留字段块的位置和大小
       rep.fieldId = fieldId;
@@ -1134,6 +1238,17 @@ blocksEl.addEventListener('drop', (e) => {
 });
 document.addEventListener('dragend', endDrag);
 
+// 侧边栏标题栏里的标题名「bitable-editor」可拖：拖到预览窗格放下，把标题行的副本放进去（侧边栏的标题行保留），和拖字段一样按落点切分
+const navHandle = document.getElementById('navHandle') as HTMLElement;
+navHandle.addEventListener('dragstart', (e) => {
+  if (!e.dataTransfer) return;
+  e.dataTransfer.setData(FIELD_DRAG_TYPE, HEADER_ID);
+  e.dataTransfer.setData(HEADER_DRAG_TYPE, '1');
+  e.dataTransfer.effectAllowed = 'copyMove';
+  document.body.classList.add('dragging-field');
+});
+navHandle.addEventListener('dragend', endDrag);
+
 renderBlocks();
 // 教程链接被服务端配置覆盖后，空状态里的链接也要跟着更新
 document.addEventListener('config-loaded', () => { if (!root) renderBlocks(); });
@@ -1146,6 +1261,7 @@ if (savedWidth > 0) layoutEl.style.setProperty('--ann-width', savedWidth + 'px')
 
 splitter.addEventListener('mousedown', (e) => {
   e.preventDefault();
+  if (layoutEl.classList.contains('collapsed')) return; // 收起时只能点按钮展开，不能拖
   document.body.classList.add('dragging-field');
   const move = (ev: MouseEvent) => {
     const w = Math.min(window.innerWidth - 240, Math.max(300, window.innerWidth - ev.clientX));
@@ -1162,3 +1278,18 @@ splitter.addEventListener('mousedown', (e) => {
 });
 
 setupZoom(layoutEl, ZOOM_KEY, 0.85 * 1.05);
+
+// ── 侧边栏收起 / 展开：分隔条上的小按钮，收起后预览窗格占满页面，分隔条留在右边缘用来展开（状态记在 localStorage）──
+const COLLAPSED_KEY = 'annotator-panel-sidebar-collapsed';
+const collapseBtn = document.getElementById('collapseBtn') as HTMLElement;
+function setCollapsed(on: boolean) {
+  layoutEl.classList.toggle('collapsed', on);
+  collapseBtn.textContent = on ? '◀' : '▶';
+  collapseBtn.title = on ? '展开侧边栏' : '收起侧边栏';
+  splitter.title = on ? '' : '拖动调整预览窗格与侧边栏的宽度';
+  localStorage.setItem(COLLAPSED_KEY, on ? '1' : '');
+  window.dispatchEvent(new Event('resize')); // 预览窗格变宽 / 变窄：让块标题栏里的多行值重新撑开
+}
+collapseBtn.addEventListener('mousedown', (e) => e.stopPropagation()); // 点按钮不触发分隔条的拖动
+collapseBtn.addEventListener('click', () => setCollapsed(!layoutEl.classList.contains('collapsed')));
+setCollapsed(!!localStorage.getItem(COLLAPSED_KEY));

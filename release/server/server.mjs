@@ -343,7 +343,7 @@ async function loadFunctions() {
   return all;
 }
 
-// ── 自动刷写函数接口 ──────────────────────────────
+// ── 批处理函数接口 ──────────────────────────────
 // GET  /api/functions          → [{ id, name, inputs, outputs }]
 // POST /api/functions/<id>/run  body { rows: [{...入参}] } → { results: [{ ok: true, outputs } | { ok: false, error }] }
 const MAX_BODY = 64 * 1024 * 1024;
