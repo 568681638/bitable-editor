@@ -411,7 +411,7 @@ body.sidebar-zoom #app {
 }
 
 // ── 批处理面板 ──────────────────────────────────
-// 筛选 / 输入 / 输出三个板块：各自包成一张卡片，标题放在卡片里面，一眼能分清各块
+// 筛选 / 函数两个板块：各自包成一张卡片，标题放在卡片里面，一眼能分清各块
 .af-sec {
   margin-bottom: 8px;
   padding: 8px 10px;
@@ -495,23 +495,6 @@ body.sidebar-zoom #app {
   &:hover { color: #ff4d4f; }
 }
 
-.af-lock { font-size: 12px; color: #d46b08; white-space: nowrap; }
-
-.af-run { display: flex; align-items: center; gap: 8px; }
-
-.af-btn {
-  padding: 8px 24px;
-  background: #4f7cff;
-  border: none;
-  border-radius: 4px;
-  color: #fff;
-  cursor: pointer;
-  font-size: 14px;
-  font-weight: 500;
-
-  &:hover { background: #3d6ae8; }
-  &.af-cancel { background: #ff4d4f; }
-}
 
 .af-status {
   font-size: 13px;
@@ -680,6 +663,20 @@ body.sidebar-zoom #app {
 .af-menu .menu-item:disabled { color: #ccc; cursor: not-allowed; background: none; }
 
 .af-modal-actions { display: flex; gap: 6px; }
+// 统计悬浮窗（视图代码见 shared/stats-view.ts；新标签页的统计页有自己的一份同名样式）
+.af-stats-box { width: min(760px, 96vw); }
+.af-stats-body { padding: 14px 16px; font-size: 13px; }
+.af-modal {
+  .st-sec h3 { font-size: 14px; margin-bottom: 8px; .sub { margin-left: 8px; color: #999; font-size: 12px; font-weight: 400; } }
+  .st-ctl { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; flex-wrap: wrap; }
+  .st-ctl select { padding: 4px 8px; border: 1px solid #d9d9d9; border-radius: 4px; font-size: 13px; max-width: 240px; }
+  .st-sum { margin-bottom: 10px; color: #666; }
+  .st-empty { padding: 8px 0; color: #999; }
+  .dist-row { display: flex; align-items: center; gap: 10px; height: 26px; }
+  .dist-label { flex: none; width: 140px; overflow: hidden; text-align: right; text-overflow: ellipsis; white-space: nowrap; &.dim { color: #aaa; } }
+  .dist-track { flex: 1; height: 14px; overflow: hidden; border-radius: 3px; background: #f3f4f7; i { display: block; height: 100%; border-radius: 3px; background: #4f7cff; &.dim { background: #c9ced8; } } }
+  .dist-num { flex: none; width: 110px; color: #666; font-variant-numeric: tabular-nums; }
+}
 
 // “预览为什么没显示”的说明：固定在字段块的右上角（和字段名在同一行的最右边），不依赖字段名的宽度
 .field-row { position: relative; }
@@ -831,3 +828,123 @@ body.sidebar-zoom #app {
 // 标题行里的「历史」按钮：只在批处理模式显示
 .history-btn { display: none; align-items: center; justify-content: center; }
 #app.mode-auto .history-btn { display: inline-flex; }
+
+
+// 输出的“函数 / 输出参数”选择器：按钮 + 向下展开的层级树（目录 → 函数 → 选项），目录和函数默认折叠
+.af-pick { position: relative; display: inline-block; }
+.af-pick-pop {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 40;
+  min-width: 100%;
+  width: max-content;
+  max-width: 360px;
+  max-height: 50vh;
+  overflow: auto;
+  padding: 4px;
+  background: #fff;
+  border: 1px solid #e3e7ef;
+  border-radius: 6px;
+  box-shadow: 0 4px 14px rgba(31, 45, 61, 0.18);
+  font-size: 13px;
+}
+.af-tn-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  user-select: none;
+
+  &:hover { background: #f0f4ff; }
+}
+.af-tn-arrow::before { content: '▸'; display: inline-block; width: 12px; color: #999; font-size: 11px; transition: transform 0.15s; }
+.af-tn.open > .af-tn-row .af-tn-arrow::before { transform: rotate(90deg); }
+.af-tn-dir > .af-tn-row .af-tn-name { font-weight: 600; color: #555; }
+.af-tn-kids { display: none; margin-left: 12px; padding-left: 6px; border-left: 1px solid #eee; }
+.af-tn.open > .af-tn-kids { display: block; }
+// 函数这一行右侧的图标按钮（调用 / 全选），点它们不会展开 / 折叠
+.af-tn-row { display: flex; align-items: center; gap: 4px; }
+.af-tn-row > .af-tn-head { flex: 1; min-width: 0; }
+.af-scope-head { padding: 2px 6px 4px; margin-bottom: 4px; border-bottom: 1px solid #eee; font-weight: 600; color: #4f5fd0; }
+.af-scope-head .af-tn-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.af-tn-tools { flex: none; display: flex; gap: 2px; }
+.af-ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  color: #4f7cff;
+  font-size: 13px;
+  cursor: pointer;
+  user-select: none;
+
+  &:hover { background: #e6eaff; }
+  &.on { background: #e6eaff; }
+  &.disabled { color: #ccc; cursor: not-allowed; &:hover { background: none; } }
+}
+.af-opt {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+  user-select: none;
+
+  &:hover { background: #f0f4ff; color: #4f7cff; }
+}
+.af-box { flex: none; position: relative; width: 14px; height: 14px; border: 1.5px solid #bfbfbf; border-radius: 3px; background: #fff; }
+.af-opt.on .af-box { border-color: #4f7cff; background: #4f7cff; }
+.af-opt.on .af-box::after { content: ''; position: absolute; left: 3.5px; top: 0.5px; width: 3px; height: 7px; border: solid #fff; border-width: 0 2px 2px 0; transform: rotate(45deg); }
+
+// 输出的函数分组：每个函数一张小卡片，头部是函数名和操作，下面是它的输出参数行
+.af-fg {
+  margin-bottom: 8px;
+  padding: 6px 8px;
+  border: 1px solid #e3e7ef;
+  border-radius: 6px;
+  background: #fafbff;
+}
+.af-fg-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 6px; }
+.af-fg-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; color: #4f5fd0; }
+.af-fg-actions { display: flex; align-items: center; gap: 6px; }
+.af-fg-actions .af-pick-pop { left: auto; right: 0; }
+.af-row select.af-fg-param { flex: 0 1 40%; min-width: 80px; }
+.af-row span.af-fg-param { flex: 0 1 40%; min-width: 60px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.af-lock { font-size: 12px; color: #d46b08; white-space: nowrap; }
+.af-fg-actions .af-add:disabled { opacity: 0.4; cursor: not-allowed; }
+// 函数卡片里的输入 / 输出各成一组：样式参考筛选条件组（浅底、细边框、左边一条粗竖线），输入蓝线、输出绿线，不额外占标题行
+.af-iog {
+  display: flex;
+  margin-bottom: 6px;
+  border: 1px solid #dfe3ea;
+  border-left: 3px solid #4f7cff;
+  border-radius: 4px;
+  background: #fff;
+  overflow: hidden;
+
+  &.out { border-left-color: #52c41a; }
+  &:last-child { margin-bottom: 0; }
+}
+// 组名竖排在左边（占宽度不占高度），底色跟竖线同色系，一眼分出输入组和输出组
+.af-iog-label {
+  flex: none;
+  width: 16px;
+  padding: 2px 0 2px 2px; // vertical-lr：文字从左边起排，再留 2px 左边距，右边不再被挤
+  background: #e6eaff;
+  color: #4f5fd0;
+  font-size: 11px;
+  line-height: 1;
+  letter-spacing: 1px;
+  text-align: center;
+  writing-mode: vertical-lr;
+  user-select: none;
+}
+.af-iog.out .af-iog-label { background: #e6f7e6; color: #389e0d; }
+.af-iog-body { flex: 1; min-width: 0; padding: 6px 6px 0; }

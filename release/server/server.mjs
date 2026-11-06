@@ -4,7 +4,7 @@ import { isIP } from 'net';
 import { readFile, stat } from 'fs/promises';
 import { gzip, brotliCompress, constants as zlibConstants } from 'zlib';
 import { promisify } from 'util';
-import { join, extname, sep } from 'path';
+import { join, extname, sep, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import https from 'https';
 import { URL } from 'url';
@@ -237,16 +237,28 @@ async function sendStatic(req, res, filePath) {
   res.end(req.method === 'HEAD' ? undefined : body);
 }
 
-// ── 函数注册表：热加载 functions/*.mjs 和 functions/*.py ─────────────
-// 每次请求都扫一遍目录，新增/修改/删除文件立即生效，不用重启服务。
-// 以 _ 开头的文件被忽略；某个文件加载失败只在日志里报错，不影响其他函数。
+// ── 函数注册表：热加载 functions/ 下的函数文件夹 ─────────────
+// 一个函数 = 一个文件夹，文件夹里必须有入口文件 function.mjs（JS）或 function.py（Python），其余文件（依赖的模块、数据、配置）随便放。
+// 不含入口文件的文件夹是“分类目录”，可以多层嵌套，目录结构就是面板里选函数时的层级；函数文件夹里面不再往下找函数。
+// 每次请求都扫一遍目录，新增 / 修改 / 删除立即生效，不用重启服务。以 _ 或 . 开头的文件和目录被忽略；某个函数加载失败只在日志里报错，不影响其他函数。
 const FUNCTIONS_DIR = join(__dirname, 'functions');
-const fnFileCache = new Map(); // 文件名 → { mtimeMs, defs }
+const ENTRY_FILES = ['function.mjs', 'function.py'];
+const fnFileCache = new Map(); // 函数文件夹（相对路径）→ { sig, defs }
 
 function validDef(d) {
   const okParams = (list) => Array.isArray(list) && list.every(p => p && typeof p.name === 'string' && p.name);
+  // outputs 可以不写 / 写空数组：只调用、不往表格写值的函数（比如发通知、触发任务）
   return d && typeof d.id === 'string' && d.id && typeof d.name === 'string' && typeof d.run === 'function'
-    && okParams(d.inputs) && okParams(d.outputs);
+    && okParams(d.inputs) && (d.outputs === undefined || okParams(d.outputs));
+}
+
+// 函数每次 run 建议拿到的行数：函数用 batchSize 自己声明，没写就是默认值；限制在 1 ~ MAX_BATCH 之间。
+// 服务端只负责把它告诉面板（/api/functions），拆分 / 攒批由前端按它来做；run 接口收到多少行就一次交给函数多少行
+const DEFAULT_BATCH = 100;
+const MAX_BATCH = 5000;
+function batchSizeOf(d) {
+  const n = Math.floor(Number(d.batchSize));
+  return n >= 1 ? Math.min(n, MAX_BATCH) : DEFAULT_BATCH;
 }
 
 // ── Python 函数：由 functions/_python_executor.py 加载 .py 并执行，一批行启动一次进程 ──
@@ -263,7 +275,8 @@ async function runPython(file, mode, input, timeoutMs) {
   try {
     await writeFile(inPath, JSON.stringify(input === undefined ? {} : input), 'utf8');
     await new Promise((resolve, reject) => {
-      const child = spawn(PYTHON_BIN, [PY_EXECUTOR, file, mode, inPath, outPath], { env: { ...process.env, PYTHONIOENCODING: 'utf-8' } });
+      // 工作目录设为函数文件夹，函数里按相对路径读自己文件夹里的数据文件就行
+      const child = spawn(PYTHON_BIN, [PY_EXECUTOR, file, mode, inPath, outPath], { cwd: dirname(file), env: { ...process.env, PYTHONIOENCODING: 'utf-8' } });
       const err = [];
       let done = false;
       const finish = (fn, v) => { if (done) return; done = true; clearTimeout(timer); fn(v); };
@@ -288,10 +301,10 @@ async function runPython(file, mode, input, timeoutMs) {
   }
 }
 
-async function loadPyDef(full) {
+async function loadPyDef(full, fallbackId) {
   const meta = await runPython(full, 'meta', undefined, PY_META_TIMEOUT);
   return [{
-    id: meta.id, name: meta.name, inputs: meta.inputs, outputs: meta.outputs,
+    id: meta.id || fallbackId, name: meta.name || meta.id || fallbackId, inputs: meta.inputs, outputs: meta.outputs, batchSize: meta.batchSize,
     // 与 JS 函数同形：返回与 rows 等长的数组，失败的行是 Error
     async run(rows) {
       const data = await runPython(full, 'run', { rows }, PY_RUN_TIMEOUT);
@@ -301,42 +314,90 @@ async function loadPyDef(full) {
   }].filter(validDef);
 }
 
+// 递归找函数文件夹：含入口文件的文件夹是一个函数，不含的当分类目录往下找。
+// 直接放在分类目录里的单个 .mjs / .py 文件（旧写法）不再加载，在日志里提醒一次该怎么改
+const MAX_FN_DEPTH = 8;
+const legacyWarned = new Set();
+async function listFunctions(dir, folders, out) {
+  let entries;
+  try { entries = await readdir(dir, { withFileTypes: true }); }
+  catch (e) { console.error('[functions] 读取目录失败:', e.message); return; }
+  entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  const entryFile = folders.length > 0 ? ENTRY_FILES.find(n => entries.some(e => e.isFile() && e.name === n)) : undefined;
+  if (entryFile) {
+    out.push({ key: folders.join('/'), dir, full: join(dir, entryFile), categories: folders.slice(0, -1), folderName: folders[folders.length - 1] });
+    return; // 函数文件夹里面不再找函数
+  }
+  for (const ent of entries) {
+    if (ent.name.startsWith('_') || ent.name.startsWith('.') || ent.name === 'node_modules') continue;
+    if (ent.isDirectory()) {
+      if (folders.length < MAX_FN_DEPTH) await listFunctions(join(dir, ent.name), [...folders, ent.name], out);
+    } else if (ent.isFile() && (ent.name.endsWith('.mjs') || ent.name.endsWith('.py'))) {
+      const key = [...folders, ent.name].join('/');
+      if (!legacyWarned.has(key)) {
+        legacyWarned.add(key);
+        console.error('[functions] 忽略 ' + key + '：函数现在要放在自己的文件夹里，入口文件命名为 function.mjs / function.py（例如 ' + [...folders, ent.name.replace(/\.(mjs|py)$/, '')].join('/') + '/' + (ent.name.endsWith('.py') ? 'function.py' : 'function.mjs') + '）');
+      }
+    }
+  }
+}
+
+// 函数文件夹的“指纹”：里面所有文件的最新修改时间 + 文件数，任何一个文件变了（含依赖的模块）就重新加载。
+// 跳过 node_modules / __pycache__ / .git，文件数封顶，免得拖慢每次请求
+async function folderSignature(dir) {
+  let latest = 0, count = 0;
+  const walk = async (d, depth) => {
+    let entries;
+    try { entries = await readdir(d, { withFileTypes: true }); } catch { return; }
+    for (const ent of entries) {
+      if (count > 3000) return;
+      if (ent.name === 'node_modules' || ent.name === '__pycache__' || ent.name === '.git') continue;
+      const p = join(d, ent.name);
+      if (ent.isDirectory()) { if (depth < 6) await walk(p, depth + 1); }
+      else if (ent.isFile()) { count++; try { latest = Math.max(latest, (await stat(p)).mtimeMs); } catch { /* 刚被删掉 */ } }
+    }
+  };
+  await walk(dir, 0);
+  return latest + '-' + count;
+}
+
 async function loadFunctions() {
-  let files = [];
-  try { files = (await readdir(FUNCTIONS_DIR)).filter(f => (f.endsWith('.mjs') || f.endsWith('.py')) && !f.startsWith('_')).sort(); }
-  catch (e) { console.error('[functions] 读取目录失败:', e.message); }
-  const seen = new Set(files);
-  for (const name of fnFileCache.keys()) if (!seen.has(name)) fnFileCache.delete(name);
+  const found = [];
+  await listFunctions(FUNCTIONS_DIR, [], found);
+  const seen = new Set(found.map(f => f.key));
+  for (const key of fnFileCache.keys()) if (!seen.has(key)) fnFileCache.delete(key);
 
   const all = [];
   const ids = new Set();
-  for (const file of files) {
-    const full = join(FUNCTIONS_DIR, file);
+  for (const { key, dir, full, categories, folderName } of found) {
     try {
-      const st = await stat(full);
-      let entry = fnFileCache.get(file);
-      if (!entry || entry.mtimeMs !== st.mtimeMs) {
-        // 带上 mtime 做查询串，绕开 Node 的模块缓存，重新加载改过的文件
+      const sig = await folderSignature(dir);
+      let entry = fnFileCache.get(key);
+      if (!entry || entry.sig !== sig) {
+        // 带上指纹做查询串，绕开 Node 的模块缓存，重新加载改过的入口文件
         let defs;
-        if (file.endsWith('.py')) {
-          defs = await loadPyDef(full);
+        if (full.endsWith('.py')) {
+          defs = await loadPyDef(full, folderName);
         } else {
-          const mod = await import(pathToFileURL(full).href + '?v=' + st.mtimeMs);
-          defs = (Array.isArray(mod.default) ? mod.default : [mod.default]).filter(validDef);
+          const mod = await import(pathToFileURL(full).href + '?v=' + sig);
+          defs = (Array.isArray(mod.default) ? mod.default : [mod.default]).filter(Boolean);
+          defs.forEach(d => { if (!d.id) d.id = folderName; if (!d.name) d.name = d.id; }); // id、name 不写就用文件夹名
+          defs = defs.filter(validDef);
         }
-        entry = { mtimeMs: st.mtimeMs, defs };
-        fnFileCache.set(file, entry);
-        console.log('[functions] 已加载 ' + file + '：' + (defs.map(d => d.id).join(', ') || '（没有有效的函数定义）'));
+        defs.forEach(d => { d.folder = categories; }); // 所在的分类目录（各级目录名，不含函数文件夹自己），面板按它分层
+        entry = { sig, defs };
+        fnFileCache.set(key, entry);
+        console.log('[functions] 已加载 ' + key + '：' + (defs.map(d => d.id).join(', ') || '（没有有效的函数定义）'));
       }
       for (const d of entry.defs) {
-        if (ids.has(d.id)) { console.error('[functions] 函数 id 重复，忽略 ' + file + ' 里的 ' + d.id); continue; }
+        if (ids.has(d.id)) { console.error('[functions] 函数 id 重复，忽略 ' + key + ' 里的 ' + d.id); continue; }
         ids.add(d.id);
         all.push(d);
       }
     } catch (e) {
-      // 失败的文件不缓存 mtime，下次请求会重试；同时保留它上一次加载成功的版本
-      console.error('[functions] 加载 ' + file + ' 失败:', e.message);
-      const old = fnFileCache.get(file);
+      // 失败的不缓存指纹，下次请求会重试；同时保留它上一次加载成功的版本
+      console.error('[functions] 加载 ' + key + ' 失败:', e.message);
+      const old = fnFileCache.get(key);
       if (old) for (const d of old.defs) if (!ids.has(d.id)) { ids.add(d.id); all.push(d); }
     }
   }
@@ -344,7 +405,7 @@ async function loadFunctions() {
 }
 
 // ── 批处理函数接口 ──────────────────────────────
-// GET  /api/functions          → [{ id, name, inputs, outputs }]
+// GET  /api/functions          → [{ id, name, inputs, outputs, batchSize, path }]（path：函数所在分类目录的各级目录名，不含函数文件夹自己）
 // POST /api/functions/<id>/run  body { rows: [{...入参}] } → { results: [{ ok: true, outputs } | { ok: false, error }] }
 const MAX_BODY = 64 * 1024 * 1024;
 
@@ -371,7 +432,7 @@ function readJson(req) {
 async function handleFunctions(req, res, path) {
   if (path === '/api/functions' && req.method === 'GET') {
     const FUNCTIONS = await loadFunctions();
-    return sendJson(res, 200, FUNCTIONS.map(({ id, name, inputs, outputs }) => ({ id, name, inputs, outputs })));
+    return sendJson(res, 200, FUNCTIONS.map((d) => ({ id: d.id, name: d.name, inputs: d.inputs, outputs: d.outputs || [], batchSize: batchSizeOf(d), path: d.folder || [] })));
   }
   const m = path.match(/^\/api\/functions\/([^/]+)\/run$/);
   if (m && req.method === 'POST') {

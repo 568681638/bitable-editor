@@ -1,6 +1,7 @@
 import { describeError, describedError } from './errors';
-import { FieldMeta, FieldOption, RecordData, esc } from './common';
+import { FType, FieldMeta, FieldOption, RecordData, esc } from './common';
 import { buildPreviewHtml } from './preview-page';
+import { renderStatsView } from './stats-view';
 import { WRITABLE_TYPES, FIELD_TYPE_NAMES, needsOptions, toFieldValue } from './field-value';
 
 // ── 批处理面板：筛选记录 → 取输入字段调用后端函数 → 把输出写回字段 ──────────
@@ -21,11 +22,11 @@ export interface AutoFlushHost {
 }
 
 interface ParamMeta { name: string; label?: string; requires?: string[] }
-interface FnMeta { id: string; name: string; inputs: ParamMeta[]; outputs: ParamMeta[] }
+interface FnMeta { id: string; name: string; inputs: ParamMeta[]; outputs: ParamMeta[]; batchSize?: number; path?: string[] /* 函数所在目录的各级目录名（后端 functions/ 的目录结构） */ }
 
 type Cond = { kind: 'cond'; fieldId: string; op: string; value: string; sep?: string; customSep?: string };
 type Group = { kind: 'group'; logic: 'and' | 'or'; negate: boolean; children: (Cond | Group)[] };
-type Mapping = { param: string; fieldId: string };
+type Mapping = { param: string; fieldId: string; fn?: string /* 输入映射属于哪个函数（输出行没有）；旧版输入没有这一项，见 migrateLegacyInputs */ };
 interface Config { filter: Group; inputs: Mapping[]; outputs: Mapping[] }
 
 const OPS: [string, string][] = [
@@ -40,14 +41,20 @@ const LIST_OPS = new Set(['in', 'notIn']);
 const SEPS: [string, string][] = [[',', '英文逗号 ,'], ['\n', '换行']];
 const DEFAULT_SEP = ',';
 const CUSTOM_SEP = '__custom__'; // sep 取这个值时，用 customSep 作为拆分符
-const CALL_BATCH = 100; // 每批调用函数并写回的记录数（函数是批量接口，一批一次请求）
+const WRITE_BATCH = 100; // 写回表格每次提交的记录数（不足 100 也算一批），和函数的批大小无关
+const DEFAULT_BATCH = 100; // 函数没有声明 batchSize 时，每次调用传给它的行数
+type FnResult = { ok: boolean; outputs?: Record<string, any>; error?: string };
+// 函数分组标记行用这个前缀：param 形如 fn:<函数 id>（让没有输出参数、只调用的函数也有自己的分组，见 renderOutputs）
+const FN_PREFIX = 'fn:';
+const ALL_PREFIX = 'all:'; // 选择器里函数右侧“全选”图标的值（只在点选时用，不会存进配置）
+const batchOf = (fn: FnMeta) => (fn.batchSize && fn.batchSize > 0 ? fn.batchSize : DEFAULT_BATCH);
 
 // 历史记录（类比浏览历史）：每次筛选 / 预览 / 导出 / 运行都记一条，连同当时整套配置（筛选 + 输入 + 输出），之后可以一键恢复
-type HistoryKind = 'filter' | 'preview' | 'export' | 'run';
+type HistoryKind = 'filter' | 'preview' | 'stats' | 'export' | 'run';
 interface HistoryEntry { id: string; time: number; kind: HistoryKind; name?: string; config: Config; matched: number; total: number; result?: string; ok?: boolean }
 const HISTORY_LIMIT = 50; // 超出时先丢最旧的未命名记录，命名过的优先保留
 const HISTORY_NAME_MAX = 40;
-const HISTORY_KINDS: Record<HistoryKind, string> = { filter: '筛选', preview: '预览', export: '导出 CSV', run: '运行' };
+const HISTORY_KINDS: Record<HistoryKind, string> = { filter: '筛选', preview: '预览', stats: '统计', export: '导出 CSV', run: '运行' };
 
 const emptyGroup = (): Group => ({ kind: 'group', logic: 'and', negate: false, children: [] });
 const newConfig = (): Config => ({ filter: emptyGroup(), inputs: [], outputs: [] });
@@ -227,23 +234,59 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     for (const fn of fns) for (const out of fn.outputs) if (outputKey(fn, out) === key) return { fn, out };
     return null;
   }
-  function requiredInputs(key: string): string[] {
-    const hit = findOutput(key);
-    return hit ? (hit.out.requires || hit.fn.inputs.map(i => i.name)) : [];
+  // 函数分组标记行（fn:<id>）→ 那个函数；不是这种行返回 null
+  function findCall(key: string): FnMeta | null {
+    return key.startsWith(FN_PREFIX) ? fns.find(f => FN_PREFIX + f.id === key) ?? null : null;
   }
-  function inputLabel(name: string): string {
-    for (const fn of fns) { const p = fn.inputs.find(i => i.name === name); if (p) return p.label || p.name; }
-    return name;
+  const outLabel = (key: string) => findCall(key)?.name || findOutput(key)?.out.label || key;
+  // ── 输入映射：每个函数各管各的（config.inputs 的每一项带 fn = 函数 id）──
+  // 一个函数分组当前需要的入参名：分组里有输出参数就是它们 requires 的并集（缺省为全部入参），没有输出参数（纯调用）就是全部入参；
+  // 不在其中的入参在卡片里标“可选”：映射了就传给函数，不映射就不传
+  function groupRequired(fn: FnMeta): Set<string> {
+    const rows = config.outputs.filter(o => !o.param.startsWith(FN_PREFIX) && findOutput(o.param)?.fn.id === fn.id);
+    if (!rows.length) return new Set(fn.inputs.map(i => i.name));
+    return new Set(rows.flatMap(o => findOutput(o.param)!.out.requires || fn.inputs.map(i => i.name)));
   }
-  // 选了出参后，把它需要、但输入区还没有的入参自动补上
-  function ensureInputs() {
-    for (const o of config.outputs) {
-      for (const name of requiredInputs(o.param)) {
-        if (!config.inputs.some(i => i.param === name)) config.inputs.push({ param: name, fieldId: '' });
+  const inputField = (fnId: string, param: string) => config.inputs.find(i => i.fn === fnId && i.param === param)?.fieldId ?? '';
+  // 旧版输入是全局的（同名入参只映射一次，没有 fn）：函数列表加载好后，拆成各函数各自的映射
+  function migrateLegacyInputs(c: Config): boolean {
+    const legacy = c.inputs.filter(i => !i.fn);
+    if (!legacy.length) return false;
+    const used = new Set<string>();
+    for (const o of c.outputs) { const fn = fnOfKey(o.param); if (fn) used.add(fn.id); }
+    const migrated: Mapping[] = [];
+    for (const fn of fns) {
+      if (!used.has(fn.id)) continue;
+      for (const inp of fn.inputs) {
+        const old = legacy.find(l => l.param === inp.name && l.fieldId);
+        if (old) migrated.push({ fn: fn.id, param: inp.name, fieldId: old.fieldId });
       }
     }
+    c.inputs = [...c.inputs.filter(i => i.fn), ...migrated];
+    return true;
   }
-  const lockedInputs = () => new Set(config.outputs.flatMap(o => requiredInputs(o.param)));
+  // 新加函数时：必需的入参里，在别的函数里配过同名参数的，直接沿用那个字段（各函数的映射仍然各自独立，之后可以单独改）
+  function prefillInputs(fn: FnMeta) {
+    for (const name of groupRequired(fn)) {
+      if (config.inputs.some(i => i.fn === fn.id && i.param === name)) continue;
+      const other = config.inputs.find(i => i.fn !== fn.id && i.param === name && i.fieldId);
+      if (other) config.inputs.push({ fn: fn.id, param: name, fieldId: other.fieldId });
+    }
+  }
+  // 每个用到的函数，把它必需的入参自动补成输入行（字段留空等用户选）；输入行本身和手动加的一样可以改参数、改字段
+  function ensureAllInputs(): boolean {
+    let changed = false;
+    const done = new Set<string>();
+    for (const o of config.outputs) {
+      const fn = fnOfKey(o.param);
+      if (!fn || done.has(fn.id)) continue;
+      done.add(fn.id);
+      for (const name of groupRequired(fn)) {
+        if (!config.inputs.some(i => i.fn === fn.id && i.param === name)) { config.inputs.push({ fn: fn.id, param: name, fieldId: '' }); changed = true; }
+      }
+    }
+    return changed;
+  }
 
   // ── 渲染 ────────────────────────────────────────
   function fieldOptions(selected: string, only?: (f: FieldMeta) => boolean) {
@@ -290,30 +333,168 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     </div>`;
   }
 
-  function renderInputs() {
-    const locked = lockedInputs();
-    const names = [...new Set(fns.flatMap(f => f.inputs.map(i => i.name)))];
-    return config.inputs.map((m, i) => `<div class="af-row" data-list="inputs" data-idx="${i}">
-      <select data-act="param">
-        <option value="">选择参数</option>
-        ${names.map(n => `<option value="${esc(n)}"${n === m.param ? ' selected' : ''}>${esc(inputLabel(n))}（${esc(n)}）</option>`).join('')}
-      </select>
-      <span class="af-arrow">←</span>
-      <select data-act="field">${fieldOptions(m.fieldId)}</select>
-      ${locked.has(m.param) ? '<span class="af-lock" title="已选的输出需要这个输入">必需</span>' : '<button class="af-x" data-act="del" title="删除">×</button>'}
-    </div>`).join('');
+  // ── 输出：按函数分组 ──
+  // 选了某个函数的输出参数，就自动出现这个函数的分组，输出参数归到分组里；点函数右侧的 ＋ 就是手动建一个没有输出参数的分组（只调用函数）。
+  // 配置仍是一维列表：param 是“函数 id.输出名”的是输出行；是“fn:函数 id”的是分组标记（让没有输出参数的分组也存在），显示时按函数归并。
+  // 选择器的层级跟后端 functions/ 的目录结构一致：目录 → 函数 → 选项，所有目录和函数默认折叠，展开状态在本次会话里记住
+  let pickerScope: string | null = null; // 展开中的选择器：'' = 整块底部的“＋函数”；函数 id = 该函数分组里的“＋ 输出参数”
+  const pickerOpen = new Set<string>(); // 展开的目录 / 函数节点
+
+  const fnOfKey = (key: string): FnMeta | null => findCall(key) ?? findOutput(key)?.fn ?? null;
+  // 函数右侧的两个图标按钮：＋ / －（把这个函数加进来——没有输出参数的分组就是只调用；加了之后变成 －，点一下把它连同输出参数移除）、
+  // 全选（加上全部输出参数；已经全加了就变成取消全选）。真正调用函数是在点“运行”的时候。withCall：是否带 ＋ / －（分组里的“＋ 输出参数”不需要）
+  function fnTools(fn: FnMeta, present: Set<string>, withCall: boolean): string {
+    const keys = fn.outputs.map(o => outputKey(fn, o));
+    const allOn = keys.length > 0 && keys.every(k => present.has(k));
+    const hasGroup = config.outputs.some(o => fnOfKey(o.param)?.id === fn.id);
+    return '<span class="af-tn-tools">' +
+      (withCall ? `<span class="af-ico${hasGroup ? ' on' : ''}" data-pick="${esc(FN_PREFIX + fn.id)}" title="${hasGroup ? '移除这个函数（连同已添加的输出参数）' : '添加这个函数：不选输出参数就是只调用、不写入字段；真正调用在点「运行」时'}">${hasGroup ? '－' : '＋'}</span>` : '') +
+      (keys.length ? `<span class="af-ico${allOn ? ' on' : ''}" data-pick="${esc(ALL_PREFIX + fn.id)}" title="${allOn ? '取消全选：把这个函数已添加的输出参数全部移除' : '全选：一次加上这个函数的全部输出参数'}">${allOn ? '☑' : '☐'}</span>` : '') +
+      '</span>';
   }
 
-  function renderOutputs() {
-    return config.outputs.map((m, i) => `<div class="af-row" data-list="outputs" data-idx="${i}">
-      <select data-act="param">
+  // 输出参数的勾选列表：已添加的打勾，再点一下移除
+  function renderOutputList(fn: FnMeta, present: Set<string>): string {
+    return fn.outputs.map(o => {
+      const k = outputKey(fn, o);
+      return `<div class="af-opt${present.has(k) ? ' on' : ''}" data-pick="${esc(k)}"><span class="af-box"></span>${esc(o.label || o.name)}</div>`;
+    }).join('') || '<div class="af-hint">这个函数没有输出参数</div>';
+  }
+
+  interface TreeNode { name: string; folders: Map<string, TreeNode>; fns: FnMeta[] }
+
+  function renderPickerTree(present: Set<string>): string {
+    const top: TreeNode = { name: '', folders: new Map(), fns: [] };
+    for (const fn of fns) {
+      let cur = top;
+      for (const dir of fn.path || []) {
+        if (!cur.folders.has(dir)) cur.folders.set(dir, { name: dir, folders: new Map(), fns: [] });
+        cur = cur.folders.get(dir)!;
+      }
+      cur.fns.push(fn);
+    }
+    const open = (key: string) => (pickerOpen.has(key) ? ' open' : '');
+    // 一行：左边是展开 / 折叠的标题，右边是（函数才有的）图标按钮——图标不在 data-tog 里，点它不会触发展开 / 折叠
+    const head = (key: string, text: string, tools = '') => `<div class="af-tn-row"><div class="af-tn-head" data-tog="${esc(key)}"><span class="af-tn-arrow"></span><span class="af-tn-name">${esc(text)}</span></div>${tools}</div>`;
+    const fnNode = (fn: FnMeta) => {
+      const key = `f:${fn.id}`;
+      return `<div class="af-tn af-tn-fn${open(key)}">${head(key, fn.name, fnTools(fn, present, true))}<div class="af-tn-kids">${renderOutputList(fn, present)}</div></div>`;
+    };
+    const walk = (n: TreeNode, prefix: string): string =>
+      [...n.folders.values()].sort((x, y) => x.name.localeCompare(y.name, 'zh')).map(f => {
+        const key = `d:${prefix}/${f.name}`;
+        return `<div class="af-tn af-tn-dir${open(key)}">${head(key, f.name)}<div class="af-tn-kids">${walk(f, prefix + '/' + f.name)}</div></div>`;
+      }).join('') + n.fns.map(fnNode).join('');
+    return walk(top, '') || '<div class="af-hint">没有可选的函数</div>';
+  }
+
+  // 分组里的“＋ 输出参数”：函数名一行（右侧只有全选），下面是输出参数的勾选列表
+  function renderScopedPicker(fn: FnMeta, present: Set<string>): string {
+    return `<div class="af-tn-row af-scope-head"><span class="af-tn-name">${esc(fn.name)}</span>${fnTools(fn, present, false)}</div>${renderOutputList(fn, present)}`;
+  }
+
+  // 去掉一个输出参数行；它是分组里最后一个就把分组标记放回原位（分组留着变成纯调用，按首次出现的位置排序，所以不能放到末尾）
+  function removeOutputAt(idx: number) {
+    const removed = config.outputs.splice(idx, 1)[0];
+    const fn = findOutput(removed.param)?.fn;
+    if (fn && !config.outputs.some(o => fnOfKey(o.param)?.id === fn.id)) config.outputs.splice(idx, 0, { param: FN_PREFIX + fn.id, fieldId: '' });
+  }
+
+  // 在选择器里点了一项：
+  //   ＋ / － → 把函数加进来（建一个没有输出参数的分组）；已经加过就把整个函数连同输出参数移除；
+  //   输出参数全选 / 取消全选 → 加上它所有还没加的输出参数（已全加了就全部移除）；
+  //   单个输出参数 → 没加就加上，加了就移除（勾选列表）。
+  // 输出参数加进来后，自动归到所属函数的分组里（没有分组就自动建）。这些操作都不收起选择器，可以接着选
+  function applyPick(pick: string) {
+    const target = pick.startsWith(ALL_PREFIX) ? fns.find(f => ALL_PREFIX + f.id === pick) : pick.startsWith(FN_PREFIX) ? findCall(pick) : findOutput(pick)?.fn;
+    const existed = !!target && config.outputs.some(o => fnOfKey(o.param)?.id === target.id);
+    const have = new Set(config.outputs.map(o => o.param));
+    const add = (param: string) => { if (!have.has(param)) { config.outputs.push({ param, fieldId: '' }); have.add(param); } };
+    const remove = (param: string) => { const i = config.outputs.findIndex(o => o.param === param); if (i >= 0) removeOutputAt(i); };
+    if (pick.startsWith(ALL_PREFIX)) {
+      const fn = fns.find(f => ALL_PREFIX + f.id === pick);
+      if (fn) {
+        const keys = fn.outputs.map(o => outputKey(fn, o));
+        if (keys.every(k => have.has(k))) keys.forEach(remove); else keys.forEach(add);
+      }
+    } else if (pick.startsWith(FN_PREFIX)) {
+      const fn = findCall(pick);
+      if (fn && config.outputs.some(o => fnOfKey(o.param)?.id === fn.id)) config.outputs = config.outputs.filter(o => fnOfKey(o.param)?.id !== fn.id); // 已加过：移除整个函数
+      else add(pick);
+    } else if (have.has(pick)) remove(pick);
+    else add(pick);
+    if (target && !existed && config.outputs.some(o => fnOfKey(o.param)?.id === target.id)) prefillInputs(target); // 刚建出的分组：沿用别处配过的同名入参
+    // 在选择器里操作时，视野以选择器为主：加 / 删输出参数会让面板里的卡片变多变少、整体变高变矮，
+    // 重绘后把面板滚到让选择器回到原来在屏幕上的位置，选择器自己的滚动位置也保持，操作的人看到的画面不动
+    const before = container.querySelector('.af-pick-pop') as HTMLElement | null;
+    const topBefore = before?.getBoundingClientRect().top ?? 0;
+    const innerScroll = before?.scrollTop ?? 0;
+    saveConfig();
+    render();
+    const pop = container.querySelector('.af-pick-pop') as HTMLElement | null;
+    if (pop && before) {
+      pop.scrollTop = innerScroll;
+      for (let i = 0; i < 3; i++) { // 面板有缩放，滚动量和屏幕像素不完全 1:1，多校正两次
+        const diff = pop.getBoundingClientRect().top - topBefore;
+        if (Math.abs(diff) < 1) break;
+        container.scrollTop += diff;
+      }
+    }
+  }
+
+  // 卡片里的输入：这个函数的每个入参映射到哪个字段（只属于这个函数）；当前输出参数不需要的入参标“可选”
+  function renderCardInputs(fn: FnMeta): string {
+    if (!fn.inputs.length) return '';
+    const req = groupRequired(fn);
+    const mine = config.inputs.map((m, i) => ({ m, i })).filter(x => x.m.fn === fn.id);
+    const used = new Set(mine.map(x => x.m.param));
+    const rows = mine.map(({ m, i }) => `<div class="af-row" data-in="${i}">
+      <select data-act="in-param" class="af-fg-param" title="这个函数的入参">
         <option value="">选择参数</option>
-        ${fns.map(fn => `<optgroup label="${esc(fn.name)}">${fn.outputs.map(o => `<option value="${esc(outputKey(fn, o))}"${outputKey(fn, o) === m.param ? ' selected' : ''}>${esc(o.label || o.name)}</option>`).join('')}</optgroup>`).join('')}
+        ${fn.inputs.map(inp => `<option value="${esc(inp.name)}"${inp.name === m.param ? ' selected' : ''}${inp.name !== m.param && used.has(inp.name) ? ' disabled' : ''}>${esc(inp.label || inp.name)}（${esc(inp.name)}）</option>`).join('')}
       </select>
-      <span class="af-arrow">→</span>
-      <select data-act="field">${fieldOptions(m.fieldId)}</select>
-      <button class="af-x" data-act="del" title="删除">×</button>
+      <span class="af-arrow">←</span>
+      <select data-act="in-field">${fieldOptions(m.fieldId)}</select>
+      ${req.has(m.param) ? '<span class="af-lock" title="必需：这个函数要运行就必须映射这个入参。选了输出参数时，是这些输出参数需要的入参；没选输出参数时，函数的全部入参都必需">必需</span>' : `<button class="af-x" data-act="del-in" data-in="${i}" title="删除这个输入">×</button>`}
     </div>`).join('');
+    return rows ? `<div class="af-iog in" title="输入：入参 ← 字段"><span class="af-iog-label">输入</span><div class="af-iog-body">${rows}</div></div>` : '';
+  }
+
+  // 输出字段是可选的：选了，函数返回的结果就顺带写进这个字段；不选，就只调用、不写入
+  function renderOutputs() {
+    const groups = new Map<string, { name: string; fn: FnMeta | null; rows: number[] }>();
+    config.outputs.forEach((m, i) => {
+      const fn = fnOfKey(m.param);
+      const key = fn ? fn.id : `missing:${m.param}`;
+      if (!groups.has(key)) groups.set(key, { name: fn ? fn.name : '（函数已不存在）', fn, rows: [] });
+      if (!findCall(m.param)) groups.get(key)!.rows.push(i); // 分组标记本身不显示成一行
+    });
+    const present = new Set(config.outputs.map(o => o.param));
+    const rowHtml = (i: number) => {
+      const m = config.outputs[i];
+      const hit = findOutput(m.param);
+      return `<div class="af-row" data-list="outputs" data-idx="${i}">
+        <select data-act="out-param" class="af-fg-param" title="换成这个函数的另一个输出参数">
+          ${hit ? '' : `<option value="${esc(m.param)}" selected>${esc(m.param)}（已不存在）</option>`}
+          ${(hit?.fn.outputs ?? []).map(o => { const k = outputKey(hit!.fn, o); return `<option value="${esc(k)}"${k === m.param ? ' selected' : ''}${k !== m.param && present.has(k) ? ' disabled' : ''}>${esc(o.label || o.name)}</option>`; }).join('')}
+        </select>
+        <span class="af-arrow">→</span>
+        <select data-act="field" title="输出字段是可选的：选了，函数返回的结果会顺带写入这个字段；不选，就只调用函数、不写入任何字段">${fieldOptions(m.fieldId)}</select>
+        <button class="af-x" data-act="del" title="删除这个输出参数">×</button>
+      </div>`;
+    };
+    const cards = [...groups.entries()].map(([key, g]) => `<div class="af-fg" data-fn="${esc(key)}">
+      <div class="af-fg-head" title="${esc([...(g.fn?.path || []), g.name].join(' / '))}">
+        <span class="af-fg-name">${esc(g.name)}</span>
+        <span class="af-fg-actions">
+          ${g.fn ? `<button type="button" class="af-add" data-act="add-in" data-fn="${esc(g.fn.id)}" title="${g.fn.inputs.every(inp => config.inputs.some(i => i.fn === g.fn!.id && i.param === inp.name)) ? '这个函数的入参都已添加' : '给这个函数添加一个输入（入参 ← 字段）'}"${g.fn.inputs.every(inp => config.inputs.some(i => i.fn === g.fn!.id && i.param === inp.name)) ? ' disabled' : ''}>＋输入</button><span class="af-pick"><button type="button" class="af-add" data-act="pick-toggle" data-scope="${esc(g.fn.id)}" title="给这个函数添加输出参数" ${g.fn.outputs.length ? '' : 'disabled'}>＋输出</button>${pickerScope === g.fn.id ? `<div class="af-pick-pop">${renderScopedPicker(g.fn, present)}</div>` : ''}</span>` : ''}
+          <button class="af-x af-x-group" data-act="del-group" data-fn="${esc(key)}" title="移除这个函数（连同它的全部输出参数）">×</button>
+        </span>
+      </div>
+      ${g.fn ? renderCardInputs(g.fn) : ''}
+      ${g.rows.length ? `<div class="af-iog out" title="输出：输出参数 → 字段（字段可选）"><span class="af-iog-label">输出</span><div class="af-iog-body">${g.rows.map(rowHtml).join('')}</div></div>` : ''}
+    </div>`).join('');
+    return cards + `<span class="af-pick"><button type="button" class="af-add" data-act="pick-toggle" data-scope="" title="选一个函数或它的输出参数；选了输出参数会自动归到对应的函数分组，选「纯调用函数」就是手动建一个没有输出参数的分组">＋函数</button>${pickerScope === '' ? `<div class="af-pick-pop">${renderPickerTree(present)}</div>` : ''}</span>`;
   }
 
   // 块右上角的 ×：一键清空这个块里的内容（块里本来就是空的、或正在运行时置灰）
@@ -322,6 +503,10 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
 
   function render() {
     loadConfig();
+    if (fnState === 'ready') {
+      const migrated = migrateLegacyInputs(config);
+      if (ensureAllInputs() || migrated) saveConfig();
+    }
     const keepScroll = container.scrollTop;
     let body: string;
     if (fnState === 'loading' || fnState === 'idle') {
@@ -332,9 +517,8 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       body = '<div class="af-hint">后端还没有注册任何函数（在服务器的 release/server/functions/ 目录里添加）</div>';
     } else {
       body = `
-        <section class="af-sec"><h4 class="af-h"><span>筛选 <span class="af-count"></span></span><span class="af-h-actions"><button class="af-add" data-act="filter" title="读取视图记录，只计算命中数，不调用函数、不写入"${running || exporting ? ' disabled' : ''}>筛选</button><button class="af-add" data-act="preview-filtered" title="在悬浮窗口里查看符合筛选条件的记录（全部可见字段）"${running || exporting ? ' disabled' : ''}>预览</button><span class="af-menu-wrap"><button class="af-add af-more" data-act="filter-menu" title="更多：导出 CSV、导入 / 导出筛选条件">☰</button>${filterMenuOpen ? `<div class="menu af-menu"><button class="menu-item" data-act="export-filtered" title="把视图里符合筛选条件的记录（全部可见字段）导出为 CSV"${running || exporting ? ' disabled' : ''}>导出 CSV</button><button class="menu-item" data-act="filter-import" title="从文件导入筛选条件（会替换当前条件）"${running || exporting ? ' disabled' : ''}>筛选条件导入</button><button class="menu-item" data-act="filter-export" title="把当前筛选条件导出为文件，方便复用">筛选条件导出</button></div>` : ''}</span></span></h4>${renderNode(config.filter, [])}</section>
-        <section class="af-sec"><h4 class="af-h"><span>输入</span>${clearBtn('clear-inputs', '输入项', config.inputs.length === 0)}</h4>${renderInputs()}<button class="af-add" data-act="add-input">＋ 输入项</button></section>
-        <section class="af-sec"><h4 class="af-h"><span>输出</span>${clearBtn('clear-outputs', '输出项', config.outputs.length === 0)}</h4>${renderOutputs()}<button class="af-add" data-act="add-output">＋ 输出项</button></section>
+        <section class="af-sec"><h4 class="af-h"><span>筛选 <span class="af-count"></span></span><span class="af-h-actions"><button class="af-add" data-act="filter" title="读取视图记录，只计算命中数，不调用函数、不写入"${running || exporting ? ' disabled' : ''}>筛选</button><button class="af-add" data-act="stats-filtered" title="读取视图记录，对符合筛选条件的记录做统计（取值分布等），在新标签页里查看"${running || exporting ? ' disabled' : ''}>统计</button><button class="af-add" data-act="preview-filtered" title="在悬浮窗口里查看符合筛选条件的记录（全部可见字段）"${running || exporting ? ' disabled' : ''}>预览</button><span class="af-menu-wrap"><button class="af-add af-more" data-act="filter-menu" title="更多：导出 CSV、导入 / 导出筛选条件">☰</button>${filterMenuOpen ? `<div class="menu af-menu"><button class="menu-item" data-act="export-filtered" title="把视图里符合筛选条件的记录（全部可见字段）导出为 CSV"${running || exporting ? ' disabled' : ''}>导出 CSV</button><button class="menu-item" data-act="filter-import" title="从文件导入筛选条件（会替换当前条件）"${running || exporting ? ' disabled' : ''}>筛选条件导入</button><button class="menu-item" data-act="filter-export" title="把当前筛选条件导出为文件，方便复用">筛选条件导出</button></div>` : ''}</span></span></h4>${renderNode(config.filter, [])}</section>
+        <section class="af-sec"><h4 class="af-h"><span>函数</span>${clearBtn('clear-outputs', '函数', config.outputs.length === 0)}</h4>${renderOutputs()}</section>
         <div class="af-status${statusKind ? ' ' + statusKind : ''}">${esc(statusText).replace(/\n/g, '<br />')}</div>
         ${renderFailures()}`;
     }
@@ -438,9 +622,35 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
   document.addEventListener('click', (e) => { if (!(e.target as HTMLElement).closest('.af-menu-wrap')) closeFilterMenu(); });
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeFilterMenu(); });
 
+  // 输出选择器：展开 / 折叠目录和函数（不重绘，只切样式）；点选一项
+  document.addEventListener('click', (e) => {
+    if (pickerScope !== null && !(e.target as HTMLElement).closest('.af-pick')) { pickerScope = null; render(); }
+  });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && pickerScope !== null) { pickerScope = null; render(); } });
+
   container.addEventListener('click', (e) => {
-    const btn = (e.target as HTMLElement).closest('button[data-act]') as HTMLElement | null;
+    const target = e.target as HTMLElement;
+    const tog = target.closest('[data-tog]') as HTMLElement | null;
+    if (tog) {
+      const node = tog.closest('.af-tn') as HTMLElement; // 标题外面还包着一行（放图标按钮），要找整个节点
+      const key = tog.dataset.tog!;
+      node.classList.toggle('open');
+      if (node.classList.contains('open')) pickerOpen.add(key); else pickerOpen.delete(key);
+      (container.querySelector('.af-pick-pop') as HTMLElement | null)?.scrollIntoView({ block: 'nearest' }); // 展开后选择器变高了：只在被挡住时才滚一点，保证它完整在视野里
+      return;
+    }
+    const pick = target.closest('[data-pick]') as HTMLElement | null;
+    if (pick) { applyPick(pick.dataset.pick!); return; }
+    const btn = target.closest('button[data-act]') as HTMLElement | null;
     if (!btn) return;
+    if (btn.dataset.act === 'pick-toggle') {
+      const scope = btn.dataset.scope || '';
+      pickerScope = pickerScope === scope ? null : scope;
+      render();
+      (container.querySelector('.af-pick-pop') as HTMLElement | null)?.scrollIntoView({ block: 'nearest' }); // 刚展开：保证选择器完整出现在视野里
+      return;
+    }
+    pickerScope = null;
     const act = btn.dataset.act!;
     if (act.startsWith('fail-')) { onFailAction(act, btn); return; }
     const nodeEl = btn.closest('[data-path]') as HTMLElement | null;
@@ -449,18 +659,31 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       case 'add-cond': (nodeAt(nodeEl!.dataset.path!).node as Group).children.push({ kind: 'cond', fieldId: '', op: 'contains', value: '' }); break;
       case 'add-group': (nodeAt(nodeEl!.dataset.path!).node as Group).children.push(emptyGroup()); break;
       case 'del':
-        if (rowEl) { config[rowEl.dataset.list as 'inputs' | 'outputs'].splice(Number(rowEl.dataset.idx), 1); }
+        if (rowEl) {
+          const idx = Number(rowEl.dataset.idx);
+          removeOutputAt(idx); // 删掉分组里最后一个输出参数，分组留着变成纯调用；要移除整个函数点分组右上角的 ×
+        }
         else if (nodeEl) { const { parent, index } = nodeAt(nodeEl.dataset.path!); parent?.children.splice(index, 1); }
         break;
       case 'clear-filter': config.filter = emptyGroup(); break;
-      case 'clear-inputs': config.inputs = []; ensureInputs(); break; // 输出还在的话，它必需的输入项会重新补成空行
-      case 'clear-outputs': config.outputs = []; break;
-      case 'add-input': config.inputs.push({ param: '', fieldId: '' }); break;
-      case 'add-output': config.outputs.push({ param: '', fieldId: '' }); break;
+      case 'clear-outputs': config.outputs = []; config.inputs = []; break;
+      case 'add-in': { // 新加一行输入：默认选这个函数里第一个还没用的入参（可以再改）
+        const fn = fns.find(f => f.id === btn.dataset.fn);
+        const free = fn?.inputs.find(inp => !config.inputs.some(i => i.fn === fn.id && i.param === inp.name));
+        if (fn && free) config.inputs.push({ fn: fn.id, param: free.name, fieldId: '' });
+        break;
+      }
+      case 'del-in': config.inputs.splice(Number(btn.dataset.in), 1); break;
+      case 'del-group': { // 移除整个函数分组：它的全部输出参数一起删
+        const key = btn.dataset.fn!;
+        config.outputs = config.outputs.filter(o => (fnOfKey(o.param)?.id ?? `missing:${o.param}`) !== key);
+        break;
+      }
       case 'reload-fns': loadFunctions(); return;
       case 'filter-menu': filterMenuOpen = !filterMenuOpen; render(); return;
       case 'filter': applyFilter(); return;
       case 'preview-filtered': previewFiltered(); return;
+      case 'stats-filtered': statsFiltered(); return;
       case 'export-filtered': closeFilterMenu(); exportFiltered(); return;
       case 'filter-export': closeFilterMenu(); exportFilterConditions(); return;
       case 'filter-import': closeFilterMenu(); importFilterConditions(); return;
@@ -491,14 +714,20 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     const el = e.target as HTMLSelectElement | HTMLInputElement;
     const act = el.dataset.act;
     if (!act || act === 'cond-sep-custom') return;
+    const inRow = el.closest('[data-in]') as HTMLElement | null;
+    if (inRow && (act === 'in-param' || act === 'in-field')) { // 卡片里的输入行：入参 / 字段
+      const m = config.inputs[Number(inRow.dataset.in)];
+      if (m) { if (act === 'in-param') m.param = el.value; else m.fieldId = el.value; }
+      saveConfig();
+      render();
+      return;
+    }
     const nodeEl = el.closest('[data-path]') as HTMLElement | null;
     const rowEl = el.closest('[data-list]') as HTMLElement | null;
     if (rowEl) {
-      const m = config[rowEl.dataset.list as 'inputs' | 'outputs'][Number(rowEl.dataset.idx)];
-      if (act === 'param') {
-        m.param = el.value;
-        if (rowEl.dataset.list === 'outputs') ensureInputs();
-      } else if (act === 'field') m.fieldId = el.value;
+      const m = config.outputs[Number(rowEl.dataset.idx)];
+      if (act === 'out-param') m.param = el.value; // 输出行：换成同一个函数的另一个输出参数（已被别的行用了的置灰）
+      else if (act === 'field') m.fieldId = el.value;
     } else if (nodeEl) {
       const node = nodeAt(nodeEl.dataset.path!).node;
       if (node.kind === 'cond') {
@@ -523,31 +752,47 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
   function validate(): string | null {
     const regexErr = checkRegexes(config.filter);
     if (regexErr) return regexErr;
-    if (config.outputs.length === 0) return '请至少添加一个输出项';
+    if (config.outputs.length === 0) return '请至少添加一个函数';
     for (const o of config.outputs) {
-      if (!o.param || !o.fieldId) return '输出项里有未选完整的参数或字段';
+      if (o.param.startsWith(FN_PREFIX)) { // 只调用的函数：不需要字段
+        if (!findCall(o.param)) return '函数已不存在（可能被删除），请重新选择';
+        continue;
+      }
+      if (!o.param) return '函数里有未选择的输出参数';
       if (!findOutput(o.param)) return `输出参数“${o.param}”已不存在（函数可能被删除），请重新选择`;
+      if (!o.fieldId) continue; // 没选字段：只取结果、不写入
       const field = host.getAllFields().find(f => f.id === o.fieldId);
-      if (!field) return '输出项里有字段已不存在，请重新选择（可点右上角 ↻ 刷新字段）';
+      if (!field) return '函数的输出字段已不存在，请重新选择（可点右上角 ↻ 刷新字段）';
       if (!WRITABLE_TYPES.has(field.type)) {
         return `输出字段“${field.name}”是${FIELD_TYPE_NAMES[field.type] || '当前'}类型，暂不支持写入，目前支持：文本、数字、货币、进度、评分、单选、多选、日期、复选框、电话、邮箱、超链接、人员，请换一个字段`;
       }
     }
-    const outFields = config.outputs.map(o => o.fieldId);
-    if (new Set(outFields).size !== outFields.length) return '多个输出项写入了同一个字段';
-    for (const i of config.inputs) if (!i.param || !i.fieldId) return '输入项里有未选完整的参数或字段';
-    const inParams = config.inputs.map(i => i.param);
-    if (new Set(inParams).size !== inParams.length) return '同一个输入参数被映射了多次';
+    const outFields = config.outputs.filter(o => !o.param.startsWith(FN_PREFIX) && o.fieldId).map(o => o.fieldId);
+    if (new Set(outFields).size !== outFields.length) return '多个输出参数写入了同一个字段';
+    const calls = config.outputs.filter(o => o.param.startsWith(FN_PREFIX)).map(o => o.param);
+    if (new Set(calls).size !== calls.length) return '同一个函数被选了多次';
+    // 每个函数需要的入参都要映射到字段
+    const fieldIds = new Set(host.getAllFields().map(f => f.id));
+    const checked = new Set<string>();
     for (const o of config.outputs) {
-      for (const name of requiredInputs(o.param)) {
-        if (!inParams.includes(name)) return `输出“${findOutput(o.param)?.out.label || o.param}”缺少输入参数“${inputLabel(name)}”`;
+      const fn = fnOfKey(o.param);
+      if (!fn || checked.has(fn.id)) continue;
+      checked.add(fn.id);
+      for (const name of groupRequired(fn)) {
+        const fid = inputField(fn.id, name);
+        const label = fn.inputs.find(i => i.name === name)?.label || name;
+        if (!fid) return `函数“${fn.name}”缺少输入参数“${label}”的字段`;
+      }
+      for (const m of config.inputs.filter(i => i.fn === fn.id)) {
+        if (!m.param || !m.fieldId) return `函数“${fn.name}”的输入项里有未选完整的参数或字段`;
+        if (!fieldIds.has(m.fieldId)) return `函数“${fn.name}”的输入字段已不存在，请重新选择（可点右上角 ↻ 刷新字段）`;
       }
     }
     return null;
   }
 
   // 这里抛出的错误都是已经带上函数名的中文说明，用 describedError 标记，避免被通用翻译二次改写
-  async function callFunction(fn: FnMeta, rows: Record<string, any>[]): Promise<{ ok: boolean; outputs?: Record<string, any>; error?: string }[]> {
+  async function callFunction(fn: FnMeta, rows: Record<string, any>[]): Promise<FnResult[]> {
     const prefix = `函数“${fn.name}”调用失败：`;
     let res: Response;
     try {
@@ -748,8 +993,11 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
   // 在新标签页里打开完整预览：点击当下直接打开，数据已经在手，页面是个自带脚本的快照。
   // 用带 target=_blank 的链接点击来打开，而不是判断 window.open 的返回值：
   // 在飞书的 iframe 等环境里，新标签页明明打开了，window.open 也可能返回 null，据此提示“被拦截”会误报
-  function openPreviewTab(rows: string[][], total: number) {
-    const url = URL.createObjectURL(new Blob([buildPreviewHtml(rows, total)], { type: 'text/html;charset=utf-8' }));
+  // 和 filteredRows 的列一一对应（第一列是记录 ID）：哪些列是多选字段，统计时要按选项拆开
+  const multiFlags = () => [false, ...host.getFields().map(f => f.type === FType.MULTI_SELECT)];
+
+  function openPreviewTab(rows: string[][], total: number, tab: 'data' | 'stats' = 'data') {
+    const url = URL.createObjectURL(new Blob([buildPreviewHtml(rows, total, tab, multiFlags())], { type: 'text/html;charset=utf-8' }));
     const a = document.createElement('a');
     a.href = url;
     a.target = '_blank';
@@ -833,9 +1081,9 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
   function describeIo(c: Config): string {
     const names = new Map(host.getAllFields().map(f => [f.id, f.name]));
     const fieldName = (id: string) => (id ? names.get(id) ?? '（字段已不存在）' : '未选字段');
-    const ins = c.inputs.map(i => `${i.param || '未选参数'} ← ${fieldName(i.fieldId)}`);
-    const outs = c.outputs.map(o => `${findOutput(o.param)?.out.label || o.param || '未选参数'} → ${fieldName(o.fieldId)}`);
-    return [ins.length ? `输入：${ins.join('，')}` : '', outs.length ? `输出：${outs.join('，')}` : ''].filter(Boolean).join('；') || '未配置输入 / 输出';
+    const ins = [...new Set(c.inputs.filter(i => i.fieldId || !i.fn).map(i => `${i.param || '未选参数'} ← ${fieldName(i.fieldId)}`))];
+    const outs = c.outputs.map(o => o.param.startsWith(FN_PREFIX) ? `调用 ${outLabel(o.param)}` : `${findOutput(o.param)?.out.label || o.param || '未选参数'}${o.fieldId ? ` → ${fieldName(o.fieldId)}` : '（不写入）'}`);
+    return [ins.length ? `输入：${ins.join('，')}` : '', outs.length ? `函数：${outs.join('，')}` : ''].filter(Boolean).join('；') || '未配置输入 / 函数';
   }
 
   function restoreHistory(entry: HistoryEntry, only: 'all' | 'filter'): boolean {
@@ -848,6 +1096,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     const saved = JSON.parse(JSON.stringify(entry.config)) as Config;
     config = only === 'filter' ? { ...config, filter: saved.filter } : { ...newConfig(), ...saved };
     migrateSeps(config.filter);
+    migrateLegacyInputs(config); // 旧版历史里的输入是全局的
     saveConfig();
     const when = new Date(entry.time);
     const pad2 = (n: number) => String(n).padStart(2, '0');
@@ -861,7 +1110,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
 
   function entryForExport(e: HistoryEntry): any {
     const byId = new Map(host.getAllFields().map(f => [f.id, f.name]));
-    const io = (m: Mapping) => ({ param: m.param, fieldId: m.fieldId, fieldName: byId.get(m.fieldId) ?? '' });
+    const io = (m: Mapping) => ({ param: m.param, fieldId: m.fieldId, fieldName: byId.get(m.fieldId) ?? '', ...(m.fn ? { fn: m.fn } : {}) });
     return {
       time: e.time, kind: e.kind, ...(e.name ? { name: e.name } : {}), matched: e.matched, total: e.total,
       ...(e.result ? { result: e.result } : {}), ...(e.ok !== undefined ? { ok: e.ok } : {}),
@@ -890,8 +1139,8 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       return '';
     };
     const io = (raw: any): Mapping[] => {
-      if (!Array.isArray(raw)) throw new Error('输入 / 输出的结构不对');
-      return raw.map((m: any) => ({ param: String(m?.param ?? ''), fieldId: mapField(String(m?.fieldId ?? ''), String(m?.fieldName ?? '')) }));
+      if (!Array.isArray(raw)) throw new Error('输入 / 函数的结构不对');
+      return raw.map((m: any) => ({ param: String(m?.param ?? ''), fieldId: mapField(String(m?.fieldId ?? ''), String(m?.fieldName ?? '')), ...(typeof m?.fn === 'string' && m.fn ? { fn: m.fn } : {}) }));
     };
     const entries: HistoryEntry[] = [];
     let skipped = 0;
@@ -971,7 +1220,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
           <div class="af-hist-title"><span class="af-hist-kind ${e.kind}">${HISTORY_KINDS[e.kind]}</span><span class="af-hist-name${e.name ? '' : ' empty'}" data-h="rename" title="点击给这条记录命名 / 改名，方便以后查找">${e.name ? esc(e.name) : '＋ 命名'}</span><span class="af-hist-time">${pad(when.getHours())}:${pad(when.getMinutes())}:${pad(when.getSeconds())}</span></div>
           ${lines.map(l => `<div class="af-hist-line" title="${esc(l)}">${esc(l)}</div>`).join('')}
           <div class="af-hist-line stat${e.ok === false ? ' bad' : ''}" title="${esc(stat)}">${esc(stat)}</div>
-          <div class="af-hist-btns"><span class="af-hist-btns-left"><button class="af-add" data-h="all" title="把筛选、输入、输出整套换成这条记录当时的配置">恢复全部</button><button class="af-add" data-h="filter" title="只替换筛选条件，输入 / 输出保持不变">仅恢复筛选</button><button class="af-add" data-h="export" title="把这条历史记录导出为文件">导出</button></span></div>
+          <div class="af-hist-btns"><span class="af-hist-btns-left"><button class="af-add" data-h="all" title="把筛选、输入、函数整套换成这条记录当时的配置">恢复全部</button><button class="af-add" data-h="filter" title="只替换筛选条件，输入 / 输出保持不变">仅恢复筛选</button><button class="af-add" data-h="export" title="把这条历史记录导出为文件">导出</button></span></div>
         </div>`;
       }).join('');
       listEl.scrollTop = keep;
@@ -1067,6 +1316,52 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     searchEl.focus();
   }
 
+  // ── 统计：读取记录、筛选，在侧边栏里弹出悬浮窗看统计（窗口里可以再在新标签页打开，空间更大）──
+  async function statsFiltered() {
+    if (running || exporting) return;
+    const regexErr = checkRegexes(config.filter);
+    if (regexErr) { setStatus(regexErr, 'error'); return; }
+    exporting = true;
+    setReadProgress('');
+    render();
+    let ready: { rows: string[][]; total: number } | null = null;
+    try {
+      const all = await host.loadAllRecords((done, n) => setReadProgress(` ${done}/${n}`));
+      const matched = all.filter(r => evalGroup(config.filter, r));
+      filterResult = { sig: filterSig(), matched: matched.length, total: all.length };
+      recordHistory('stats', matched.length, all.length);
+      if (matched.length === 0) setStatus(`视图共 ${all.length} 条记录，没有符合筛选条件的记录`, '');
+      else { ready = { rows: filteredRows(matched), total: all.length }; setStatus('', ''); }
+    } catch (e) {
+      setStatus(`统计失败：${describeError(e, 'read')}`, 'error');
+    } finally {
+      exporting = false;
+      const keep = { text: statusText, kind: statusKind };
+      render();
+      setStatus(keep.text, keep.kind);
+    }
+    if (!ready) return;
+    const { rows, total } = ready;
+    const [head, ...body] = rows;
+    const overlay = document.createElement('div');
+    overlay.className = 'af-modal';
+    overlay.innerHTML = `<div class="af-modal-box af-stats-box" role="dialog" aria-modal="true">
+      <div class="af-modal-head"><span>统计：命中 ${body.length} / 共 ${total} 条</span><button class="af-x" data-close title="关闭">×</button></div>
+      <div class="af-modal-body af-stats-body"></div>
+      <div class="af-modal-foot"><span>这是点击统计那一刻的快照，不会自动更新</span><span class="af-modal-actions"><button class="af-add" data-newtab title="在新标签页里打开，能用上整个浏览器窗口">在新标签页打开</button></span></div>
+    </div>`;
+    renderStatsView(overlay.querySelector('.af-stats-body') as HTMLElement, head, body, multiFlags());
+    const close = () => { overlay.remove(); document.removeEventListener('keydown', onKey); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close(); };
+    overlay.addEventListener('click', (e) => {
+      const t = e.target as HTMLElement;
+      if (t === overlay || t.closest('[data-close]')) close();
+      else if (t.closest('[data-newtab]')) openPreviewTab(rows, total, 'stats');
+    });
+    document.addEventListener('keydown', onKey);
+    document.body.appendChild(overlay); // 挂在 body 上，不受面板缩放影响
+  }
+
   async function startRun() {
     if (running || exporting) return;
     const err = validate();
@@ -1076,10 +1371,20 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     setStatus('正在读取视图记录…', '');
     render();
     const fieldById = new Map(host.getAllFields().map(f => [f.id, f]));
-    let written = 0, failed = 0, skipped = 0, matchedCount = 0;
+    let written = 0, failed = 0, skipped = 0, called = 0, matchedCount = 0;
+    let hasWrites = true; // 输出里有没有要写进字段的（全是“只调用的函数”则没有）
     failures = [];
-    failureHeaders = config.inputs.map(i => `${i.param}(${fieldById.get(i.fieldId)?.name ?? i.fieldId})`);
-    const inputCols = config.inputs.map(i => i.fieldId);
+    // 失败明细里带上送给函数的输入：用到的各函数的输入映射，相同的（参数 + 字段）只列一列
+    const inCols: { label: string; fieldId: string }[] = [];
+    for (const fn of new Map(config.outputs.flatMap(o => { const f = fnOfKey(o.param); return f ? [[f.id, f] as [string, FnMeta]] : []; })).values()) {
+      for (const inp of fn.inputs) {
+        const fid = inputField(fn.id, inp.name);
+        const label = `${inp.name}(${fieldById.get(fid)?.name ?? fid})`;
+        if (fid && !inCols.some(c => c.label === label && c.fieldId === fid)) inCols.push({ label, fieldId: fid });
+      }
+    }
+    failureHeaders = inCols.map(c => c.label);
+    const inputCols = inCols.map(c => c.fieldId);
     const optionsOf = new Map<string, FieldOption[]>(); // 单选/多选输出字段的选项
     let historyId = '';
     try {
@@ -1088,8 +1393,15 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       matchedCount = matched.length;
       filterResult = { sig: filterSig(), matched: matched.length, total: all.length };
       if (matched.length === 0) { setStatus(`视图共 ${all.length} 条记录，没有符合筛选条件的记录`, ''); return; }
-      const outNames = config.outputs.map(o => findOutput(o.param)?.out.label || o.param).join('、');
-      if (!confirm(`视图共 ${all.length} 条记录，${matched.length} 条符合筛选条件。\n将调用函数并覆盖写入：${outNames}\n\n确定开始吗？`)) {
+      const writeOuts = config.outputs.filter(o => !o.param.startsWith(FN_PREFIX) && o.fieldId);
+      hasWrites = writeOuts.length > 0;
+      // 只调用、不写入的函数：添加了但没选输出参数的，以及输出参数都没选字段的
+      const fnOf = (key: string) => findCall(key) ?? findOutput(key)?.fn;
+      const writtenFns = new Set(writeOuts.map(o => fnOf(o.param)?.id));
+      const callOnly = [...new Set(config.outputs.map(o => fnOf(o.param)).filter((f): f is FnMeta => !!f && !writtenFns.has(f.id)).map(f => f.name))];
+      const plan = (hasWrites ? `将调用函数并覆盖写入：${writeOuts.map(o => outLabel(o.param)).join('、')}` : '') +
+        (callOnly.length ? `${hasWrites ? '\n' : ''}将调用函数：${callOnly.join('、')}（只调用，不写入表格）` : '');
+      if (!confirm(`视图共 ${all.length} 条记录，${matched.length} 条符合筛选条件。\n${plan}\n\n确定开始吗？`)) {
         setStatus('已取消', '');
         return;
       }
@@ -1098,37 +1410,56 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       // 按函数分组：同一个函数的多个输出，一次调用拿齐
       const byFn = new Map<string, { fn: FnMeta; outs: { name: string; fieldId: string }[] }>();
       for (const o of config.outputs) {
+        const call = findCall(o.param);
+        if (call) { // 只调用的函数：没有要写的输出，但要照常调用
+          if (!byFn.has(call.id)) byFn.set(call.id, { fn: call, outs: [] });
+          continue;
+        }
         const hit = findOutput(o.param)!;
         if (!byFn.has(hit.fn.id)) byFn.set(hit.fn.id, { fn: hit.fn, outs: [] });
         byFn.get(hit.fn.id)!.outs.push({ name: hit.out.name, fieldId: o.fieldId });
       }
-      const fieldOf = new Map(config.inputs.map(i => [i.param, i.fieldId]));
       for (const o of config.outputs) {
         const f = fieldById.get(o.fieldId);
         if (f && needsOptions(f.type) && !optionsOf.has(o.fieldId)) optionsOf.set(o.fieldId, await host.getFieldOptions(o.fieldId));
       }
       const indexOf = new Map(all.map((r, i) => [r.recordId, i + 1]));
 
-      for (let start = 0; start < matched.length; start += CALL_BATCH) {
+      // 适配层：写回表格固定每 WRITE_BATCH（100）条提交一次；调用函数则按函数自己的 batchSize 来——
+      // 一轮取选中的函数里最大的批大小那么多条记录，批大小大于 100 的函数把几个 100 攒成一次调用，小于 100 的拆成几次；
+      // 一轮算完，结果再按 100 条一批写回。取消在一轮处理完后生效（只选一个函数时，一轮就是一次调用）
+      const roundSize = Math.max(...[...byFn.values()].map(x => batchOf(x.fn)));
+      for (let start = 0; start < matched.length; start += roundSize) {
         if (cancelled) break;
-        const chunk = matched.slice(start, start + CALL_BATCH);
+        const chunk = matched.slice(start, start + roundSize);
+        // 多个函数的入参映射到同一个字段时，这一轮里每条记录的这个字段只转一次文本
+        const textCache = new Map<string, string>();
+        const cellOf = (rec: RecordData, fid: string) => {
+          const k = rec.recordId + '\u0000' + fid;
+          let t = textCache.get(k);
+          if (t === undefined) { t = cellText(rec.fields[fid]); textCache.set(k, t); }
+          return t;
+        };
         const values = chunk.map(() => ({} as Record<string, any>));
         const bad = chunk.map(() => '');
         for (const { fn, outs } of byFn.values()) {
           const rows = chunk.map(rec => {
             const row: Record<string, any> = {};
             for (const inp of fn.inputs) {
-              const fid = fieldOf.get(inp.name);
-              if (fid) row[inp.name] = cellText(rec.fields[fid]);
+              const fid = inputField(fn.id, inp.name);
+              if (fid) row[inp.name] = cellOf(rec, fid);
             }
             return row;
           });
-          const results = await callFunction(fn, rows);
+          const size = batchOf(fn);
+          const results: FnResult[] = [];
+          for (let s = 0; s < rows.length; s += size) results.push(...await callFunction(fn, rows.slice(s, s + size)));
           results.forEach((r, i) => {
             if (bad[i]) return;
             if (!r.ok) { bad[i] = r.error || '函数执行失败'; return; }
             try {
               for (const o of outs) {
+                if (!o.fieldId) continue; // 没选字段：不写入，也不要求函数返回它
                 if (!r.outputs || !(o.name in r.outputs)) throw new Error(`函数“${fn.name}”没有返回“${o.name}”`);
                 if (r.outputs[o.name] === null) continue; // 函数返回 null：这个字段不写入，保留原值
                 values[i][o.fieldId] = toFieldValue(fieldById.get(o.fieldId)!, r.outputs[o.name], optionsOf.get(o.fieldId));
@@ -1141,13 +1472,19 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
           if (bad[i]) {
             failed++;
             failures.push({ index: indexOf.get(rec.recordId) || 0, recordId: rec.recordId, inputs: inputCols.map(fid => cellText(rec.fields[fid])), error: bad[i] });
-          } else if (Object.keys(values[i]).length === 0) skipped++; // 所有输出都是 null，没有可写的内容
+          } else if (!hasWrites) called++; // 只调用的函数：成功就算已调用，没有要写的内容
+          else if (Object.keys(values[i]).length === 0) skipped++; // 所有输出都是 null，没有可写的内容
           else items.push({ recordId: rec.recordId, fields: values[i] });
         });
-        if (items.length) { await host.writeRecords(items); written += items.length; }
-        setStatus(`进度 ${Math.min(start + CALL_BATCH, matched.length)}/${matched.length}（已写入 ${written}，失败 ${failed}）`, '');
+        for (let s = 0; s < items.length; s += WRITE_BATCH) {
+          const part = items.slice(s, s + WRITE_BATCH);
+          await host.writeRecords(part);
+          written += part.length;
+        }
+        setStatus(`进度 ${Math.min(start + roundSize, matched.length)}/${matched.length}（${hasWrites ? `已写入 ${written}` : `已调用 ${called}`}，失败 ${failed}）`, '');
       }
-      const summary = `${cancelled ? '已取消' : '完成'}：符合筛选 ${matchedCount} 条，已写入 ${written} 条，失败 ${failed} 条` +
+      const summary = `${cancelled ? '已取消' : '完成'}：符合筛选 ${matchedCount} 条，` +
+        (hasWrites ? `已写入 ${written} 条` : `已调用 ${called} 条（只调用，不写入表格）`) + `，失败 ${failed} 条` +
         (skipped ? `，跳过 ${skipped} 条（函数没有返回内容，未写入）` : '') +
         (failed ? '（详见下方失败明细）' : '');
       setStatus(summary, failed || cancelled ? 'error' : 'ok');

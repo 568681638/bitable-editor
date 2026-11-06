@@ -95,7 +95,8 @@ interface Leaf { kind: 'leaf'; id: string; fieldId: string; size: number; fieldN
 interface Split { kind: 'split'; dir: 'row' | 'column'; children: LayoutNode[]; size: number; }
 // 组合块：把一个矩形区域里的若干字段块（任意排布）圈成一个整体：最外层有组合框，可整体移动，也可作为整体被别的字段切分。
 // shared 打开时组内各字段只留标题栏，共用组底部的一个渲染区（哪个字段的链接能加载就用哪个）
-interface Group { kind: 'group'; id: string; child: LayoutNode; shared: boolean; size: number; }
+// sync 打开时组内的视频 / 音频同步播放：播放其中一个，其他的一起播放；暂停其中一个，其他的一起暂停
+interface Group { kind: 'group'; id: string; child: LayoutNode; shared: boolean; sync: boolean; size: number; }
 type LayoutNode = Leaf | Split | Group;
 type Zone = 'left' | 'right' | 'top' | 'bottom';
 
@@ -105,7 +106,6 @@ const LAST_TABLE_KEY = 'annotator-panel-last-table'; // 上次看的数据表，
 const WIDTH_KEY = 'annotator-panel-width';
 const ZOOM_KEY = 'annotator-panel-zoom-v4'; // 之前的版本会把默认值也自动存下来，换个 key 让它们失效
 const BLOCK_DRAG_TYPE = 'application/x-annotator-block';
-const GROUP_DRAG_TYPE = 'application/x-annotator-group'; // 框选后拖动选区的把手
 const NODE_DRAG_TYPE = 'application/x-annotator-node'; // 拖动组合框的把手（整组移动）
 const HEADER_DRAG_TYPE = 'application/x-annotator-header'; // 拖动侧边栏标题名（同时带 FIELD_DRAG_TYPE，走字段拖入的同一套落点逻辑）
 // 侧边栏的标题行也能做成字段块：fieldId 取这个固定值，不对应任何字段。
@@ -154,8 +154,8 @@ function switchTable(tableId: string, fields: FieldMeta[]) {
 const blocksEl = document.getElementById('blocks') as HTMLElement;
 const blockEls = new Map<string, HTMLElement>();
 const nodeEls = new Map<LayoutNode, HTMLElement>(); // 当前渲染出来的节点 → 元素
-const shareBodyEls = new Map<string, HTMLElement>(); // 开了共用渲染区的组合块 id → 组底部共用的渲染区（占位元素，内容在固定图层里）
-const shareOfLeaf = new Map<string, Group>(); // 字段块 id → 管它渲染的共享组合块（最近的一层开了共用渲染区的组合块）
+const shareBodyEls = new Map<string, HTMLElement>(); // 开了任一渲染的组合块 id → 组底部共用的渲染区（占位元素，内容在固定图层里）
+const shareOfLeaf = new Map<string, Group>(); // 字段块 id → 管它渲染的共享组合块（最近的一层开了任一渲染的组合块）
 
 // 网页 / 视频 / 图片等渲染内容放在一个固定不动的图层里，按对应字段块内容区的位置叠上去。
 // 布局变化（新增、移动、切字段块）会重建字段块的容器；iframe 一旦换了父节点就会被浏览器重新加载，
@@ -235,6 +235,70 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') exitFullscreen();
 });
 
+// ── 同步播放：开了同步播放的组里，一个视频 / 音频播放、暂停或拖动进度，同组其他的跟着一起 ──
+// 媒体事件不冒泡，所以在渲染图层上用捕获监听。程序触发的 play / pause / seeked 会再产生一次事件，用 syncExpect 记下“这次是我们自己触发的”并忽略，避免来回触发。
+// 各个音视频的长度不一定一样，规则是按秒对齐：
+//   · 同步到某个时间点，比它短的就停在自己的结尾，不会倒回去重播；
+//   · 长的继续播，短的播完后保持停着；长的把进度拖回短的范围内，短的立刻跟上并继续播；
+//   · 都停下后再点播放，所有人一起从当前位置重新开始（播完的从头开始）。
+const syncExpect = new WeakMap<HTMLMediaElement, Record<string, number>>();
+function expectEvent(el: HTMLMediaElement, type: string) {
+  const o = syncExpect.get(el) || {};
+  o[type] = (o[type] || 0) + 1;
+  syncExpect.set(el, o);
+  // 有的操作不会产生事件（比如播放被浏览器拦下），过一会儿还没消耗掉就清掉，免得误吞掉用户后面的真实操作
+  setTimeout(() => { if (o[type] > 0) o[type]--; }, 2000);
+}
+function consumeExpected(el: HTMLMediaElement, type: string): boolean {
+  const o = syncExpect.get(el);
+  if (!o || !(o[type] > 0)) return false;
+  o[type]--;
+  return true;
+}
+
+function syncGroupOf(viewerId: string): Group | null {
+  for (const g of groups(root)) { // 外层在前：嵌套时按最外层开了同步的组算
+    if (g.sync && (g.id === viewerId || leaves(g.child).some(l => l.id === viewerId))) return g;
+  }
+  return null;
+}
+
+// 让 other 跟上 m：位置按秒对齐（不超过 other 自己的长度），m 在播且 other 还没到结尾就播，否则停
+function alignTo(m: HTMLMediaElement, other: HTMLMediaElement) {
+  const d = isFinite(other.duration) ? other.duration : Infinity;
+  const t = Math.min(m.currentTime, d);
+  if (Math.abs(other.currentTime - t) > 0.1) {
+    expectEvent(other, 'seeked');
+    other.currentTime = t;
+  }
+  const shouldPlay = !m.paused && !m.ended && m.currentTime < d - 0.05;
+  if (shouldPlay && other.paused) {
+    expectEvent(other, 'play');
+    other.play().catch(() => { const o = syncExpect.get(other); if (o && o.play > 0) o.play--; }); // 被浏览器拦下就不会有事件
+  } else if (!shouldPlay && !other.paused) {
+    expectEvent(other, 'pause');
+    other.pause();
+  }
+}
+
+function onMediaSync(e: Event) {
+  const m = e.target as HTMLMediaElement;
+  if (!(m instanceof HTMLMediaElement)) return;
+  if (consumeExpected(m, e.type)) return;
+  if (e.type === 'pause' && m.ended) return; // 播完自动触发的暂停不算，别把还没播完的拉停
+  const wrap = m.closest('.viewer-item') as HTMLElement | null;
+  const g = wrap?.dataset.leaf ? syncGroupOf(wrap.dataset.leaf) : null;
+  if (!g) return;
+  const ids = new Set([g.id, ...leaves(g.child).map(l => l.id)]);
+  viewerLayer.querySelectorAll<HTMLElement>('.viewer-item').forEach(viewer => {
+    if (!ids.has(viewer.dataset.leaf || '')) return;
+    viewer.querySelectorAll<HTMLMediaElement>('video, audio').forEach(other => { if (other !== m) alignTo(m, other); });
+  });
+}
+viewerLayer.addEventListener('play', onMediaSync, true);
+viewerLayer.addEventListener('pause', onMediaSync, true);
+viewerLayer.addEventListener('seeked', onMediaSync, true);
+
 function removeViewer(id: string) {
   viewerEls.get(id)?.remove();
   viewerEls.delete(id);
@@ -248,9 +312,10 @@ function normalize(node: LayoutNode | null): LayoutNode | null {
   if (node.kind === 'group') {
     const c = normalize(node.child);
     if (!c || leaves(c).length === 0) return null;
-    if (c.kind === 'leaf') { c.size = node.size; return c; } // 组里只剩一个字段块：不再是组合
+    // 组里只剩一个字段块也保留组合（单个字段块也可以成组，要散开点“取消组合”）；组里一个都不剩才整组消失（上面已处理）
     node.child = c;
     node.shared = !!node.shared;
+    node.sync = !!node.sync;
     return node;
   }
   const kids: LayoutNode[] = [];
@@ -422,7 +487,7 @@ function updateBlock(leaf: Leaf) {
   }
 }
 
-// ── 共用渲染区：组里按顺序找第一个“能加载”的字段，把它的内容放到组底部共用的渲染区 ──
+// ── 任一渲染：组里按顺序找第一个“能加载”的字段，把它的内容放到组底部共用的渲染区 ──
 // 图片 / 视频 / 音频：加载失败（直连和服务端中转都不行）就跳过；网页：先问服务端能否嵌入，禁止的就跳过。
 // 前面的网页还在检查时先等结果，不抢跑到后面的字段。失败记录按“记录 + 地址”存在内存里，换记录或刷新就重新判断
 const shareFailed = new Set<string>();
@@ -473,7 +538,7 @@ function updateShare(group: Group) {
   else removeViewer(group.id);
 }
 
-// 共用渲染区的图片 / 视频 / 音频最终加载失败：直连失败会先由 installProxyFallback 改走代理重试（它会拦下这次事件），
+// 任一渲染的图片 / 视频 / 音频最终加载失败：直连失败会先由 installProxyFallback 改走代理重试（它会拦下这次事件），
 // 走代理也失败才会冒泡到这里
 viewerLayer.addEventListener('error', (e) => {
   const t = e.target as HTMLElement;
@@ -577,7 +642,8 @@ function buildNode(node: LayoutNode): HTMLElement {
     el.dataset.groupId = group.id;
     el.innerHTML = `<div class="group-bar">
         <span class="group-handle" draggable="true" title="拖动这里移动整个组合；把别的字段拖到组合框的边缘，会按整组来切分">⠿ 组合</span>
-        <button type="button" class="group-share${group.shared ? ' on' : ''}" title="${group.shared ? '关闭共用渲染区：各字段块恢复各自的渲染区' : '开启共用渲染区：组内各字段只留标题栏，共用组底部的一个渲染区，哪个字段的链接能加载就显示哪个'}">共用渲染区</button>
+        <button type="button" class="group-share${group.shared ? ' on' : ''}" title="${group.shared ? '关闭任一渲染：各字段块恢复各自的渲染区' : '开启任一渲染：组内各字段只留标题栏，共用组底部的一个渲染区，哪个字段的链接能加载就显示哪个'}">任一渲染</button>
+        <button type="button" class="group-sync${group.sync ? ' on' : ''}" title="${group.sync ? '关闭同步播放' : '开启同步播放：组内的视频 / 音频一起播放、一起暂停（播放或暂停其中任何一个，其他的跟着一起）'}">同步播放</button>
         <button type="button" class="group-ungroup" title="取消组合：各字段块恢复独立">取消组合</button>
       </div>`;
     const inner = document.createElement('div');
@@ -598,6 +664,11 @@ function buildNode(node: LayoutNode): HTMLElement {
       group.shared = !group.shared;
       saveLayout();
       renderBlocks();
+    });
+    (el.querySelector('.group-sync') as HTMLElement).addEventListener('click', (e) => {
+      group.sync = !group.sync;
+      (e.currentTarget as HTMLElement).classList.toggle('on', group.sync);
+      saveLayout(); // 只切开关，不重绘（重绘会让正在播放的视频重新加载）
     });
     (el.querySelector('.group-ungroup') as HTMLElement).addEventListener('click', () => {
       replaceNode(group, group.child);
@@ -764,7 +835,7 @@ function exportLayout() {
   const withNames = (n: LayoutNode): any => n.kind === 'leaf'
     ? { kind: 'leaf', fieldId: n.fieldId, fieldName: names.get(n.fieldId) || n.fieldName || '', size: n.size }
     : n.kind === 'group'
-      ? { kind: 'group', size: n.size, shared: n.shared, child: withNames(n.child) }
+      ? { kind: 'group', size: n.size, shared: n.shared, sync: n.sync, child: withNames(n.child) }
       : { kind: 'split', dir: n.dir, size: n.size, children: n.children.map(withNames) };
   const text = JSON.stringify({ type: LAYOUT_FILE_TYPE, version: 1, layout: withNames(root) }, null, 2);
   const pad = (x: number) => String(x).padStart(2, '0');
@@ -805,7 +876,7 @@ function mapImportedLayout(raw: any, fields: FieldMeta[], missing: string[], dep
   if (raw.kind === 'leaf') return mapLeaf(raw);
   if (raw.kind === 'group') {
     const child = mapImportedLayout(raw.child, fields, missing, depth + 1);
-    return child ? { kind: 'group', id: newId(), child, shared: !!raw.shared, size: sizeOf(raw) } : null;
+    return child ? { kind: 'group', id: newId(), child, shared: !!raw.shared, sync: !!raw.sync, size: sizeOf(raw) } : null;
   }
   if (raw.kind === 'split' && (raw.dir === 'row' || raw.dir === 'column') && Array.isArray(raw.children)) {
     const children = raw.children.map((c: any) => mapImportedLayout(c, fields, missing, depth + 1)).filter((c: LayoutNode | null): c is LayoutNode => !!c);
@@ -1004,16 +1075,15 @@ function commitLayout() {
 }
 
 // 把 node 整体移到 t 旁边（单个字段块、组合块、框选的组合都走这里）：先摘下来，插到落点旁边，最后再整理树
-function moveNode(node: LayoutNode, t: DropTarget | null, parent?: Split | null, siblings?: LayoutNode[]) {
+function moveNode(node: LayoutNode, t: DropTarget | null) {
   if (!t || nodeContains(node, t.node) || (t.node.kind === 'group' && nodeContains(t.node, node) && leaves(t.node).length <= leaves(node).length)) return;
-  if (siblings && parent) parent.children = parent.children.filter(c => !siblings.includes(c));
-  else detach(node);
+  detach(node);
   node.size = 1;
   insertBeside(t.node, node, t.zone);
   commitLayout();
 }
 
-// ── 框选：在预览窗格空白处按住拖出矩形，选中碰到的字段块 / 组合块；选区自动补成矩形，可整体移动、圈成组合块 ──
+// ── 框选：在预览窗格空白处按住拖出矩形，选中碰到的字段块 / 组合块；选区自动补成矩形，直接圈成组合块 ──
 // 布局是树：碰到的单元先找到它们共同的最近上级切分，再把这个切分里“第一个到最后一个被碰到的子节点”之间的全部子节点选中
 // （连续的兄弟节点拼起来一定是矩形）；子节点全选就等于选中整个切分。组合块整个算一个单元
 interface Selection { nodes: LayoutNode[]; parent: Split | null }
@@ -1048,20 +1118,18 @@ function selectionFor(units: LayoutNode[]): Selection | null {
   return { nodes, parent: lca };
 }
 
-const insideSel = (node: LayoutNode) => !!sel && sel.nodes.some(n => nodeContains(n, node));
-
-// 选区里至少有两个字段块、且还不是单独一个组合块，才能圈成（新的）组合块
+// 选区里至少有一个字段块、且还不是单独一个组合块，才能圈成（新的）组合块（单个字段块也可以成组）
 function groupable(): boolean {
   if (!sel) return false;
   if (sel.nodes.length === 1 && sel.nodes[0].kind === 'group') return false;
-  return sel.nodes.reduce((n, x) => n + leaves(x).length, 0) >= 2;
+  return sel.nodes.reduce((n, x) => n + leaves(x).length, 0) >= 1;
 }
 
 function makeGroup() {
   if (!sel || !groupable()) return;
   const { nodes, parent } = sel;
   const child: LayoutNode = nodes.length === 1 ? nodes[0] : { kind: 'split', dir: parent!.dir, size: 1, children: nodes };
-  const group: Group = { kind: 'group', id: newId(), child, shared: false, size: nodes.reduce((sum, n) => sum + (n.size || 1), 0) };
+  const group: Group = { kind: 'group', id: newId(), child, shared: false, sync: false, size: nodes.reduce((sum, n) => sum + (n.size || 1), 0) };
   if (nodes.length === 1) replaceNode(nodes[0], group);
   else parent!.children.splice(parent!.children.indexOf(nodes[0]), nodes.length, group);
   commitLayout();
@@ -1086,30 +1154,15 @@ function drawSelection() {
   box.style.top = top - host.top + 'px';
   box.style.width = right - left + 'px';
   box.style.height = bottom - top + 'px';
-  const wholeLayout = sel.nodes.length === 1 && sel.nodes[0] === root;
-  // 顶部栏和组合块的一样：左边拖动把手，右边取消选择。框出多个字段块会直接圈成组合块，这里只剩单个字段块 / 已有组合块的整体移动
-  box.innerHTML = `<div class="sel-bar">
-      ${wholeLayout ? '' : '<span class="sel-handle" draggable="true" title="拖动这里把选中的块整体移到别的块旁边（落在目标块的上 / 下 / 左 / 右边缘）">⠿ 移动</span>'}
-      <span class="sel-actions">
-        <button type="button" data-act="clear" title="取消选择（Esc）">✕</button>
-      </span>
-    </div>`;
+  // 只画虚线选框，没有操作条：框出一个或多个字段块都会直接圈成组合块；只框到已有的单个组合块时，
+  // 它们自己的标题（字段名 / 组合框顶部的「⠿ 组合」）就是移动把手，再加一条操作条只会盖住标题。取消选择：Esc、点别处、或再进入框选
   selLayer.appendChild(box);
-  // 顶部栏放在选区上方，不挡住选中块的标题；选区贴着预览窗格顶部、上方放不下时才压在选区顶边上
-  const bar = box.querySelector('.sel-bar') as HTMLElement;
-  bar.classList.toggle('outside', top - host.top >= bar.offsetHeight);
 }
 
-selLayer.addEventListener('click', (e) => {
-  if ((e.target as HTMLElement).closest('[data-act="clear"]')) clearSelection();
-});
-selLayer.addEventListener('dragstart', (e) => {
-  if (!(e.target as HTMLElement).classList.contains('sel-handle') || !e.dataTransfer) return;
-  e.dataTransfer.setData(GROUP_DRAG_TYPE, '1');
-  e.dataTransfer.effectAllowed = 'move';
-  document.body.classList.add('dragging-field');
-});
-selLayer.addEventListener('dragend', endDrag);
+// 点任意位置取消选择（框选模式下由框选自己处理）
+document.addEventListener('pointerdown', () => {
+  if (sel && !document.body.classList.contains('marquee-mode')) clearSelection();
+}, true);
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { setMarqueeMode(false); clearSelection(); } });
 new ResizeObserver(() => drawSelection()).observe(blocksEl);
 
@@ -1133,7 +1186,6 @@ marqueeBtn.addEventListener('click', () => {
 // 矩形限制在预览窗格内
 selLayer.addEventListener('pointerdown', (e) => {
   if (e.button !== 0 || !root || !document.body.classList.contains('marquee-mode')) return;
-  if ((e.target as HTMLElement).closest('.sel-bar')) return;
   e.preventDefault();
   clearSelection();
   selLayer.setPointerCapture(e.pointerId);
@@ -1174,7 +1226,7 @@ selLayer.addEventListener('pointerdown', (e) => {
       return b.left < r.right && b.right > r.left && b.top < r.bottom && b.bottom > r.top;
     }).map(u => u.node);
     sel = hit.length ? selectionFor(hit) : null;
-    if (groupable()) { makeGroup(); return; } // 框出两个以上字段块就直接圈成组合块，不用再点按钮
+    if (groupable()) { makeGroup(); return; } // 框出一个或多个字段块就直接圈成组合块，不用再点按钮
     drawSelection();
   };
   selLayer.addEventListener('pointermove', move);
@@ -1185,15 +1237,14 @@ selLayer.addEventListener('pointerdown', (e) => {
 blocksEl.addEventListener('dragover', (e) => {
   const types = e.dataTransfer?.types || [];
   const isField = types.includes(FIELD_DRAG_TYPE), isBlock = types.includes(BLOCK_DRAG_TYPE);
-  const isGroup = types.includes(GROUP_DRAG_TYPE), isNode = types.includes(NODE_DRAG_TYPE);
-  if (!isField && !isBlock && !isGroup && !isNode) return;
+  const isNode = types.includes(NODE_DRAG_TYPE);
+  if (!isField && !isBlock && !isNode) return;
   e.preventDefault();
   e.dataTransfer!.dropEffect = isField ? 'copy' : 'move';
   clearDropMarks();
   if (!root) { blocksEl.classList.add('drop-active'); return; }
   const t = dropTarget(e);
   if (!t) return;
-  if (isGroup && insideSel(t.node)) return; // 不能落在选区自己身上
   if (t.blank) { showDropHint(t.blank); return; }
   const rep = isField && !types.includes(HEADER_DRAG_TYPE) ? replaceTarget(t) : undefined;
   if (rep) blockEls.get(rep.id)?.classList.add('drop-replace');
@@ -1207,7 +1258,6 @@ blocksEl.addEventListener('drop', (e) => {
   const fieldId = e.dataTransfer?.getData(FIELD_DRAG_TYPE);
   const blockId = e.dataTransfer?.getData(BLOCK_DRAG_TYPE);
   const nodeId = e.dataTransfer?.getData(NODE_DRAG_TYPE);
-  const isGroup = !!e.dataTransfer?.types.includes(GROUP_DRAG_TYPE);
   const t = dropTarget(e);
   endDrag();
   if (fieldId) {
@@ -1232,8 +1282,6 @@ blocksEl.addEventListener('drop', (e) => {
   } else if (nodeId) {
     const moved = groups(root).find(g => g.id === nodeId);
     if (moved) moveNode(moved, t);
-  } else if (isGroup && sel && t && !insideSel(t.node)) {
-    moveNode(sel.nodes.length === 1 ? sel.nodes[0] : { kind: 'split', dir: sel.parent!.dir, size: 1, children: sel.nodes }, t, sel.parent, sel.nodes);
   }
 });
 document.addEventListener('dragend', endDrag);

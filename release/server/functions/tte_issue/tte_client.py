@@ -1,6 +1,6 @@
 # TTE 工单查询的最小客户端（自包含，只依赖 requests，不依赖任何其他项目）。
 # 接口：POST {TTE_BASE_URL}/issue/list，用 assetIdList 批量查询；SHA1 签名鉴权。
-# 以下划线开头，不会被当成函数注册。
+# 放在函数文件夹里的普通模块：在 function.py 里直接 `import tte_client` 使用（服务会把函数文件夹加入 sys.path）。
 import hashlib
 import time
 import uuid

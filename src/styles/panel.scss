@@ -127,7 +127,7 @@ body.dragging-field .viewer-item {
   &.drop-replace::after { display: block; inset: 0; }
 }
 
-// 组合块：最外层有一圈组合框（顶部是操作条），里面是任意排布的字段块；开了共用渲染区时组内只留标题栏，组底部是共用的渲染区
+// 组合块：最外层有一圈组合框（顶部是操作条），里面是任意排布的字段块；开了任一渲染时组内只留标题栏，组底部是共用的渲染区
 .group {
   border: 2px solid #8c9cff;
   border-radius: 8px;
@@ -153,6 +153,7 @@ body.dragging-field .viewer-item {
 }
 
 .group-share,
+.group-sync,
 .group-ungroup {
   padding: 0 8px;
   border: none;
@@ -165,7 +166,8 @@ body.dragging-field .viewer-item {
   &:hover { background: #d5dcff; }
 }
 
-.group-share.on { background: #4f7cff; color: #fff; }
+.group-share.on,
+.group-sync.on { background: #4f7cff; color: #fff; }
 .group-ungroup { margin-left: auto; }
 
 .group-inner {
@@ -189,7 +191,7 @@ body.dragging-field .viewer-item {
   &[hidden] { display: none; }
 }
 
-// 按自身高度排布：开了共用渲染区的组合块（组内只剩标题栏）、以及没有可渲染内容而收缩的组合块
+// 按自身高度排布：开了任一渲染的组合块（组内只剩标题栏）、以及没有可渲染内容而收缩的组合块
 .group.shared > .group-inner,
 .group[data-fit] > .group-inner { flex: 0 0 auto; }
 
@@ -205,7 +207,7 @@ body.dragging-field .viewer-item {
   font-size: 10px;
 }
 
-// 框选：矩形、选区外框和操作条（盖在渲染内容图层上面）
+// 框选：矩形和选区外框（盖在渲染内容图层上面）
 .sel-layer {
   position: absolute;
   top: 0;
@@ -240,50 +242,6 @@ body.marquee-mode .sel-layer {
   border: 2px dashed #4f7cff;
   background: rgba(79, 124, 255, 0.08);
   border-radius: 6px;
-}
-
-// 选区的顶部栏：外观和组合块的顶部栏一致（盖在选区最上面一条，选区是临时的，不占布局空间）
-.sel-bar {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 2px 6px;
-  background: #e6eaff;
-  border-radius: 4px 4px 0 0;
-  font-size: 12px;
-  pointer-events: auto;
-  user-select: none;
-
-  &.outside { top: auto; bottom: 100%; left: -2px; right: -2px; border: 2px dashed #4f7cff; border-bottom: none; }
-
-  .sel-handle {
-    padding: 0 4px;
-    color: #4f5fd0;
-    font-weight: 600;
-    cursor: grab;
-  }
-
-  .sel-actions {
-    margin-left: auto;
-    display: flex;
-    gap: 4px;
-  }
-
-  button {
-    padding: 0 8px;
-    border: none;
-    border-radius: 3px;
-    background: none;
-    color: #4f7cff;
-    font-size: 12px;
-    cursor: pointer;
-
-    &:hover { background: #d5dcff; }
-  }
 }
 
 .block-header {
@@ -553,7 +511,7 @@ body.marquee-mode .sel-layer {
   &:hover { opacity: 1; background: #4f7cff; font-size: 10px; }
 }
 
-// ── 记录导航（上一条 / 跳转 / 下一条）：拖侧边栏标题名「bitable-editor」到预览窗格放成字段块 ──
+// ── 标题行：拖侧边栏标题名「bitable-editor」到预览窗格，放一份标题行的副本（做成字段块）──
 .header h3[draggable="true"] { cursor: grab; user-select: none; }
 
 // 标题行块：侧边栏标题行的副本，整行蓝底；☰ 菜单要伸到块外面，所以这种块不裁剪溢出

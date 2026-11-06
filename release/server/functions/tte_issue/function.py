@@ -1,5 +1,5 @@
 # TTE 工单：按资产 ID 批量查工单，取工单描述和问题语录
-# 自包含：用 _tte_client 里的 query_issues（一次请求查整批资产），只依赖 requests，不依赖其他项目
+# 自包含：用同文件夹里 tte_client.py 的 query_issues（一次请求查整批资产），只依赖 requests，不依赖其他项目
 import _asset_id
 
 META = {
@@ -15,7 +15,7 @@ META = {
 
 def run(rows):
     # 放到函数里再 import：依赖缺失时不影响函数注册，错误会在运行时明确报出
-    from _tte_client import query_issues
+    from tte_client import query_issues  # 同文件夹里的模块，服务会把函数文件夹加入 sys.path
 
     ids = [str(r.get("asset_id", "")).strip() for r in rows]
     issues = {}

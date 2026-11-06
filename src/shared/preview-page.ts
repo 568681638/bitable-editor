@@ -1,8 +1,10 @@
 // 筛选结果预览的“整页”版本：生成一份自带样式和脚本的 HTML，在新标签页里打开，能用上整个浏览器窗口。
-// 功能：表头固定、拖动表头右边缘调整列宽、点击表头按列排序、虚拟滚动（几万行也不卡）、导出 CSV。
+// 功能：表头固定、拖动表头右边缘调整列宽、点击表头按列排序、虚拟滚动（几万行也不卡）、导出 CSV；顶部「数据 | 统计」切换，统计页见 stats-view.ts。
 // 页面里只用 textContent 写入单元格内容，数据不会被当成 HTML 执行。
 //
 // 注意：下面嵌入的页面脚本写在模板字符串里，所以脚本里不能出现反引号和 ${，也尽量不用反斜杠转义。
+
+import { renderStatsView } from './stats-view';
 
 const PAGE_CSS = `
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -24,6 +26,38 @@ const PAGE_CSS = `
   .rz:hover, .rz.on { background: rgba(79, 124, 255, 0.35); }
   th { position: sticky; }
   .sp td { padding: 0; border: none; }
+
+  .tabs { display: flex; }
+  .bar .tabs button { background: #fff; color: #555; border: 1px solid #d9d9d9; border-radius: 0; padding: 4px 14px; }
+  .bar .tabs button:first-child { border-radius: 4px 0 0 4px; }
+  .bar .tabs button:last-child { border-radius: 0 4px 4px 0; margin-left: -1px; }
+  .bar .tabs button:hover { background: #f0f4ff; }
+  .bar .tabs button.on { background: #4f7cff; color: #fff; border-color: #4f7cff; }
+  #stats { flex: 1; overflow: auto; padding: 16px 20px; display: none; }
+  .st-sec { margin-bottom: 28px; }
+  .st-sec h3 { font-size: 14px; margin-bottom: 8px; }
+  .st-sec .sub { color: #999; font-size: 12px; font-weight: 400; margin-left: 8px; }
+  .st-table { border-collapse: collapse; table-layout: auto; }
+  .st-table th, .st-table td { height: 30px; padding: 0 12px; border: 1px solid #eee; white-space: nowrap; text-align: left; overflow: visible; }
+  .st-table th { background: #f5f7fa; position: static; cursor: default; font-weight: 600; }
+  .st-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .st-table td.dim { color: #bbb; text-align: center; }
+  .st-table tbody tr { cursor: pointer; }
+  .st-table tbody tr:hover td { background: #f0f4ff; }
+  .st-table tbody tr.on td { background: #e6eaff; }
+  .pbar { display: inline-block; vertical-align: middle; width: 120px; height: 10px; margin-right: 8px; background: #eef0f4; border-radius: 5px; overflow: hidden; }
+  .pbar i { display: block; height: 100%; background: #4f7cff; }
+  .st-ctl { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; flex-wrap: wrap; }
+  .st-ctl select { padding: 4px 8px; border: 1px solid #d9d9d9; border-radius: 4px; font-size: 13px; max-width: 280px; }
+  .dist-row { display: flex; align-items: center; gap: 10px; height: 26px; }
+  .dist-label { flex: none; width: 240px; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dist-label.dim { color: #aaa; }
+  .dist-track { flex: 1; max-width: 640px; height: 14px; background: #f3f4f7; border-radius: 3px; overflow: hidden; }
+  .dist-track i { display: block; height: 100%; background: #4f7cff; border-radius: 3px; }
+  .dist-track i.dim { background: #c9ced8; }
+  .dist-num { flex: none; width: 150px; color: #666; font-variant-numeric: tabular-nums; }
+  .st-empty { color: #999; padding: 8px 0; }
+  .st-sum { color: #666; margin-bottom: 10px; }
 `;
 
 const PAGE_SCRIPT = `
@@ -192,17 +226,37 @@ const PAGE_SCRIPT = `
     setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
   });
 
+
+  // ── 统计页：在页面里直接用这份快照算，不再读表格（统计视图的代码和侧边栏悬浮窗共用，见 stats-view.ts）──
+  var renderStatsView = ${renderStatsView.toString()};
+  var statsEl = document.getElementById('stats');
+  var tabBtns = document.querySelectorAll('.tabs button');
+  var statsBuilt = false;
+
+  function showTab(name) {
+    wrap.style.display = name === 'data' ? '' : 'none';
+    statsEl.style.display = name === 'stats' ? 'block' : 'none';
+    for (var i = 0; i < tabBtns.length; i++) tabBtns[i].classList.toggle('on', tabBtns[i].getAttribute('data-tab') === name);
+    if (name === 'stats' && !statsBuilt) { statsBuilt = true; renderStatsView(statsEl, head, body, data.multi); }
+    if (name === 'data') render();
+  }
+  for (var tb = 0; tb < tabBtns.length; tb++) {
+    (function (btn) { btn.addEventListener('click', function () { showTab(btn.getAttribute('data-tab')); }); })(tabBtns[tb]);
+  }
+
   buildHead();
   render();
+  if (data.startTab === 'stats') showTab('stats');
 })();
 `;
 
 const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 /** 生成预览页的完整 HTML。rows 第一行是表头，其余是数据。 */
-export function buildPreviewHtml(rows: string[][], total: number): string {
+/** multi：和 rows 的列一一对应，true 表示这一列是多选字段（统计时按选项拆开）。 */
+export function buildPreviewHtml(rows: string[][], total: number, startTab: 'data' | 'stats' = 'data', multi: boolean[] = []): string {
   // 数据放在 JSON 脚本块里：转义 < 防止提前结束脚本块，转义 U+2028/2029 避免被当成换行
-  const json = JSON.stringify({ rows })
+  const json = JSON.stringify({ rows, startTab, multi })
     .replace(/</g, '\\u003c')
     .replace(/\u2028/g, '\\u2028')
     .replace(/\u2029/g, '\\u2029');
@@ -216,8 +270,9 @@ export function buildPreviewHtml(rows: string[][], total: number): string {
 <style>${PAGE_CSS}</style>
 </head>
 <body>
-<div class="bar"><b>${esc(title)}</b><span class="hint">点击表头排序，拖动表头右边缘调整列宽。这是点击预览那一刻的快照，不会自动更新</span><button id="export">导出 CSV</button></div>
+<div class="bar"><b>${esc(title)}</b><span class="tabs"><button data-tab="data" class="on">数据</button><button data-tab="stats">统计</button></span><span class="hint">数据页：点击表头排序，拖动表头右边缘调整列宽。这是点击预览那一刻的快照，不会自动更新</span><button id="export">导出 CSV</button></div>
 <div id="wrap"></div>
+<div id="stats"></div>
 <script id="data" type="application/json">${json}</script>
 <script>${PAGE_SCRIPT}</script>
 </body>
