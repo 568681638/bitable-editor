@@ -314,7 +314,7 @@ export function createAnnotatorUI(opts: AnnotatorOptions) {
     if (field.type === FType.TEXT || hasNewlines(rawValue)) {
       // 飞书文本末尾自带换行，去掉它，否则会多出一个空行、单行文本也会被当成两行
       const shown = textVal.replace(/[\r\n]+$/, '');
-      return `<textarea class="${ro ? '' : 'field-input'}" data-field-id="${field.id}" data-field-type="text" rows="1" wrap="off"${ro ? ' readonly' : ''}>${esc(shown)}</textarea>`;
+      return `<textarea class="${ro ? '' : 'field-input'}" data-field-id="${field.id}" data-field-type="text" rows="1"${ro ? ' readonly' : ''}>${esc(shown)}</textarea>`;
     }
     return `<input type="text" class="${ro ? '' : 'field-input'}" data-field-id="${field.id}" data-field-type="text" value="${esc(textVal)}"${ro ? ' readonly' : ''} />`;
   }

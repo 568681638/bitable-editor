@@ -8,10 +8,12 @@ const MAX_HEIGHT_RATIO = 0.5;
 export function autosizeTextarea(ta: HTMLTextAreaElement, maxRatio = MAX_HEIGHT_RATIO) {
   if (ta.dataset.manual === '1') return; // 用户手动拖拽过高度，不再自动调整
   if (!ta.offsetHeight) return;
-  // 值里没有换行时是“单行状态”：外观与单行输入框一致（不出滚动条、不显示拖拽角），见样式 .single-line
-  ta.classList.toggle('single-line', !ta.value.includes('\n'));
+  // 先摘掉单行状态再量：单行状态的样式（不出滚动条）会影响量出来的高度
+  ta.classList.remove('single-line');
   ta.style.height = 'auto';
-  const extra = ta.offsetHeight - ta.clientHeight; // 边框 + 横向滚动条的厚度
+  const extra = ta.offsetHeight - ta.clientHeight; // 边框的厚度（长行自动换行，没有横向滚动条）
+  // 值里没有换行、折行后也只占一行时是“单行状态”：外观与单行输入框一致（不出滚动条、不显示拖拽角），见样式 .single-line
+  ta.classList.toggle('single-line', !ta.value.includes('\n') && ta.scrollHeight <= ta.clientHeight + 1);
   // 页面可能被缩放（面板页侧边栏有 zoom）：屏幕像素 / CSS 像素，上限要按屏幕像素算
   const scale = ta.getBoundingClientRect().height / ta.offsetHeight || 1;
   const cap = Math.floor((window.innerHeight * maxRatio) / scale);
@@ -45,4 +47,28 @@ export function installLineSelectAll(ta: HTMLTextAreaElement) {
     e.preventDefault();
     ta.setSelectionRange(lineStart, lineEnd);
   });
+}
+
+// 预览窗格字段块标题栏里的值：同一个值有两个框，单行输入框（超长用省略号）和多行输入框（自动换行）。
+//   值里有换行 → 多行框；
+//   值没有换行，且 wrapLong（这个值只在标题栏里显示，没有别处可看）→ 先当单行框摆出来量，被省略号截断了就换成自动换行的多行框，免得看不全；
+//   wrapLong 为 false（值是被渲染的链接，真正的内容在下面的渲染区，换行只会把地址撑成很多行、挤占渲染区）→ 保持单行，悬停看全文。
+// 宽度变化时（拖分隔条、改窗口大小）要重新调用：变窄了可能要换成多行框，变宽了又装得下单行框
+export function fitValueBox(input: HTMLInputElement, area: HTMLTextAreaElement, text: string, wrapLong: boolean, maxRatio: number) {
+  let useArea = text.includes('\n');
+  if (!useArea && wrapLong && text) {
+    input.hidden = false;
+    input.value = text;
+    useArea = input.scrollWidth > input.clientWidth + 1;
+  }
+  input.hidden = useArea;
+  area.hidden = !useArea;
+  input.value = useArea ? '' : text;
+  input.title = text;
+  if (useArea) {
+    // 框是复用的：内容变了（切换记录）就清掉“手动拖拽过高度”的标记，重新按内容撑开
+    if (area.value !== text) delete area.dataset.manual;
+    area.value = text;
+    autosizeTextarea(area, maxRatio);
+  }
 }

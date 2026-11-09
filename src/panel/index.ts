@@ -11,7 +11,7 @@ import { setupModeSwitch } from '../shared/mode-switch';
 import { setupZoom } from '../shared/zoom';
 import { setupMenu } from '../shared/menu';
 import { describedError } from '../shared/errors';
-import { autosizeTextarea, trackManualResize, installLineSelectAll } from '../shared/textarea';
+import { autosizeTextarea, trackManualResize, installLineSelectAll, fitValueBox } from '../shared/textarea';
 import type { HostMessage, PanelCommand, SnapshotMessage } from '../shared/bridge';
 
 installProxyFallback();
@@ -164,16 +164,24 @@ const viewerLayer = document.getElementById('viewerLayer') as HTMLElement;
 const viewerEls = new Map<string, HTMLElement>(); // 字段块 id → 渲染内容元素
 const bodyObserver = new ResizeObserver(() => positionViewers());
 
-// 预览窗格块标题栏里的多行值：尺寸变化时重新撑开（只在宽度变化时重算，避免自己改高度又触发自己）
+// 预览窗格块标题栏里的值（单行框 / 多行框）：宽度变化时重新判断该用哪个框（变窄了单行装不下就换成自动换行的多行框，变宽了又换回来）并重新撑开高度。
+// 只在宽度变化时重算，避免自己改高度又触发自己
 const valueObserver = new ResizeObserver((entries) => {
   for (const entry of entries) {
-    const ta = entry.target as HTMLTextAreaElement;
+    const box = entry.target as HTMLElement;
     const w = Math.round(entry.contentRect.width);
-    if (String(w) === ta.dataset.lastWidth) continue;
-    ta.dataset.lastWidth = String(w);
-    autosizeTextarea(ta, BLOCK_VALUE_MAX_RATIO);
+    if (String(w) === box.dataset.lastWidth) continue;
+    box.dataset.lastWidth = String(w);
+    const block = box.closest('[data-block-id]') as HTMLElement | null;
+    if (block) refitBlockValue(block);
   }
 });
+// 按块上记着的值重新判断（值和“值是不是被渲染的链接”在 updateBlock 里记下）
+function refitBlockValue(el: HTMLElement) {
+  const input = el.querySelector('input.block-value') as HTMLInputElement | null;
+  const area = el.querySelector('textarea.block-value') as HTMLTextAreaElement | null;
+  if (input && area) fitValueBox(input, area, el.dataset.valueText || '', el.dataset.valueUrl !== '1', BLOCK_VALUE_MAX_RATIO);
+}
 window.addEventListener('resize', () => {
   blockEls.forEach(el => {
     const ta = el.querySelector('textarea.block-value') as HTMLTextAreaElement | null;
@@ -455,22 +463,14 @@ function updateBlock(leaf: Leaf) {
   open.hidden = !url;
   if (url) open.href = url;
 
-  // 标题栏：字段名 | 字段值（左右结构，悬停看全文）。
-  // 值里没有换行 → 单行输入框（过长用省略号）；有换行 → 多行输入框，保留换行。都只读，可选中复制。
-  // 多行框与侧边栏同一套规则：每行不折行（横向滚动）、高度随内容撑开、Ctrl+A 分两步；上限更紧（BLOCK_VALUE_MAX_RATIO）
-  const valueInput = el.querySelector('input.block-value') as HTMLInputElement;
-  const valueArea = el.querySelector('textarea.block-value') as HTMLTextAreaElement;
-  const multiline = text.includes('\n');
-  valueInput.hidden = multiline;
-  valueArea.hidden = !multiline;
-  valueInput.value = multiline ? '' : text;
-  valueInput.title = text;
-  if (multiline) {
-    // 框是复用的：内容变了（切换记录）就清掉“手动拖拽过高度”的标记，重新按内容撑开
-    if (valueArea.value !== text) delete valueArea.dataset.manual;
-    valueArea.value = text;
-    autosizeTextarea(valueArea, BLOCK_VALUE_MAX_RATIO);
-  }
+  // 标题栏：字段名 | 字段值（左右结构，悬停看全文）。都只读，可选中复制。
+  //   值里有换行 → 多行输入框，保留换行；
+  //   值是被渲染的链接 → 单行输入框（过长用省略号，内容在下面的渲染区）；
+  //   其他值（只在标题栏里显示）→ 单行装得下就是单行输入框，装不下换成自动换行的多行输入框，免得看不全（见 fitValueBox）。
+  // 多行框与侧边栏同一套规则：长行自动换行（不出横向滚动条）、高度随内容撑开、Ctrl+A 分两步；上限更紧（BLOCK_VALUE_MAX_RATIO）
+  el.dataset.valueText = text;
+  el.dataset.valueUrl = url ? '1' : '';
+  refitBlockValue(el);
 
   // 内容区：只有 URL 渲染成网页/媒体；其他字段的值只显示在标题栏（输入框里，可选中复制），块只占标题栏高度（值有换行时标题栏会随多行输入框变高）
   const body = el.querySelector('.block-body') as HTMLElement;
@@ -604,7 +604,7 @@ function createBlockEl(leaf: Leaf): HTMLElement {
     el.innerHTML = `<div class="block-header">
       <span class="block-title" draggable="true" title="拖动字段名可调整位置"></span>
       <input class="block-value" readonly placeholder="（空）" />
-      <textarea class="block-value block-value-multi" rows="2" wrap="off" readonly hidden></textarea>
+      <textarea class="block-value block-value-multi" rows="2" readonly hidden></textarea>
       <a class="block-open" target="_blank" rel="noopener noreferrer" title="在新窗口打开">↗</a>
       <button class="block-close" title="移除该字段块（字段回到侧边栏）">✕</button>
     </div><div class="block-body"></div>`;
@@ -612,6 +612,7 @@ function createBlockEl(leaf: Leaf): HTMLElement {
     installLineSelectAll(area);
     trackManualResize(area);
     valueObserver.observe(area);
+    valueObserver.observe(el.querySelector('input.block-value') as HTMLInputElement); // 单行框的宽度变化也要重新判断（变窄了装不下，就换成多行框）
   }
   bodyObserver.observe(el.querySelector('.block-body') as HTMLElement);
   (el.querySelector('.block-close') as HTMLElement).addEventListener('click', () => {

@@ -12,6 +12,7 @@ import { readdir, mkdtemp, writeFile, unlink, rmdir } from 'fs/promises';
 import { tmpdir } from 'os';
 import { spawn } from 'child_process';
 import { pathToFileURL } from 'url';
+import { createJobStore } from './jobs.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = join(__dirname, '..', 'dist');
@@ -267,6 +268,7 @@ const PYTHON_BIN = process.env.PYTHON_BIN || (process.platform === 'win32' ? 'py
 const PY_EXECUTOR = join(FUNCTIONS_DIR, '_python_executor.py');
 const PY_META_TIMEOUT = 15000;
 const PY_RUN_TIMEOUT = Number(process.env.PY_RUN_TIMEOUT_MS) || 300000; // 单批执行的超时，可用环境变量调大
+const PY_ASYNC_TIMEOUT = Number(process.env.PY_ASYNC_TIMEOUT_MS) || 4 * 3600 * 1000; // 异步函数（META 里 async: true）单批执行的超时，默认 4 小时
 
 async function runPython(file, mode, input, timeoutMs) {
   const dir = await mkdtemp(join(tmpdir(), 'autoflush-'));
@@ -304,10 +306,10 @@ async function runPython(file, mode, input, timeoutMs) {
 async function loadPyDef(full, fallbackId) {
   const meta = await runPython(full, 'meta', undefined, PY_META_TIMEOUT);
   return [{
-    id: meta.id || fallbackId, name: meta.name || meta.id || fallbackId, inputs: meta.inputs, outputs: meta.outputs, batchSize: meta.batchSize,
+    id: meta.id || fallbackId, name: meta.name || meta.id || fallbackId, inputs: meta.inputs, outputs: meta.outputs, batchSize: meta.batchSize, async: meta.async === true,
     // 与 JS 函数同形：返回与 rows 等长的数组，失败的行是 Error
     async run(rows) {
-      const data = await runPython(full, 'run', { rows }, PY_RUN_TIMEOUT);
+      const data = await runPython(full, 'run', { rows }, meta.async === true ? PY_ASYNC_TIMEOUT : PY_RUN_TIMEOUT);
       if (!data || !Array.isArray(data.results)) throw new Error('Python 返回格式不对');
       return data.results.map(r => (r.ok ? r.outputs : new Error(r.error)));
     },
@@ -405,7 +407,7 @@ async function loadFunctions() {
 }
 
 // ── 批处理函数接口 ──────────────────────────────
-// GET  /api/functions          → [{ id, name, inputs, outputs, batchSize, path }]（path：函数所在分类目录的各级目录名，不含函数文件夹自己）
+// GET  /api/functions          → [{ id, name, inputs, outputs, batchSize, async, path }]（path：函数所在分类目录的各级目录名，不含函数文件夹自己）
 // POST /api/functions/<id>/run  body { rows: [{...入参}] } → { results: [{ ok: true, outputs } | { ok: false, error }] }
 const MAX_BODY = 64 * 1024 * 1024;
 
@@ -432,7 +434,7 @@ function readJson(req) {
 async function handleFunctions(req, res, path) {
   if (path === '/api/functions' && req.method === 'GET') {
     const FUNCTIONS = await loadFunctions();
-    return sendJson(res, 200, FUNCTIONS.map((d) => ({ id: d.id, name: d.name, inputs: d.inputs, outputs: d.outputs || [], batchSize: batchSizeOf(d), path: d.folder || [] })));
+    return sendJson(res, 200, FUNCTIONS.map((d) => ({ id: d.id, name: d.name, inputs: d.inputs, outputs: d.outputs || [], batchSize: batchSizeOf(d), async: d.async === true, path: d.folder || [] })));
   }
   const m = path.match(/^\/api\/functions\/([^/]+)\/run$/);
   if (m && req.method === 'POST') {
@@ -450,6 +452,53 @@ async function handleFunctions(req, res, path) {
     }
     const results = outs.map(o => (o instanceof Error ? { ok: false, error: o.message } : { ok: true, outputs: o || {} }));
     return sendJson(res, 200, { results });
+  }
+  // 异步函数：下发一批行，立刻返回任务 ID，函数在后台执行（任务和结果落盘，见 jobs.mjs）。只有声明了 async: true 的函数能这样用
+  const jm = path.match(/^\/api\/functions\/([^/]+)\/jobs$/);
+  if (jm && req.method === 'POST') {
+    const fn = (await loadFunctions()).find(f => f.id === decodeURIComponent(jm[1]));
+    if (!fn) return sendJson(res, 404, { error: 'Unknown function' });
+    if (fn.async !== true) return sendJson(res, 400, { error: '函数 ' + fn.id + ' 不是异步函数（定义里没有 async: true）' });
+    let body;
+    try { body = await readJson(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    if (!body || !Array.isArray(body.rows)) return sendJson(res, 400, { error: 'rows is required' });
+    if (typeof body.scope !== 'string' || !body.scope || body.scope.length > 200) return sendJson(res, 400, { error: 'scope is required' });
+    const rows = body.rows.map(r => r || {});
+    const job = jobs.create({ fnId: fn.id, fnName: fn.name, scope: body.scope, rows, meta: body.meta }, async (input) => {
+      const outs = await fn.run(input);
+      if (!Array.isArray(outs) || outs.length !== input.length) {
+        throw new Error('函数 ' + fn.id + ' 必须返回与 rows 等长的数组（收到 ' + input.length + ' 行，返回 ' + (Array.isArray(outs) ? outs.length : typeof outs) + '）');
+      }
+      return outs.map(o => (o instanceof Error ? { ok: false, error: o.message } : { ok: true, outputs: o || {} }));
+    });
+    return sendJson(res, 200, { job });
+  }
+  sendJson(res, 404, { error: 'Not found' });
+}
+
+// ── 异步任务接口 ─────────────────────────────────
+// GET  /api/jobs?scope=<s>               → { jobs: [摘要] }（这张表下的全部任务）
+// POST /api/jobs/<id>/claim  { scope }   → { job: 带 meta / results 的完整任务, token }；已被认领或状态不对返回 409
+// POST /api/jobs/<id>/ack    { token, result }   回写完成，任务转为已回写
+// POST /api/jobs/<id>/release { token }  回写没成功，放开认领
+// POST /api/jobs/<id>/cancel { scope }   取消
+const jobs = createJobStore(process.env.JOBS_DIR || join(__dirname, 'data', 'jobs'));
+
+async function handleJobs(req, res, path) {
+  if (path === '/api/jobs' && req.method === 'GET') {
+    const scope = new URL(req.url, 'http://localhost').searchParams.get('scope') || '';
+    return sendJson(res, 200, { jobs: scope ? jobs.list(scope) : [] });
+  }
+  const m = path.match(/^\/api\/jobs\/([0-9a-f]+)\/(claim|ack|release|cancel)$/);
+  if (m && req.method === 'POST') {
+    let body;
+    try { body = await readJson(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    body = body || {};
+    const r = m[2] === 'claim' ? jobs.claim(m[1], String(body.scope || ''))
+      : m[2] === 'ack' ? jobs.ack(m[1], String(body.token || ''), body.result)
+      : m[2] === 'release' ? jobs.release(m[1], String(body.token || ''))
+      : jobs.cancel(m[1], String(body.scope || ''));
+    return r.error ? sendJson(res, r.status || 400, { error: r.error }) : sendJson(res, 200, r);
   }
   sendJson(res, 404, { error: 'Not found' });
 }
@@ -479,6 +528,10 @@ const server = createServer((req, res) => {
       .then(cfg => sendJson(res, 200, cfg), () => sendJson(res, 200, {}));
   }
 
+  if (req.url.startsWith('/api/jobs')) {
+    return handleJobs(req, res, req.url.split('?')[0]).catch((e) => { if (!res.headersSent) sendJson(res, 500, { error: e.message }); });
+  }
+
   if (req.url.startsWith('/api/functions')) {
     return handleFunctions(req, res, req.url.split('?')[0]).catch((e) => { if (!res.headersSent) sendJson(res, 500, { error: e.message }); });
   }
@@ -498,6 +551,9 @@ const server = createServer((req, res) => {
   });
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server running at http://0.0.0.0:${PORT}/`);
+// 先把落盘的异步任务读进来再开始监听（Node 14 的 ES 模块不能用顶层 await）
+jobs.init().catch((e) => console.error('[jobs] 初始化失败，异步任务不可用:', e.message)).then(() => {
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running at http://0.0.0.0:${PORT}/`);
+  });
 });

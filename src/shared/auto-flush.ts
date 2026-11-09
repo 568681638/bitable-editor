@@ -15,14 +15,18 @@ export interface AutoFlushHost {
   /** 数据表的全部字段，含视图里隐藏的（各处“选择字段”的下拉用它） */
   getAllFields(): FieldMeta[];
   getTableId(): string;
-  /** 取当前视图的全部记录（顺序与视图一致） */
-  loadAllRecords(onProgress: (done: number, total: number) => void): Promise<RecordData[]>;
+  /** 异步任务的归属（多维表格 ID / 数据表 ID），没选中表格时为空串 */
+  getScope(): string;
+  /** 取当前视图的全部记录（顺序与视图一致）。默认可能用短时缓存；fresh 为 true 时一定重新读取（并刷新缓存） */
+  loadAllRecords(onProgress: (done: number, total: number) => void, opts?: { fresh?: boolean }): Promise<RecordData[]>;
+  /** 最近一次 loadAllRecords 返回的数据是什么时候从表格里读的（毫秒时间戳） */
+  loadedAt(): number;
   /** 批量写回 */
   writeRecords(items: { recordId: string; fields: Record<string, any> }[]): Promise<void>;
 }
 
 interface ParamMeta { name: string; label?: string; requires?: string[] }
-interface FnMeta { id: string; name: string; inputs: ParamMeta[]; outputs: ParamMeta[]; batchSize?: number; path?: string[] /* 函数所在目录的各级目录名（后端 functions/ 的目录结构） */ }
+interface FnMeta { id: string; name: string; inputs: ParamMeta[]; outputs: ParamMeta[]; batchSize?: number; async?: boolean /* 异步函数：下发后由服务端后台执行，完成后插件取回结果写回 */; path?: string[] /* 函数所在目录的各级目录名（后端 functions/ 的目录结构） */ }
 
 type Cond = { kind: 'cond'; fieldId: string; op: string; value: string; sep?: string; customSep?: string };
 type Group = { kind: 'group'; logic: 'and' | 'or'; negate: boolean; children: (Cond | Group)[] };
@@ -44,6 +48,24 @@ const CUSTOM_SEP = '__custom__'; // sep 取这个值时，用 customSep 作为�
 const WRITE_BATCH = 100; // 写回表格每次提交的记录数（不足 100 也算一批），和函数的批大小无关
 const DEFAULT_BATCH = 100; // 函数没有声明 batchSize 时，每次调用传给它的行数
 type FnResult = { ok: boolean; outputs?: Record<string, any>; error?: string };
+
+// 异步函数的任务（服务端见 release/server/jobs.mjs）。下发时把回写需要的信息放进 meta，之后不管页面刷没刷新都能照着写回
+// 批次：一次点「运行」是一个批次，被函数的 batchSize 拆成多个任务；同一批次的任务共用 id，part / parts 是第几个 / 共几个，from–to 是对应批次里的第几到第几条
+interface RunInfo { id: string; at: number; total: number; part: number; parts: number; from: number; to: number }
+interface JobSummary {
+  id: string; fnId: string; fnName: string; count: number; claimed: boolean; run?: RunInfo;
+  status: 'queued' | 'running' | 'done' | 'failed' | 'applied' | 'cancelled';
+  createdAt: number; startedAt?: number; finishedAt?: number; appliedAt?: number; error?: string; result?: string;
+}
+interface JobMeta { recordIds: string[]; indexes: number[]; outs: { name: string; fieldId: string }[]; run?: RunInfo }
+interface AsyncFail { jobId: string; runId?: string; fnId: string; index: number; recordId: string; fnName: string; error: string; time: number }
+const SS_MIN = 7; // 下拉的选项多于这个数，才换成带搜索框的弹层（选项少的用原生下拉更快）
+const PENDING_SHOWN = 6; // 弹层里每个批次的每个函数最多列几个未完成的任务
+const RUNS_SHOWN = 4; // 弹层里默认显示最近几个批次
+const ASYNC_FAIL_LIMIT = 2000; // 异步任务的失败行最多保留多少条（存在浏览器本地）
+const JOB_POLL_ACTIVE = 3000; // 有任务在跑 / 等回写时的轮询间隔
+const JOB_POLL_IDLE = 30000; // 平时的轮询间隔（只在后端有异步函数时才轮询）
+const JOB_RETRY_BACKOFF = 60000; // 回写失败后多久再试
 // 函数分组标记行用这个前缀：param 形如 fn:<函数 id>（让没有输出参数、只调用的函数也有自己的分组，见 renderOutputs）
 const FN_PREFIX = 'fn:';
 const ALL_PREFIX = 'all:'; // 选择器里函数右侧“全选”图标的值（只在点选时用，不会存进配置）
@@ -157,6 +179,19 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
   let failureHeaders: string[] = [];
   let failOpen = false;
   let cancelled = false;
+  // 异步任务：当前这张表的任务列表、失败行、轮询状态
+  let jobList: JobSummary[] = [];
+  let jobScope = '';
+  let jobTimer: ReturnType<typeof setTimeout> | undefined;
+  let jobBusy = false; // 正在轮询 / 回写
+  let jobNote = ''; // 最近一次轮询或回写出错的原因
+  let jobPopOpen = false; // 「函数」块右上角的任务标签是否展开着明细
+  let jobShowAllRuns = false; // 弹层里是否显示全部批次（默认只显示最近几个）
+  const doneOpenKeys = new Set<string>(); // 展开着的“已写回的任务”折叠块（key = 批次|函数）
+  let jobApplying = ''; // 正在回写的任务 ID
+  const jobRetryAt = new Map<string, number>(); // 任务 ID → 回写失败后最早什么时候再试
+  let asyncFails: AsyncFail[] = [];
+  const afailOpenKeys = new Set<string>(); // 展开着的异步失败明细（key = failKey：函数 id）
   let statusText = '';
   let statusKind: '' | 'error' | 'ok' = '';
 
@@ -227,6 +262,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       fnError = describeError(e, 'read');
     }
     if (!running) render();
+    refreshJobs();
   }
 
   const outputKey = (fn: FnMeta, o: ParamMeta) => `${fn.id}.${o.name}`;
@@ -306,7 +342,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     const p = path.join('.');
     if (node.kind === 'cond') {
       return `<div class="af-cond" data-path="${p}">
-        <select data-act="cond-field">${fieldOptions(node.fieldId)}</select>
+        <select data-act="cond-field" data-ss>${fieldOptions(node.fieldId)}</select>
         <select data-act="cond-op">${OPS.map(([v, l]) => `<option value="${v}"${v === node.op ? ' selected' : ''}>${l}</option>`).join('')}</select>
         ${NO_VALUE_OPS.has(node.op) ? ''
           : LIST_OPS.has(node.op) ? `<textarea data-act="cond-value" rows="1" placeholder="多个值用所选拆分符分隔">${esc(node.value)}</textarea>`
@@ -337,6 +373,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
   // 选了某个函数的输出参数，就自动出现这个函数的分组，输出参数归到分组里；点函数右侧的 ＋ 就是手动建一个没有输出参数的分组（只调用函数）。
   // 配置仍是一维列表：param 是“函数 id.输出名”的是输出行；是“fn:函数 id”的是分组标记（让没有输出参数的分组也存在），显示时按函数归并。
   // 选择器的层级跟后端 functions/ 的目录结构一致：目录 → 函数 → 选项，所有目录和函数默认折叠，展开状态在本次会话里记住
+  let pickerQuery = ''; // 选择器里的搜索词（选了一项后面板会重绘，搜索词要带过去）
   let pickerScope: string | null = null; // 展开中的选择器：'' = 整块底部的“＋函数”；函数 id = 该函数分组里的“＋ 输出参数”
   const pickerOpen = new Set<string>(); // 展开的目录 / 函数节点
 
@@ -361,6 +398,9 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     }).join('') || '<div class="af-hint">这个函数没有输出参数</div>';
   }
 
+  // 选择器顶部的搜索框（见 filterPicker）
+  const PICK_SEARCH = '<div class="af-pick-search"><input type="text" class="af-pick-q" placeholder="搜索函数 / 输出参数…" /></div>';
+
   interface TreeNode { name: string; folders: Map<string, TreeNode>; fns: FnMeta[] }
 
   function renderPickerTree(present: Set<string>): string {
@@ -375,22 +415,22 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     }
     const open = (key: string) => (pickerOpen.has(key) ? ' open' : '');
     // 一行：左边是展开 / 折叠的标题，右边是（函数才有的）图标按钮——图标不在 data-tog 里，点它不会触发展开 / 折叠
-    const head = (key: string, text: string, tools = '') => `<div class="af-tn-row"><div class="af-tn-head" data-tog="${esc(key)}"><span class="af-tn-arrow"></span><span class="af-tn-name">${esc(text)}</span></div>${tools}</div>`;
+    const head = (key: string, text: string, tools = '', tag = '') => `<div class="af-tn-row"><div class="af-tn-head" data-tog="${esc(key)}"><span class="af-tn-arrow"></span><span class="af-tn-name">${esc(text)}</span>${tag}</div>${tools}</div>`;
     const fnNode = (fn: FnMeta) => {
       const key = `f:${fn.id}`;
-      return `<div class="af-tn af-tn-fn${open(key)}">${head(key, fn.name, fnTools(fn, present, true))}<div class="af-tn-kids">${renderOutputList(fn, present)}</div></div>`;
+      return `<div class="af-tn af-tn-fn${open(key)}">${head(key, fn.name, fnTools(fn, present, true), fn.async ? '<span class="af-async-tag" title="异步函数：下发后在服务端后台执行，完成后自动写回">异步</span>' : '')}<div class="af-tn-kids">${renderOutputList(fn, present)}</div></div>`;
     };
     const walk = (n: TreeNode, prefix: string): string =>
       [...n.folders.values()].sort((x, y) => x.name.localeCompare(y.name, 'zh')).map(f => {
         const key = `d:${prefix}/${f.name}`;
         return `<div class="af-tn af-tn-dir${open(key)}">${head(key, f.name)}<div class="af-tn-kids">${walk(f, prefix + '/' + f.name)}</div></div>`;
       }).join('') + n.fns.map(fnNode).join('');
-    return walk(top, '') || '<div class="af-hint">没有可选的函数</div>';
+    return PICK_SEARCH + (walk(top, '') || '<div class="af-hint">没有可选的函数</div>');
   }
 
   // 分组里的“＋ 输出参数”：函数名一行（右侧只有全选），下面是输出参数的勾选列表
   function renderScopedPicker(fn: FnMeta, present: Set<string>): string {
-    return `<div class="af-tn-row af-scope-head"><span class="af-tn-name">${esc(fn.name)}</span>${fnTools(fn, present, false)}</div>${renderOutputList(fn, present)}`;
+    return `<div class="af-tn-row af-scope-head"><span class="af-tn-name">${esc(fn.name)}</span>${fnTools(fn, present, false)}</div>${fn.outputs.length > SS_MIN ? PICK_SEARCH : ''}${renderOutputList(fn, present)}`;
   }
 
   // 去掉一个输出参数行；它是分组里最后一个就把分组标记放回原位（分组留着变成纯调用，按首次出现的位置排序，所以不能放到末尾）
@@ -454,7 +494,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
         ${fn.inputs.map(inp => `<option value="${esc(inp.name)}"${inp.name === m.param ? ' selected' : ''}${inp.name !== m.param && used.has(inp.name) ? ' disabled' : ''}>${esc(inp.label || inp.name)}（${esc(inp.name)}）</option>`).join('')}
       </select>
       <span class="af-arrow">←</span>
-      <select data-act="in-field">${fieldOptions(m.fieldId)}</select>
+      <select data-act="in-field" data-ss>${fieldOptions(m.fieldId)}</select>
       ${req.has(m.param) ? '<span class="af-lock" title="必需：这个函数要运行就必须映射这个入参。选了输出参数时，是这些输出参数需要的入参；没选输出参数时，函数的全部入参都必需">必需</span>' : `<button class="af-x" data-act="del-in" data-in="${i}" title="删除这个输入">×</button>`}
     </div>`).join('');
     return rows ? `<div class="af-iog in" title="输入：入参 ← 字段"><span class="af-iog-label">输入</span><div class="af-iog-body">${rows}</div></div>` : '';
@@ -479,13 +519,13 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
           ${(hit?.fn.outputs ?? []).map(o => { const k = outputKey(hit!.fn, o); return `<option value="${esc(k)}"${k === m.param ? ' selected' : ''}${k !== m.param && present.has(k) ? ' disabled' : ''}>${esc(o.label || o.name)}</option>`; }).join('')}
         </select>
         <span class="af-arrow">→</span>
-        <select data-act="field" title="输出字段是可选的：选了，函数返回的结果会顺带写入这个字段；不选，就只调用函数、不写入任何字段">${fieldOptions(m.fieldId)}</select>
+        <select data-act="field" data-ss title="输出字段是可选的：选了，函数返回的结果会顺带写入这个字段；不选，就只调用函数、不写入任何字段">${fieldOptions(m.fieldId)}</select>
         <button class="af-x" data-act="del" title="删除这个输出参数">×</button>
       </div>`;
     };
     const cards = [...groups.entries()].map(([key, g]) => `<div class="af-fg" data-fn="${esc(key)}">
       <div class="af-fg-head" title="${esc([...(g.fn?.path || []), g.name].join(' / '))}">
-        <span class="af-fg-name">${esc(g.name)}</span>
+        <span class="af-fg-title"><span class="af-fg-name">${esc(g.name)}</span>${g.fn?.async ? '<span class="af-async-tag" title="异步函数：点运行只下发数据，函数在服务端后台执行，完成后插件自动取回结果并写回字段（需要保持这张表的插件页面开着）">异步</span>' : ''}</span>
         <span class="af-fg-actions">
           ${g.fn ? `<button type="button" class="af-add" data-act="add-in" data-fn="${esc(g.fn.id)}" title="${g.fn.inputs.every(inp => config.inputs.some(i => i.fn === g.fn!.id && i.param === inp.name)) ? '这个函数的入参都已添加' : '给这个函数添加一个输入（入参 ← 字段）'}"${g.fn.inputs.every(inp => config.inputs.some(i => i.fn === g.fn!.id && i.param === inp.name)) ? ' disabled' : ''}>＋输入</button><span class="af-pick"><button type="button" class="af-add" data-act="pick-toggle" data-scope="${esc(g.fn.id)}" title="给这个函数添加输出参数" ${g.fn.outputs.length ? '' : 'disabled'}>＋输出</button>${pickerScope === g.fn.id ? `<div class="af-pick-pop">${renderScopedPicker(g.fn, present)}</div>` : ''}</span>` : ''}
           <button class="af-x af-x-group" data-act="del-group" data-fn="${esc(key)}" title="移除这个函数（连同它的全部输出参数）">×</button>
@@ -494,7 +534,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       ${g.fn ? renderCardInputs(g.fn) : ''}
       ${g.rows.length ? `<div class="af-iog out" title="输出：输出参数 → 字段（字段可选）"><span class="af-iog-label">输出</span><div class="af-iog-body">${g.rows.map(rowHtml).join('')}</div></div>` : ''}
     </div>`).join('');
-    return cards + `<span class="af-pick"><button type="button" class="af-add" data-act="pick-toggle" data-scope="" title="选一个函数或它的输出参数；选了输出参数会自动归到对应的函数分组，选「纯调用函数」就是手动建一个没有输出参数的分组">＋函数</button>${pickerScope === '' ? `<div class="af-pick-pop">${renderPickerTree(present)}</div>` : ''}</span>`;
+    return `<div class="af-jobs-note">${jobNoteHtml()}</div>` + cards + `<span class="af-pick"><button type="button" class="af-add" data-act="pick-toggle" data-scope="" title="选一个函数或它的输出参数；选了输出参数会自动归到对应的函数分组，选「纯调用函数」就是手动建一个没有输出参数的分组">＋函数</button>${pickerScope === '' ? `<div class="af-pick-pop">${renderPickerTree(present)}</div>` : ''}</span>`;
   }
 
   // 块右上角的 ×：一键清空这个块里的内容（块里本来就是空的、或正在运行时置灰）
@@ -502,6 +542,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     `<button class="af-x af-x-group" data-act="${act}" title="清空全部${what}"${empty || running || exporting ? ' disabled' : ''}>×</button>`;
 
   function render() {
+    closeSS();
     loadConfig();
     if (fnState === 'ready') {
       const migrated = migrateLegacyInputs(config);
@@ -518,11 +559,15 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     } else {
       body = `
         <section class="af-sec"><h4 class="af-h"><span>筛选 <span class="af-count"></span></span><span class="af-h-actions"><button class="af-add" data-act="filter" title="读取视图记录，只计算命中数，不调用函数、不写入"${running || exporting ? ' disabled' : ''}>筛选</button><button class="af-add" data-act="stats-filtered" title="读取视图记录，对符合筛选条件的记录做统计（取值分布等），在新标签页里查看"${running || exporting ? ' disabled' : ''}>统计</button><button class="af-add" data-act="preview-filtered" title="在悬浮窗口里查看符合筛选条件的记录（全部可见字段）"${running || exporting ? ' disabled' : ''}>预览</button><span class="af-menu-wrap"><button class="af-add af-more" data-act="filter-menu" title="更多：导出 CSV、导入 / 导出筛选条件">☰</button>${filterMenuOpen ? `<div class="menu af-menu"><button class="menu-item" data-act="export-filtered" title="把视图里符合筛选条件的记录（全部可见字段）导出为 CSV"${running || exporting ? ' disabled' : ''}>导出 CSV</button><button class="menu-item" data-act="filter-import" title="从文件导入筛选条件（会替换当前条件）"${running || exporting ? ' disabled' : ''}>筛选条件导入</button><button class="menu-item" data-act="filter-export" title="把当前筛选条件导出为文件，方便复用">筛选条件导出</button></div>` : ''}</span></span></h4>${renderNode(config.filter, [])}</section>
-        <section class="af-sec"><h4 class="af-h"><span>函数</span>${clearBtn('clear-outputs', '函数', config.outputs.length === 0)}</h4>${renderOutputs()}</section>
+        <section class="af-sec af-sec-fn"><h4 class="af-h"><span>函数</span><span class="af-h-actions"><span class="af-jobs-badge-wrap" data-jobs-badge>${jobBadgeHtml()}</span>${clearBtn('clear-outputs', '函数', config.outputs.length === 0)}</span></h4>${renderOutputs()}</section>
         <div class="af-status${statusKind ? ' ' + statusKind : ''}">${esc(statusText).replace(/\n/g, '<br />')}</div>
         ${renderFailures()}`;
     }
     container.innerHTML = body;
+    if (pickerScope !== null) {
+      const qi = container.querySelector('.af-pick-q') as HTMLInputElement | null;
+      if (qi) { qi.value = pickerQuery; filterPicker(); }
+    }
     syncRunBtn();
     updateFilterCount();
     container.scrollTop = keepScroll;
@@ -599,8 +644,137 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
 
   container.addEventListener('toggle', (e) => {
     const el = e.target as HTMLDetailsElement;
-    if (el.classList && el.classList.contains('af-fail')) failOpen = el.open;
+    if (el.classList && el.classList.contains('af-done')) { const k = el.dataset.done || ''; if (el.open) doneOpenKeys.add(k); else doneOpenKeys.delete(k); }
+    else if (el.classList && el.classList.contains('af-afail')) { const k = el.dataset.fn || ''; if (el.open) afailOpenKeys.add(k); else afailOpenKeys.delete(k); }
+    else if (el.classList && el.classList.contains('af-fail')) failOpen = el.open;
   }, true);
+
+  // ── 带搜索的下拉：字段下拉（筛选条件的字段、函数输入 / 输出的字段）选项多于 SS_MIN 时，点开换成“搜索框 + 选项列表”的弹层。──
+  // 底层仍是原来的 <select>：选中后改它的 value 再派发 change，原有的事件处理一行都不用动。
+  // 弹层挂在 select 的父元素里（绝对定位），所以不受面板缩放影响
+  let ssPop: HTMLElement | null = null;
+  let ssSel: HTMLSelectElement | null = null;
+  function closeSS() {
+    if (ssPop) { ssPop.remove(); ssPop = null; ssSel = null; }
+  }
+  // 把命中的部分标出来
+  function highlight(text: string, q: string): string {
+    const i = q ? text.toLowerCase().indexOf(q) : -1;
+    return i < 0 ? esc(text) : `${esc(text.slice(0, i))}<mark>${esc(text.slice(i, i + q.length))}</mark>${esc(text.slice(i + q.length))}`;
+  }
+  function openSS(sel: HTMLSelectElement) {
+    closeSS();
+    const opts = [...sel.options].map(o => ({ value: o.value, text: o.textContent || '', disabled: o.disabled }));
+    const parent = sel.parentElement as HTMLElement;
+    if (getComputedStyle(parent).position === 'static') parent.style.position = 'relative';
+    const pop = document.createElement('div');
+    pop.className = 'af-ss-pop';
+    pop.innerHTML = '<input type="text" class="af-ss-input" placeholder="搜索…" /><div class="af-ss-list"></div>';
+    pop.style.left = `${sel.offsetLeft}px`;
+    pop.style.top = `${sel.offsetTop + sel.offsetHeight + 2}px`;
+    pop.style.minWidth = `${Math.max(sel.offsetWidth, 180)}px`;
+    parent.appendChild(pop);
+    ssPop = pop;
+    ssSel = sel;
+    const input = pop.querySelector('.af-ss-input') as HTMLInputElement;
+    const list = pop.querySelector('.af-ss-list') as HTMLElement;
+    let shown = opts;
+    let active = Math.max(0, opts.findIndex(o => o.value === sel.value));
+    const draw = () => {
+      const q = input.value.trim().toLowerCase();
+      shown = q ? opts.filter(o => o.text.toLowerCase().includes(q)) : opts;
+      if (active >= shown.length) active = shown.length - 1;
+      if (active < 0) active = 0;
+      list.innerHTML = shown.length
+        ? shown.map((o, i) => `<div class="af-ss-item${o.value === sel.value ? ' sel' : ''}${o.disabled ? ' dis' : ''}${i === active ? ' on' : ''}" data-i="${i}">${highlight(o.text || '（未选择）', q)}</div>`).join('')
+        : '<div class="af-ss-empty">没有匹配的选项</div>';
+      const cur = list.querySelector('.on') as HTMLElement | null; // 键盘移动时，让高亮项留在列表可见范围内（只滚列表自己，不带动整个面板）
+      if (cur) {
+        if (cur.offsetTop < list.scrollTop) list.scrollTop = cur.offsetTop;
+        else if (cur.offsetTop + cur.offsetHeight > list.scrollTop + list.clientHeight) list.scrollTop = cur.offsetTop + cur.offsetHeight - list.clientHeight;
+      }
+    };
+    const choose = (i: number) => {
+      const o = shown[i];
+      if (!o || o.disabled) return;
+      sel.value = o.value;
+      closeSS();
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
+    };
+    list.addEventListener('mousedown', (e) => {
+      e.preventDefault(); // 不让搜索框失焦
+      const item = (e.target as HTMLElement).closest('.af-ss-item') as HTMLElement | null;
+      if (item) choose(Number(item.dataset.i));
+    });
+    input.addEventListener('input', () => { active = 0; draw(); });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowDown') { e.preventDefault(); active = Math.min(active + 1, shown.length - 1); draw(); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(active - 1, 0); draw(); }
+      else if (e.key === 'Enter') { e.preventDefault(); choose(active); }
+      else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeSS(); sel.focus(); }
+      else if (e.key === 'Tab') closeSS();
+    });
+    draw();
+    input.focus({ preventScroll: true });
+    pop.scrollIntoView({ block: 'nearest' }); // 弹层在面板底部时，只在被挡住的情况下滚一点，让它完整出现在视野里
+  }
+  const searchable = (el: EventTarget | null): HTMLSelectElement | null => {
+    const sel = (el as HTMLElement | null)?.closest?.('select[data-ss]') as HTMLSelectElement | null;
+    return sel && !sel.disabled && sel.options.length > SS_MIN ? sel : null;
+  };
+  container.addEventListener('mousedown', (e) => {
+    const sel = searchable(e.target);
+    if (!sel) return;
+    e.preventDefault(); // 不弹原生下拉
+    sel.focus();
+    if (ssSel === sel) closeSS(); else openSS(sel);
+  });
+  container.addEventListener('keydown', (e) => { // 键盘聚焦在下拉上时，Enter / 空格 / ↓ 也打开搜索弹层
+    if (e.key !== 'Enter' && e.key !== ' ' && e.key !== 'ArrowDown') return;
+    const sel = searchable(e.target);
+    if (sel) { e.preventDefault(); openSS(sel); }
+  });
+  document.addEventListener('mousedown', (e) => { if (ssPop && !ssPop.contains(e.target as Node) && e.target !== ssSel) closeSS(); });
+
+  // ── 函数选择器里的搜索：按目录 / 函数 / 输出参数的名字过滤；不匹配的隐藏，命中的目录和函数自动展开；
+  // 目录名或函数名命中时，它下面的全部内容都保留。只改样式类，不重绘，所以输入时不会丢焦点 ──
+  function filterPicker() {
+    const pop = container.querySelector('.af-pick-pop') as HTMLElement | null;
+    if (!pop) return;
+    pop.querySelectorAll('.ss-hide, .ss-open').forEach(el => el.classList.remove('ss-hide', 'ss-open'));
+    pop.querySelector('.af-pick-none')?.remove();
+    const q = pickerQuery.trim().toLowerCase();
+    if (!q) return;
+    const has = (el: Element | null, force: boolean) => force || (el?.textContent || '').toLowerCase().includes(q);
+    const visit = (n: HTMLElement, force: boolean): boolean => {
+      const self = has(n.querySelector(':scope > .af-tn-row .af-tn-name'), force);
+      let any = false;
+      if (n.classList.contains('af-tn-fn')) {
+        n.querySelectorAll<HTMLElement>(':scope > .af-tn-kids .af-opt').forEach(o => {
+          const m = self || has(o, false);
+          o.classList.toggle('ss-hide', !m);
+          if (m) any = true;
+        });
+      } else {
+        n.querySelectorAll<HTMLElement>(':scope > .af-tn-kids > .af-tn').forEach(c => { if (visit(c, self)) any = true; });
+      }
+      const show = self || any;
+      n.classList.toggle('ss-hide', !show);
+      n.classList.toggle('ss-open', any && !self); // 靠里面的内容命中的才自动展开；自己的名字命中，保持原来的折叠状态
+      return show;
+    };
+    let hits = 0;
+    pop.querySelectorAll<HTMLElement>(':scope > .af-tn').forEach(n => { if (visit(n, false)) hits++; });
+    pop.querySelectorAll<HTMLElement>(':scope > .af-opt').forEach(o => { // 分组里的“＋输出参数”选择器没有树，直接过滤勾选项
+      const m = has(o, false);
+      o.classList.toggle('ss-hide', !m);
+      if (m) hits++;
+    });
+    if (!hits) pop.insertAdjacentHTML('beforeend', '<div class="af-hint af-pick-none">没有匹配的函数或输出参数</div>');
+  }
+  function focusPickerQuery() {
+    (container.querySelector('.af-pick-q') as HTMLInputElement | null)?.focus({ preventScroll: true });
+  }
 
   // ── 事件 ────────────────────────────────────────
   function nodeAt(path: string): { node: Cond | Group; parent: Group | null; index: number } {
@@ -621,6 +795,10 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
   }
   document.addEventListener('click', (e) => { if (!(e.target as HTMLElement).closest('.af-menu-wrap')) closeFilterMenu(); });
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeFilterMenu(); });
+  // 任务标签的明细弹层：点弹层外面 / 按 Esc 收起。用 composedPath 判断点在哪：弹层里的按钮点了会重绘，点击目标可能已经不在页面上
+  function closeJobPop() { if (jobPopOpen) { jobPopOpen = false; updateJobsView(); } }
+  document.addEventListener('click', (e) => { if (jobPopOpen && !e.composedPath().some(n => (n as HTMLElement).classList?.contains('af-jobs-badge-wrap'))) closeJobPop(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeJobPop(); });
 
   // 输出选择器：展开 / 折叠目录和函数（不重绘，只切样式）；点选一项
   document.addEventListener('click', (e) => {
@@ -640,19 +818,22 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       return;
     }
     const pick = target.closest('[data-pick]') as HTMLElement | null;
-    if (pick) { applyPick(pick.dataset.pick!); return; }
+    if (pick) { applyPick(pick.dataset.pick!); focusPickerQuery(); return; }
     const btn = target.closest('button[data-act]') as HTMLElement | null;
     if (!btn) return;
     if (btn.dataset.act === 'pick-toggle') {
       const scope = btn.dataset.scope || '';
       pickerScope = pickerScope === scope ? null : scope;
+      pickerQuery = '';
       render();
+      focusPickerQuery();
       (container.querySelector('.af-pick-pop') as HTMLElement | null)?.scrollIntoView({ block: 'nearest' }); // 刚展开：保证选择器完整出现在视野里
       return;
     }
     pickerScope = null;
     const act = btn.dataset.act!;
     if (act.startsWith('fail-')) { onFailAction(act, btn); return; }
+    if (act.startsWith('afail-')) { onAsyncFailAction(act, btn); return; }
     const nodeEl = btn.closest('[data-path]') as HTMLElement | null;
     const rowEl = btn.closest('[data-list]') as HTMLElement | null;
     switch (act) {
@@ -680,6 +861,10 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
         break;
       }
       case 'reload-fns': loadFunctions(); return;
+      case 'jobs-refresh': refreshJobs(); return;
+      case 'jobs-toggle': jobPopOpen = !jobPopOpen; updateJobsView(); return;
+      case 'jobs-runs': jobShowAllRuns = !jobShowAllRuns; updateJobsView(); return;
+      case 'job-cancel': cancelJob(btn.dataset.id!); return;
       case 'filter-menu': filterMenuOpen = !filterMenuOpen; render(); return;
       case 'filter': applyFilter(); return;
       case 'preview-filtered': previewFiltered(); return;
@@ -694,6 +879,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
 
   container.addEventListener('input', (e) => {
     const el = e.target as HTMLInputElement | HTMLTextAreaElement;
+    if (el.classList && el.classList.contains('af-pick-q')) { pickerQuery = el.value; filterPicker(); return; }
     const nodeEl = el.closest('[data-path]') as HTMLElement | null;
     if (!nodeEl) return;
     if (el.dataset.act === 'cond-value') {
@@ -811,6 +997,340 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     return data.results;
   }
 
+  // ── 异步函数：下发任务、取回结果并用前端 SDK 写回 ──────────
+  // 只有声明了 async: true 的函数走这条路；普通函数完全不涉及（不调用任务接口、服务端也不存任何东西）。
+  // 流程：下发一批行 → 服务端后台执行并落盘 → 插件开着时取回结果（认领）→ 用 SDK 写回表格 → 确认。
+  // 回写所需的信息（记录 ID、输出字段）随任务一起存在服务端，所以下发后刷新页面、甚至关掉再开，都能接着写回。
+  async function jobApi(path: string, body?: any): Promise<any> {
+    const res = await fetch(apiUrl(path), body === undefined ? undefined : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (!res.ok) throw new Error(await serverMessage(res));
+    return res.json();
+  }
+
+  async function dispatchJob(fn: FnMeta, rows: Record<string, any>[], meta: JobMeta): Promise<void> {
+    const prefix = `函数“${fn.name}”下发失败：`;
+    try {
+      await jobApi(`api/functions/${encodeURIComponent(fn.id)}/jobs`, { rows, scope: host.getScope(), meta });
+    } catch (e) {
+      throw describedError(prefix + describeError(e, 'read'));
+    }
+  }
+
+  const asyncFailKey = () => `annotator-auto-flush-async-fail:${host.getTableId()}`;
+  function loadAsyncFails(): AsyncFail[] {
+    try { const list = JSON.parse(localStorage.getItem(asyncFailKey()) || '[]'); return Array.isArray(list) ? list : []; } catch { return []; }
+  }
+  function saveAsyncFails(add: AsyncFail[]) {
+    if (add.length === 0) return;
+    const ids = new Set(add.map(f => f.jobId));
+    asyncFails = [...add, ...asyncFails.filter(f => !ids.has(f.jobId))].slice(0, ASYNC_FAIL_LIMIT); // 同一个任务重复回写时，只留最新一份
+    try { localStorage.setItem(asyncFailKey(), JSON.stringify(asyncFails)); } catch { /* ignore */ }
+  }
+
+  // 把一个已完成任务的结果写回表格；返回一句摘要（会随确认一起存到服务端）。出错就抛异常，任务会被放开认领、稍后重试
+  async function writeBackJob(job: any): Promise<string> {
+    const meta: JobMeta | null = job.meta;
+    const results: FnResult[] | null = job.results;
+    if (!meta || !Array.isArray(meta.recordIds)) throw new Error('任务缺少回写信息');
+    const fieldById = new Map(host.getAllFields().map(f => [f.id, f]));
+    const fails: AsyncFail[] = [];
+    const addFail = (i: number, error: string) => fails.push({ jobId: job.id, runId: meta.run?.id, fnId: job.fnId, index: meta.indexes[i] || 0, recordId: meta.recordIds[i], fnName: job.fnName, error, time: Date.now() });
+    if (job.status === 'failed' || !results) {
+      const why = job.error || '函数执行失败';
+      meta.recordIds.forEach((_, i) => addFail(i, why));
+      saveAsyncFails(fails);
+      return `整批失败：${why}（${meta.recordIds.length} 条）`;
+    }
+    if (results.length !== meta.recordIds.length) throw new Error('结果条数与下发的记录数不一致');
+    const optionsOf = new Map<string, FieldOption[]>();
+    for (const o of meta.outs) {
+      const f = fieldById.get(o.fieldId);
+      if (f && needsOptions(f.type) && !optionsOf.has(o.fieldId)) optionsOf.set(o.fieldId, await host.getFieldOptions(o.fieldId));
+    }
+    const items: { i: number; recordId: string; fields: Record<string, any> }[] = [];
+    let skipped = 0, called = 0;
+    results.forEach((r, i) => {
+      if (!r.ok) { addFail(i, r.error || '函数执行失败'); return; }
+      const values: Record<string, any> = {};
+      try {
+        for (const o of meta.outs) {
+          const f = fieldById.get(o.fieldId);
+          if (!f) throw new Error('输出字段已不存在');
+          if (!r.outputs || !(o.name in r.outputs)) throw new Error(`函数“${job.fnName}”没有返回“${o.name}”`);
+          if (r.outputs[o.name] === null) continue; // 函数返回 null：这个字段不写入，保留原值
+          values[o.fieldId] = toFieldValue(f, r.outputs[o.name], optionsOf.get(o.fieldId));
+        }
+      } catch (e) { addFail(i, e instanceof Error ? e.message : String(e)); return; }
+      if (meta.outs.length === 0) called++; // 只调用的函数：没有要写的内容
+      else if (Object.keys(values).length === 0) skipped++;
+      else items.push({ i, recordId: meta.recordIds[i], fields: values });
+    });
+    let written = 0;
+    for (let s = 0; s < items.length; s += WRITE_BATCH) {
+      const part = items.slice(s, s + WRITE_BATCH);
+      try {
+        await host.writeRecords(part.map(x => ({ recordId: x.recordId, fields: x.fields })));
+        written += part.length;
+      } catch (batchErr) {
+        // 整批失败：可能只是其中某条记录已被删除，逐条写，只让真正有问题的行失败；
+        // 逐条也全失败，说明是网络 / 权限这类整体问题，抛出去让任务稍后重试，不要当成这些行失败
+        let ok = 0;
+        for (const x of part) {
+          try { await host.writeRecords([{ recordId: x.recordId, fields: x.fields }]); ok++; }
+          catch (e) { addFail(x.i, describeError(e, 'write')); }
+        }
+        if (ok === 0) throw batchErr;
+        written += ok;
+      }
+    }
+    saveAsyncFails(fails);
+    return (meta.outs.length ? `写入 ${written} 条` : `已调用 ${called} 条`) + (fails.length ? `，失败 ${fails.length} 条` : '') + (skipped ? `，跳过 ${skipped} 条` : '');
+  }
+
+  async function applyJob(s: JobSummary, scope: string) {
+    let claim: any;
+    try { claim = await jobApi(`api/jobs/${s.id}/claim`, { scope }); }
+    catch { return; } // 被别的页面认领了 / 状态变了：下次轮询再看
+    const job = claim.job;
+    const token = String(claim.token);
+    jobApplying = job.id;
+    updateJobsView();
+    try {
+      const result = await writeBackJob(job);
+      await jobApi(`api/jobs/${job.id}/ack`, { token, result });
+      s.status = 'applied'; s.result = result; s.appliedAt = Date.now();
+      jobRetryAt.delete(job.id);
+    } catch (e) {
+      jobRetryAt.set(job.id, Date.now() + JOB_RETRY_BACKOFF);
+      jobNote = `异步任务“${job.fnName}”回写失败：${describeError(e, 'write')}，稍后会自动重试`;
+      try { await jobApi(`api/jobs/${job.id}/release`, { token }); } catch { /* 认领过一会儿自己会失效 */ }
+    } finally {
+      jobApplying = '';
+    }
+  }
+
+  // 刷新任务列表，并回写已经完成的任务。批处理正在运行（同步函数在写表）时只刷新列表，回写等它结束后的下一次轮询
+  async function refreshJobs() {
+    clearTimeout(jobTimer);
+    const scope = host.getScope();
+    if (!scope) return;
+    if (jobBusy) { scheduleJobPoll(); return; }
+    jobBusy = true;
+    try {
+      if (scope !== jobScope) { jobScope = scope; jobList = []; asyncFails = loadAsyncFails(); jobRetryAt.clear(); }
+      if (fns.some(f => f.async) || jobList.length > 0) {
+        jobList = (await jobApi(`api/jobs?scope=${encodeURIComponent(scope)}`)).jobs;
+        jobNote = '';
+        updateJobsView();
+        if (!running) {
+          for (const j of jobList) {
+            if ((j.status === 'done' || j.status === 'failed') && !j.claimed && (jobRetryAt.get(j.id) || 0) <= Date.now()) await applyJob(j, scope);
+          }
+        }
+      }
+    } catch (e) {
+      jobNote = `异步任务状态获取失败：${describeError(e, 'read')}`;
+    } finally {
+      jobBusy = false;
+      updateJobsView();
+      scheduleJobPoll();
+    }
+  }
+
+  function scheduleJobPoll() {
+    clearTimeout(jobTimer);
+    // 没有异步函数、也没有未完成的任务（已回写 / 已取消的不用再盯）：不轮询
+    if (!fns.some(f => f.async) && !jobList.some(j => j.status !== 'applied' && j.status !== 'cancelled')) return;
+    const active = jobList.some(j => j.status === 'queued' || j.status === 'running'
+      || ((j.status === 'done' || j.status === 'failed') && (jobRetryAt.get(j.id) || 0) <= Date.now()));
+    jobTimer = setTimeout(refreshJobs, active ? JOB_POLL_ACTIVE : JOB_POLL_IDLE);
+  }
+
+  async function cancelJob(id: string) {
+    const j = jobList.find(x => x.id === id);
+    if (!j) return;
+    if (!confirm(`取消“${j.fnName}”的这个任务（${j.count} 条）？\n已经在运行的任务无法中断，但它的结果不会再写回表格。`)) return;
+    try { await jobApi(`api/jobs/${id}/cancel`, { scope: host.getScope() }); }
+    catch (e) { jobNote = `取消失败：${describeError(e, 'read')}`; }
+    refreshJobs();
+  }
+
+  const fmtDuration = (ms: number) => {
+    const sec = Math.max(0, Math.round(ms / 1000));
+    return sec < 60 ? `${sec} 秒` : sec < 3600 ? `${Math.floor(sec / 60)} 分钟` : `${Math.floor(sec / 3600)} 小时 ${Math.floor(sec % 3600 / 60)} 分钟`;
+  };
+
+  // 图标（线条风格，颜色跟随文字色）：转圈 = 正在进行，钟 = 等待，对勾 = 完成，叹号 = 出错，列表 = 任务
+  type IcoKind = 'spin' | 'clock' | 'check' | 'alert' | 'refresh' | 'list';
+  function ico(kind: IcoKind): string {
+    const paths: Record<IcoKind, string> = {
+      spin: '<path d="M21 12a9 9 0 1 1-6.2-8.56"/>',
+      clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+      check: '<circle cx="12" cy="12" r="9"/><path d="M8 12.5l3 3 5-6"/>',
+      alert: '<circle cx="12" cy="12" r="9"/><path d="M12 7.5v5.5"/><path d="M12 16.2v.3"/>',
+      refresh: '<path d="M20 11a8 8 0 0 0-14.3-4.3L4 8.5"/><path d="M4 4v4.5h4.5"/><path d="M4 13a8 8 0 0 0 14.3 4.3L20 15.5"/><path d="M20 20v-4.5h-4.5"/>',
+      list: '<path d="M9 6h11"/><path d="M9 12h11"/><path d="M9 18h11"/><path d="M4.5 6h.01"/><path d="M4.5 12h.01"/><path d="M4.5 18h.01"/>',
+    };
+    return `<svg class="af-svg${kind === 'spin' ? ' af-spin' : ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[kind]}</svg>`;
+  }
+
+  // 下发时间：今天只显示时:分，其他天带上月-日
+  function fmtClock(ms: number, seconds = false): string {
+    const d = new Date(ms);
+    const p = (n: number) => String(n).padStart(2, '0');
+    const t = `${p(d.getHours())}:${p(d.getMinutes())}${seconds ? ':' + p(d.getSeconds()) : ''}`;
+    return d.toDateString() === new Date().toDateString() ? t : `${p(d.getMonth() + 1)}-${p(d.getDate())} ${t}`;
+  }
+
+  // 一个任务当前的样子：图标、样式类、一句话状态
+  function jobView(j: JobSummary): { ico: IcoKind; cls: string; text: string } {
+    const working = j.claimed || jobApplying === j.id; // 已经被取走（正在写回 / 汇报）
+    switch (j.status) {
+      case 'queued': return { ico: 'clock', cls: 'st-queued', text: '排队中，等待执行' };
+      case 'running': return { ico: 'spin', cls: 'st-running', text: `运行中，已 ${fmtDuration(Date.now() - (j.startedAt || j.createdAt))}` };
+      case 'done': return working ? { ico: 'spin', cls: 'st-running', text: '正在写回表格…' } : { ico: 'clock', cls: 'st-done', text: '已完成，等待写回' };
+      case 'failed': return working ? { ico: 'spin', cls: 'st-running', text: '正在汇报失败原因…' } : { ico: 'alert', cls: 'st-failed', text: `执行失败：${j.error || '函数执行失败'}` };
+      case 'applied': {
+        const took = j.startedAt && j.finishedAt ? `，用时 ${fmtDuration(j.finishedAt - j.startedAt)}` : '';
+        return { ico: 'check', cls: 'st-applied', text: `已写回：${j.result || '完成'}${took}` };
+      }
+      default: return { ico: 'clock', cls: '', text: j.status };
+    }
+  }
+
+  // 异步失败行的分组 key：批次 + 函数。复制 / 导出 / 清空都按它来
+  function failKey(f: AsyncFail): string { return `${f.runId || ''}|${f.fnId || 'name:' + f.fnName}`; }
+
+  // 一个任务一行：第几个任务（共几个）、对应批次里的第几到第几条，下面是状态
+  function jobLineHtml(j: JobSummary): string {
+    const v = jobView(j);
+    const cancelable = j.status === 'queued' || j.status === 'running' || ((j.status === 'done' || j.status === 'failed') && !j.claimed && jobApplying !== j.id);
+    const title = j.run ? `任务 ${j.run.part}/${j.run.parts}<span class="af-job-range">第 ${j.run.from}–${j.run.to} 条</span>` : `${j.count} 条`;
+    return `<div class="af-job ${v.cls}"><span class="af-job-ico">${ico(v.ico)}</span>` +
+      `<div class="af-job-body"><div class="af-job-title">${title}</div><div class="af-job-state">${esc(v.text)}</div></div>` +
+      `${cancelable ? `<button class="af-x" data-act="job-cancel" data-id="${esc(j.id)}" title="取消这个任务">×</button>` : ''}</div>`;
+  }
+
+  // 失败明细：key 是（批次 + 函数）的分组 key，复制 / 导出 / 清空只针对这一组
+  function failDetailsHtml(fails: AsyncFail[], key: string): string {
+    if (fails.length === 0) return '';
+    return `<details class="af-fail af-afail" data-fn="${esc(key)}"${afailOpenKeys.has(key) ? ' open' : ''}>
+      <summary>${ico('alert')}<span>失败明细 · ${fails.length} 条</span></summary>
+      <div class="af-fail-actions">
+        <button class="af-add" data-act="afail-copy" data-fn="${esc(key)}">复制全部</button>
+        <button class="af-add" data-act="afail-csv" data-fn="${esc(key)}">导出 CSV</button>
+        <button class="af-add" data-act="afail-ids" data-fn="${esc(key)}">仅复制记录 ID</button>
+        <button class="af-add" data-act="afail-clear" data-fn="${esc(key)}">清空</button>
+      </div>
+      <div class="af-fail-list">${fails.slice(0, FAIL_SHOW_LIMIT).map(f =>
+        `<div class="af-fail-item">第 ${f.index} 条 <span class="af-fail-id">${esc(f.recordId)}</span><div class="af-fail-err">${esc(f.error)}</div></div>`).join('')}</div>
+    </details>`;
+  }
+
+  // 一个批次里某个函数的任务：先是它的进度，再列没写回的任务，已写回的折叠起来，最后是失败明细
+  function fnTasksHtml(runKey: string, fnId: string, g: { name: string; jobs: JobSummary[]; fails: AsyncFail[] }): string {
+    const jobs = g.jobs.slice().sort((a, b) => (a.run?.part ?? 0) - (b.run?.part ?? 0) || a.createdAt - b.createdAt);
+    const pending = jobs.filter(j => j.status !== 'applied');
+    const done = jobs.filter(j => j.status === 'applied');
+    const total = jobs[0]?.run?.parts || jobs.length;
+    const key = `${runKey}|${fnId}`;
+    const shown = pending.slice(0, PENDING_SHOWN);
+    return `<div class="af-run-fn"><div class="af-run-fn-head"><span class="af-run-fn-name">${esc(g.name)}</span>` +
+      (jobs.length ? `<span class="af-run-fn-prog">${done.length}/${total} 已写回</span>` : '') + '</div>' +
+      (jobs.length ? `<div class="af-bar"><i style="width:${Math.round(done.length / Math.max(total, 1) * 100)}%"></i></div>` : '') +
+      shown.map(jobLineHtml).join('') +
+      (pending.length > shown.length ? `<div class="af-jobs-more">另有 ${pending.length - shown.length} 个未完成的任务</div>` : '') +
+      (done.length ? `<details class="af-done" data-done="${esc(key)}"${doneOpenKeys.has(key) ? ' open' : ''}><summary>已写回的任务 · ${done.length} 个</summary>${done.map(jobLineHtml).join('')}</details>` : '') +
+      failDetailsHtml(g.fails, `${runKey}|${fnId}`) + '</div>';
+  }
+
+  // 「函数」块右上角的标签：图标 + “任务”，右上角一个状态点（执行中橙、有失败红、全部完成绿）；点开弹出任务记录，
+  // 按「批次 → 函数 → 任务」分组：一次点「运行」是一个批次，被函数的 batchSize 拆成多个任务。
+  // 状态不占面板版面，所以下发之后可以继续配置、运行别的函数
+  function jobBadgeHtml(): string {
+    const live = jobList.filter(j => j.status !== 'cancelled');
+    if (live.length === 0 && asyncFails.length === 0) return '';
+    const busy = live.filter(j => j.status === 'queued' || j.status === 'running').length;
+    const waiting = live.filter(j => j.status === 'done' || j.status === 'failed').length;
+    const applied = live.filter(j => j.status === 'applied').length;
+    // 红色只表示失败：只要有失败的行就立刻变红（还有任务没结束时，红点呼吸，表示“有失败，且还没跑完”）；没有失败：执行中橙色呼吸，全部完成绿色
+    const live2 = busy > 0 || waiting > 0;
+    const state = asyncFails.length ? (live2 ? 'bad live' : 'bad') : live2 ? 'busy' : 'ok';
+    const tip = ['异步任务', busy ? `运行中 ${busy}` : '', waiting ? `待写回 ${waiting}` : '', applied ? `已写回 ${applied}` : '', asyncFails.length ? `${asyncFails.length} 条失败` : ''].filter(Boolean).join(' · ');
+    let pop = '';
+    if (jobPopOpen) {
+      const chip = (cls: string, text: string) => `<span class="af-chip ${cls}">${esc(text)}</span>`;
+      const chips = [busy ? chip('busy', `运行中 ${busy}`) : '', waiting ? chip('wait', `待写回 ${waiting}`) : '', applied ? chip('ok', `已写回 ${applied}`) : '',
+        asyncFails.length ? chip('bad', `${asyncFails.length} 条失败`) : ''].join('');
+      // 分组：批次（runId，没有批次信息的归到“更早的任务”）→ 函数
+      type FnGroup = { name: string; jobs: JobSummary[]; fails: AsyncFail[] };
+      const runs = new Map<string, { at: number; total: number; fns: Map<string, FnGroup> }>();
+      const runOf = (id: string) => { if (!runs.has(id)) runs.set(id, { at: 0, total: 0, fns: new Map() }); return runs.get(id)!; };
+      const fnOf2 = (r: { fns: Map<string, FnGroup> }, id: string, name: string) => { if (!r.fns.has(id)) r.fns.set(id, { name, jobs: [], fails: [] }); return r.fns.get(id)!; };
+      live.forEach(j => { const r = runOf(j.run?.id || ''); if (j.run) { r.at = j.run.at; r.total = j.run.total; } fnOf2(r, j.fnId, j.fnName).jobs.push(j); });
+      asyncFails.forEach(f => { const r = runOf(f.runId || ''); if (f.runId && !r.at) r.at = f.time; fnOf2(r, f.fnId || 'name:' + f.fnName, f.fnName).fails.push(f); });
+      const ordered = [...runs.entries()].sort((a, b) => (a[0] === '' ? 1 : 0) - (b[0] === '' ? 1 : 0) || b[1].at - a[1].at); // 最新的批次在前，没有批次信息的放最后
+      const visible = jobShowAllRuns ? ordered : ordered.slice(0, RUNS_SHOWN);
+      const body = visible.map(([runKey, r]) => {
+        const all = [...r.fns.values()].flatMap(g => g.jobs);
+        const doneN = all.filter(j => j.status === 'applied').length;
+        const parts = [...r.fns.values()].reduce((n, g) => n + (g.jobs[0]?.run?.parts || g.jobs.length), 0);
+        const open = all.some(j => j.status !== 'applied');
+        const head = runKey === ''
+          ? `<span class="af-run-title">更早的任务</span>`
+          : `<span class="af-run-title">批次 ${esc(fmtClock(r.at, true))}</span><span class="af-run-meta">${r.total ? `${r.total} 条` : ''}</span>`;
+        return `<div class="af-run${open ? ' live' : ''}"><div class="af-run-head">${head}<span class="af-run-prog">${all.length ? `${doneN}/${parts} 已写回` : ''}</span></div>` +
+          [...r.fns.entries()].map(([fid, g]) => fnTasksHtml(runKey, fid, g)).join('') + '</div>';
+      }).join('') + (ordered.length > RUNS_SHOWN ? `<button type="button" class="af-add af-runs-toggle" data-act="jobs-runs">${jobShowAllRuns ? '收起较早的批次' : `显示更早的 ${ordered.length - RUNS_SHOWN} 个批次`}</button>` : '');
+      pop = `<div class="af-job-pop"><div class="af-pop-head"><span class="af-pop-title">任务记录</span><span class="af-pop-chips">${chips}</span>` +
+        `<button type="button" class="af-pop-icon" data-act="jobs-refresh" title="立即刷新任务状态，并写回已完成的任务">${ico('refresh')}</button>` +
+        `<button type="button" class="af-pop-icon" data-act="jobs-toggle" title="关闭">×</button></div><div class="af-pop-body">${body}</div></div>`;
+    }
+    return `<button type="button" class="af-job-badge${jobPopOpen ? ' on' : ''}" data-act="jobs-toggle" title="${esc(tip)}">${ico('list')}<span>任务</span><i class="af-dot ${state}"></i></button>${pop}`;
+  }
+
+  function jobNoteHtml(): string { return jobNote ? `<div class="af-hint af-err">${esc(jobNote)}</div>` : ''; }
+
+  // 只更新标签和弹层，不整块重绘面板（免得轮询时打断正在输入的筛选条件）；内容没变就不动，转圈图标才不会每次轮询都从头转
+  // （不能拿 innerHTML 读回来比：浏览器会把它规范化成另一种写法，所以自己记下上一次写进去的字符串）
+  const lastHtml = new WeakMap<HTMLElement, string>();
+  function setHtml(el: HTMLElement, html: string) {
+    if (lastHtml.get(el) === html) return;
+    el.innerHTML = html;
+    lastHtml.set(el, html);
+  }
+  function updateJobsView() {
+    const badge = container.querySelector('[data-jobs-badge]') as HTMLElement | null;
+    if (badge) setHtml(badge, jobBadgeHtml());
+    const note = container.querySelector('.af-jobs-note') as HTMLElement | null;
+    if (note) setHtml(note, jobNoteHtml());
+  }
+
+  function asyncFailTable(rows: AsyncFail[]): string[][] {
+    return [['序号', '记录ID', '函数', '失败原因'], ...rows.map(f => [String(f.index), f.recordId, f.fnName, f.error])];
+  }
+  // 失败明细的操作只针对按钮所在的那个函数
+  async function onAsyncFailAction(act: string, btn: HTMLElement) {
+    const key = btn.dataset.fn || '';
+    const rows = asyncFails.filter(f => failKey(f) === key);
+    try {
+      if (act === 'afail-clear') {
+        if (!confirm('清空这个函数的异步失败明细？')) return;
+        asyncFails = asyncFails.filter(f => failKey(f) !== key);
+        try { localStorage.setItem(asyncFailKey(), JSON.stringify(asyncFails)); } catch { /* ignore */ }
+        updateJobsView();
+        return;
+      }
+      if (act === 'afail-csv') { downloadCsv(toCsv(asyncFailTable(rows)), '异步任务失败行'); return; }
+      await copyText(act === 'afail-ids' ? rows.map(f => f.recordId).join('\n') : toTsv(asyncFailTable(rows)));
+      const old = btn.textContent;
+      btn.textContent = '已复制';
+      setTimeout(() => { btn.textContent = old; }, 1500);
+    } catch (e) {
+      alert(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   // ── 底部右侧的“运行（取消）”按钮（在面板外，由侧边栏页面提供）──
   function syncRunBtn() {
     if (runBtn) {
@@ -852,7 +1372,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     setReadProgress('');
     render();
     try {
-      const all = await host.loadAllRecords((done, total) => setReadProgress(` ${done}/${total}`));
+      const all = await host.loadAllRecords((done, total) => setReadProgress(` ${done}/${total}`), { fresh: true });
       const matched = all.filter(r => evalGroup(config.filter, r));
       filterResult = { sig: filterSig(), matched: matched.length, total: all.length };
       recordHistory('filter', matched.length, all.length);
@@ -878,7 +1398,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     setReadProgress('');
     render();
     try {
-      const all = await host.loadAllRecords((done, total) => setReadProgress(` ${done}/${total}`));
+      const all = await host.loadAllRecords((done, total) => setReadProgress(` ${done}/${total}`), { fresh: true });
       const matched = all.filter(r => evalGroup(config.filter, r));
       filterResult = { sig: filterSig(), matched: matched.length, total: all.length };
       recordHistory('export', matched.length, all.length);
@@ -982,6 +1502,14 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
   const PREVIEW_LIMIT = 200; // 预览最多渲染的行数，导出始终是全部
   const PREVIEW_CELL_MAX = 200; // 单元格文本最多显示的字符数，完整内容放在悬停提示里
 
+  // 预览 / 统计可能用了缓存里的记录：数据不是刚读的就在窗口底部说明，并告诉用户怎么拿最新的
+  function dataAgeHint(): string {
+    const sec = Math.round((Date.now() - host.loadedAt()) / 1000);
+    if (sec < 3) return '';
+    const ago = sec < 60 ? `${sec} 秒` : `${Math.floor(sec / 60)} 分钟`;
+    return `（数据读取于 ${ago}前，要最新数据请先点「筛选」）`;
+  }
+
   function filteredRows(matched: RecordData[]): string[][] {
     const fields = host.getFields();
     return [
@@ -1020,7 +1548,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
         <thead><tr><th>#</th>${head.map(h => `<th>${esc(h)}</th>`).join('')}</tr></thead>
         <tbody>${shown.map((r, i) => `<tr><td>${i + 1}</td>${r.map(cell).join('')}</tr>`).join('')}</tbody>
       </table></div>
-      <div class="af-modal-foot"><span>${body.length > shown.length ? `仅显示前 ${shown.length} 条，导出 CSV 包含全部 ${body.length} 条` : `共 ${body.length} 条`}</span><span class="af-modal-actions"><button class="af-add" data-newtab title="在新标签页里打开，能用上整个浏览器窗口，并支持排序、调整列宽">在新标签页打开</button><button class="af-add" data-export>导出 CSV</button></span></div>
+      <div class="af-modal-foot"><span>${body.length > shown.length ? `仅显示前 ${shown.length} 条，导出 CSV 包含全部 ${body.length} 条` : `共 ${body.length} 条`}${dataAgeHint()}</span><span class="af-modal-actions"><button class="af-add" data-newtab title="在新标签页里打开，能用上整个浏览器窗口，并支持排序、调整列宽">在新标签页打开</button><button class="af-add" data-export>导出 CSV</button></span></div>
     </div>`;
     const close = () => { overlay.remove(); document.removeEventListener('keydown', onKey); };
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close(); };
@@ -1348,7 +1876,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     overlay.innerHTML = `<div class="af-modal-box af-stats-box" role="dialog" aria-modal="true">
       <div class="af-modal-head"><span>统计：命中 ${body.length} / 共 ${total} 条</span><button class="af-x" data-close title="关闭">×</button></div>
       <div class="af-modal-body af-stats-body"></div>
-      <div class="af-modal-foot"><span>这是点击统计那一刻的快照，不会自动更新</span><span class="af-modal-actions"><button class="af-add" data-newtab title="在新标签页里打开，能用上整个浏览器窗口">在新标签页打开</button></span></div>
+      <div class="af-modal-foot"><span>这是点击统计那一刻的快照，不会自动更新${dataAgeHint()}</span><span class="af-modal-actions"><button class="af-add" data-newtab title="在新标签页里打开，能用上整个浏览器窗口">在新标签页打开</button></span></div>
     </div>`;
     renderStatsView(overlay.querySelector('.af-stats-body') as HTMLElement, head, body, multiFlags());
     const close = () => { overlay.remove(); document.removeEventListener('keydown', onKey); };
@@ -1371,7 +1899,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     setStatus('正在读取视图记录…', '');
     render();
     const fieldById = new Map(host.getAllFields().map(f => [f.id, f]));
-    let written = 0, failed = 0, skipped = 0, called = 0, matchedCount = 0;
+    let written = 0, failed = 0, skipped = 0, called = 0, matchedCount = 0, dispatched = 0;
     let hasWrites = true; // 输出里有没有要写进字段的（全是“只调用的函数”则没有）
     failures = [];
     // 失败明细里带上送给函数的输入：用到的各函数的输入映射，相同的（参数 + 字段）只列一列
@@ -1388,19 +1916,29 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     const optionsOf = new Map<string, FieldOption[]>(); // 单选/多选输出字段的选项
     let historyId = '';
     try {
-      const all = await host.loadAllRecords((done, total) => setStatus(`正在读取视图记录… ${done}/${total}`, ''));
+      const all = await host.loadAllRecords((done, total) => setStatus(`正在读取视图记录… ${done}/${total}`, ''), { fresh: true });
       const matched = all.filter(r => evalGroup(config.filter, r));
       matchedCount = matched.length;
       filterResult = { sig: filterSig(), matched: matched.length, total: all.length };
       if (matched.length === 0) { setStatus(`视图共 ${all.length} 条记录，没有符合筛选条件的记录`, ''); return; }
-      const writeOuts = config.outputs.filter(o => !o.param.startsWith(FN_PREFIX) && o.fieldId);
+      // 同步函数的写入（hasWrites、writeOuts 都只看同步函数）；异步函数的结果由服务端跑完后，插件取回再写，不在这次运行里写
+      const fnOf = (key: string) => findCall(key) ?? findOutput(key)?.fn;
+      const allWriteOuts = config.outputs.filter(o => !o.param.startsWith(FN_PREFIX) && o.fieldId);
+      const writeOuts = allWriteOuts.filter(o => !fnOf(o.param)?.async);
       hasWrites = writeOuts.length > 0;
       // 只调用、不写入的函数：添加了但没选输出参数的，以及输出参数都没选字段的
-      const fnOf = (key: string) => findCall(key) ?? findOutput(key)?.fn;
-      const writtenFns = new Set(writeOuts.map(o => fnOf(o.param)?.id));
-      const callOnly = [...new Set(config.outputs.map(o => fnOf(o.param)).filter((f): f is FnMeta => !!f && !writtenFns.has(f.id)).map(f => f.name))];
-      const plan = (hasWrites ? `将调用函数并覆盖写入：${writeOuts.map(o => outLabel(o.param)).join('、')}` : '') +
-        (callOnly.length ? `${hasWrites ? '\n' : ''}将调用函数：${callOnly.join('、')}（只调用，不写入表格）` : '');
+      const writtenFns = new Set(allWriteOuts.map(o => fnOf(o.param)?.id));
+      const callOnly = [...new Set(config.outputs.map(o => fnOf(o.param)).filter((f): f is FnMeta => !!f && !f.async && !writtenFns.has(f.id)).map(f => f.name))];
+      const asyncFnList = [...new Map(config.outputs.map(o => fnOf(o.param)).filter((f): f is FnMeta => !!f && !!f.async).map(f => [f.id, f] as [string, FnMeta])).values()];
+      const asyncPlan = asyncFnList.map(f => {
+        const labels = allWriteOuts.filter(o => fnOf(o.param)?.id === f.id).map(o => outLabel(o.param));
+        return `${f.name}${labels.length ? `（写入：${labels.join('、')}）` : '（只调用）'}`;
+      });
+      const plan = [
+        hasWrites ? `将调用函数并覆盖写入：${writeOuts.map(o => outLabel(o.param)).join('、')}` : '',
+        callOnly.length ? `将调用函数：${callOnly.join('、')}（只调用，不写入表格）` : '',
+        asyncPlan.length ? `将下发异步函数：${asyncPlan.join('、')}\n（在服务端后台执行，完成后自动覆盖写入；期间需保持这张表的插件页面开着）` : '',
+      ].filter(Boolean).join('\n');
       if (!confirm(`视图共 ${all.length} 条记录，${matched.length} 条符合筛选条件。\n${plan}\n\n确定开始吗？`)) {
         setStatus('已取消', '');
         return;
@@ -1428,6 +1966,17 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       // 适配层：写回表格固定每 WRITE_BATCH（100）条提交一次；调用函数则按函数自己的 batchSize 来——
       // 一轮取选中的函数里最大的批大小那么多条记录，批大小大于 100 的函数把几个 100 攒成一次调用，小于 100 的拆成几次；
       // 一轮算完，结果再按 100 条一批写回。取消在一轮处理完后生效（只选一个函数时，一轮就是一次调用）
+      const sentBy = new Map<string, number>(); // 异步函数 → 已下发条数
+      // 批次：这次点「运行」是一个批次，被函数的 batchSize 拆成多个任务，任务带着批次信息，面板里才看得出它们的关系
+      const runId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      const runAt = Date.now();
+      const partSeq = new Map<string, number>(); // 异步函数 → 已拆出几个任务
+      const partsOf = (fn: FnMeta) => { // 这个函数在这个批次里一共会拆成几个任务（每一轮取 roundSize 条，再按函数的批大小拆）
+        const size = batchOf(fn);
+        return Math.floor(matched.length / roundSize) * Math.ceil(roundSize / size) + (matched.length % roundSize ? Math.ceil((matched.length % roundSize) / size) : 0);
+      };
+      const syncFns = [...byFn.values()].filter(x => !x.fn.async);
+      const asyncFns = [...byFn.values()].filter(x => x.fn.async);
       const roundSize = Math.max(...[...byFn.values()].map(x => batchOf(x.fn)));
       for (let start = 0; start < matched.length; start += roundSize) {
         if (cancelled) break;
@@ -1442,15 +1991,16 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
         };
         const values = chunk.map(() => ({} as Record<string, any>));
         const bad = chunk.map(() => '');
-        for (const { fn, outs } of byFn.values()) {
-          const rows = chunk.map(rec => {
-            const row: Record<string, any> = {};
-            for (const inp of fn.inputs) {
-              const fid = inputField(fn.id, inp.name);
-              if (fid) row[inp.name] = cellOf(rec, fid);
-            }
-            return row;
-          });
+        const buildRows = (fn: FnMeta) => chunk.map(rec => {
+          const row: Record<string, any> = {};
+          for (const inp of fn.inputs) {
+            const fid = inputField(fn.id, inp.name);
+            if (fid) row[inp.name] = cellOf(rec, fid);
+          }
+          return row;
+        });
+        for (const { fn, outs } of syncFns) {
+          const rows = buildRows(fn);
           const size = batchOf(fn);
           const results: FnResult[] = [];
           for (let s = 0; s < rows.length; s += size) results.push(...await callFunction(fn, rows.slice(s, s + size)));
@@ -1469,6 +2019,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
         }
         const items: { recordId: string; fields: Record<string, any> }[] = [];
         chunk.forEach((rec, i) => {
+          if (syncFns.length === 0) return; // 这次选的全是异步函数：没有同步结果可统计
           if (bad[i]) {
             failed++;
             failures.push({ index: indexOf.get(rec.recordId) || 0, recordId: rec.recordId, inputs: inputCols.map(fid => cellText(rec.fields[fid])), error: bad[i] });
@@ -1481,22 +2032,43 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
           await host.writeRecords(part);
           written += part.length;
         }
-        setStatus(`进度 ${Math.min(start + roundSize, matched.length)}/${matched.length}（${hasWrites ? `已写入 ${written}` : `已调用 ${called}`}，失败 ${failed}）`, '');
+        // 异步函数：同步函数的结果写完后，把这一轮的行下发成任务（立刻返回，不等执行）
+        for (const { fn, outs } of asyncFns) {
+          const rows = buildRows(fn);
+          const size = batchOf(fn);
+          const mapped = outs.filter(o => o.fieldId);
+          for (let s = 0; s < rows.length; s += size) {
+            const part = chunk.slice(s, s + size);
+            const seq = (partSeq.get(fn.id) || 0) + 1;
+            partSeq.set(fn.id, seq);
+            const run: RunInfo = { id: runId, at: runAt, total: matched.length, part: seq, parts: partsOf(fn), from: start + s + 1, to: start + s + part.length };
+            await dispatchJob(fn, rows.slice(s, s + size), { recordIds: part.map(r => r.recordId), indexes: part.map(r => indexOf.get(r.recordId) || 0), outs: mapped, run });
+            // 按函数累计，已下发条数取各函数里最多的那个（同一条记录给多个异步函数只算一条）；下发到一半失败时，已成功的部分也如实计入
+            sentBy.set(fn.id, (sentBy.get(fn.id) || 0) + part.length);
+            dispatched = Math.max(dispatched, ...sentBy.values());
+          }
+        }
+        const prog = [syncFns.length ? `${hasWrites ? `已写入 ${written}` : `已调用 ${called}`}，失败 ${failed}` : '', asyncFns.length ? `已下发 ${dispatched}` : ''].filter(Boolean).join('，');
+        setStatus(`进度 ${Math.min(start + roundSize, matched.length)}/${matched.length}（${prog}）`, '');
       }
-      const summary = `${cancelled ? '已取消' : '完成'}：符合筛选 ${matchedCount} 条，` +
-        (hasWrites ? `已写入 ${written} 条` : `已调用 ${called} 条（只调用，不写入表格）`) + `，失败 ${failed} 条` +
-        (skipped ? `，跳过 ${skipped} 条（函数没有返回内容，未写入）` : '') +
-        (failed ? '（详见下方失败明细）' : '');
+      const syncPart = syncFns.length
+        ? (hasWrites ? `已写入 ${written} 条` : `已调用 ${called} 条（只调用，不写入表格）`) + `，失败 ${failed} 条` +
+          (skipped ? `，跳过 ${skipped} 条（函数没有返回内容，未写入）` : '') + (failed ? '（详见下方失败明细）' : '')
+        : '';
+      const asyncPart = asyncFns.length ? `已下发 ${dispatched} 条给异步函数（后台执行，完成后自动写回，进度见「函数」块右上角的标签）` : '';
+      const summary = `${cancelled ? '已取消' : '完成'}：符合筛选 ${matchedCount} 条，` + [syncPart, asyncPart].filter(Boolean).join('；');
       setStatus(summary, failed || cancelled ? 'error' : 'ok');
       if (historyId) updateHistory(historyId, { result: summary, ok: !(failed || cancelled) });
     } catch (e) {
-      setStatus(`中断：${describeError(e, 'write')}\n已写入 ${written} 条，其余记录未处理`, 'error');
-      if (historyId) updateHistory(historyId, { result: `中断：已写入 ${written} 条，其余记录未处理`, ok: false });
+      const doneText = `已写入 ${written} 条` + (dispatched ? `，已下发 ${dispatched} 条给异步函数（它们仍会照常执行并回写）` : '');
+      setStatus(`中断：${describeError(e, 'write')}\n${doneText}，其余记录未处理`, 'error');
+      if (historyId) updateHistory(historyId, { result: `中断：${doneText}，其余记录未处理`, ok: false });
     } finally {
       running = false;
       const keep = { text: statusText, kind: statusKind };
       render();
       setStatus(keep.text, keep.kind);
+      if (dispatched > 0) refreshJobs(); // 刚下发了任务：马上刷新一次任务区，之后自动轮询
     }
   }
 

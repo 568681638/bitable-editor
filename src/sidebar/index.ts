@@ -26,8 +26,18 @@ let lastLoadError = '';
 let loadGen = 0; // 重置记录列表时自增，丢弃旧请求返回的数据
 let navSeq = 0; // 连续跳转时只响应最后一次
 let currentIndex = 0;
+// 「全部记录」的短时缓存：筛选 / 预览 / 统计常常连着点，读一遍就够了。
+// 任何可能让它过期的事（记录增删改、字段变化、刷新、切表切视图、插件自己写入）都会 invalidateAllCache；
+// 兜底再加一个存活时间，万一事件没收到也不会一直用旧数据
+const ALL_CACHE_TTL = 5 * 60 * 1000;
+let allCache: { records: RecordData[]; at: number } | null = null;
+let allCacheEpoch = 0; // 每次失效自增：读取过程中发生了失效，这一次读到的结果就不能存进缓存
+let allCacheTimer: ReturnType<typeof setTimeout> | undefined;
+let lastLoadAt = 0; // 最近一次 loadAllRecords 返回的数据是什么时候从表格里读的
+let offTableEvents: Array<() => void> = [];
 const fieldOptionsCache: Record<string, FieldOption[]> = {};
 let currentTableId = '';
+let currentBaseId = '';
 let currentViewId = '';
 let status: MessageStatus = { kind: 'loading', text: '' };
 let panelWin: Window | null = null;
@@ -60,18 +70,54 @@ const autoFlush = createAutoFlush(document.getElementById('autoContent') as HTML
     return options;
   },
   getTableId: () => currentTableId,
-  loadAllRecords: async (onProgress) => {
-    const ids = recordIds.slice();
-    const all: RecordData[] = [];
-    const STEP = 200;
-    for (let i = 0; i < ids.length; i += STEP) {
-      all.push(...await withTimeout(fetchRecords(ids.slice(i, i + STEP)), '读取记录'));
-      onProgress(Math.min(i + STEP, ids.length), ids.length);
+  // 异步任务按「多维表格 / 数据表」归属，插件只会取回自己这张表的任务
+  getScope: () => (currentTableId ? `${currentBaseId}/${currentTableId}` : ''),
+  loadAllRecords: async (onProgress, opts) => {
+    if (!opts?.fresh && allCache && Date.now() - allCache.at < ALL_CACHE_TTL) {
+      lastLoadAt = allCache.at;
+      onProgress(allCache.records.length, allCache.records.length);
+      return allCache.records.slice(); // 复制数组，调用方怎么 filter / sort 都不会影响缓存
     }
-    return all;
+    const epoch = allCacheEpoch;
+    const startedAt = Date.now();
+    // 分批并发读取（串行的话，总耗时 = 批数 × 单次往返）；并发数不宜太大，避免触发飞书客户端限流
+    const ids = recordIds.slice();
+    const STEP = 200;
+    const CONCURRENCY = 5;
+    const batches: string[][] = [];
+    for (let i = 0; i < ids.length; i += STEP) batches.push(ids.slice(i, i + STEP));
+    const results: RecordData[][] = new Array(batches.length);
+    let next = 0;
+    let done = 0;
+    let failed = false;
+    const worker = async () => {
+      while (!failed && next < batches.length) {
+        const idx = next++;
+        try {
+          results[idx] = await withTimeout(fetchRecords(batches[idx]), '读取记录');
+        } catch (e) {
+          failed = true; // 一批失败，其余 worker 不再发新请求
+          throw e;
+        }
+        done += batches[idx].length;
+        onProgress(done, ids.length);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, batches.length) }, worker));
+    const records = results.flat();
+    lastLoadAt = startedAt;
+    if (epoch === allCacheEpoch) {
+      allCache = { records, at: startedAt };
+      clearTimeout(allCacheTimer);
+      allCacheTimer = setTimeout(invalidateAllCache, ALL_CACHE_TTL); // 到期释放内存
+    }
+    return records.slice();
   },
+  loadedAt: () => lastLoadAt,
   writeRecords: async (items) => {
+    invalidateAllCache(); // 写之前就失效：写入过程中并发的读取不会把旧数据存进缓存
     await currentTable.setRecords(items.map(i => ({ recordId: i.recordId, fields: i.fields })));
+    invalidateAllCache();
     for (const item of items) {
       const record = recordCache.get(item.recordId);
       if (record) Object.assign(record.fields, item.fields);
@@ -87,6 +133,22 @@ document.getElementById('historyBtn')!.addEventListener('click', () => autoFlush
 setupModeSwitch(ui.saveIfModified, (mode) => { autoMode = mode === 'auto'; if (autoMode) autoFlush.show(); });
 document.body.classList.add('sidebar-zoom');
 setupZoom(document.documentElement, 'annotator-sidebar-zoom-v2', 1.05);
+
+function invalidateAllCache() {
+  allCache = null;
+  allCacheEpoch++;
+  clearTimeout(allCacheTimer);
+}
+
+// 监听当前表格的记录 / 字段变化（别人或自己改了数据），让缓存失效；切表时先解除上一张表的监听
+function watchTable(table: any) {
+  offTableEvents.forEach(off => { try { off(); } catch { /* ignore */ } });
+  offTableEvents = [];
+  const handlers = [table.onRecordAdd, table.onRecordDelete, table.onRecordModify, table.onFieldAdd, table.onFieldDelete, table.onFieldModify];
+  for (const on of handlers) {
+    try { offTableEvents.push(on.call(table, invalidateAllCache)); } catch { /* 取不到事件就只靠存活时间兜底 */ }
+  }
+}
 
 function currentRecord(): RecordData | undefined {
   return recordCache.get(recordIds[currentIndex]);
@@ -113,6 +175,7 @@ function sync() {
 // ── 分批加载记录 ──────────────────────────────────
 function resetRecords(ids: string[]) {
   loadGen++;
+  invalidateAllCache(); // 刷新、切表切视图都会走到这里
   loadingBlocks.clear();
   recordIds = ids;
   recordCache.clear();
@@ -190,7 +253,9 @@ async function show(index: number, locate: boolean) {
 }
 
 async function persistRecord(recordId: string, values: Record<string, any>) {
+  invalidateAllCache();
   await currentTable.setRecord(recordId, { fields: values });
+  invalidateAllCache();
   const record = recordCache.get(recordId);
   if (record) Object.assign(record.fields, values);
 }
@@ -384,6 +449,9 @@ async function init() {
 
     currentTable = await bitable.base.getTableById(sel.tableId);
     currentTableId = sel.tableId;
+    currentBaseId = sel.baseId || '';
+    invalidateAllCache();
+    watchTable(currentTable);
     const allFields: FieldMeta[] = await currentTable.getFieldMetaList();
     tableFields = allFields;
 

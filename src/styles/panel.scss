@@ -290,10 +290,10 @@ body.marquee-mode .sel-layer {
   font-family: inherit;
   line-height: 1.5;
   resize: vertical;
-  // 与侧边栏一致：每行不折行，过长时横向滚动（高度随内容撑开，见 shared/textarea.ts）
-  white-space: pre;
-  overflow-wrap: normal;
-  overflow-x: auto;
+  // 与侧边栏一致：长行自动换行，不出横向滚动条（高度随内容撑开，见 shared/textarea.ts）
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow-x: hidden;
 }
 
 .block-open {
