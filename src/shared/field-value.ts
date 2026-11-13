@@ -4,8 +4,11 @@ import { FType, FieldMeta, FieldOption } from './common';
 // 写入结构（见 SDK 类型定义）：文本 [{type:'text',text}]、数字 number、单选 {id,text}、多选 [{id,text}]、
 // 日期 毫秒时间戳 number、复选框 boolean、电话/邮箱 string、超链接 [{type:'url',text,link}]、人员 [{id}]。
 // 函数返回值就按该类型在多维表格里的原生形态给（数字给数字、复选框给 true/false、日期给毫秒时间戳……），
-// 这里不做宽松兼容（不解析日期字符串、不拆分隔符、不猜真假词），类型不对直接报错。
-// 唯一的转换是单选/多选：函数给选项名，这里换成选项 ID（函数不可能知道选项 ID）。
+// 这里基本不做宽松兼容（不解析日期字符串、不拆分隔符、不猜“是 / 否”之类的真假词），类型不对直接报错。
+// 转换只有这几种（都没有歧义）：
+//   单选/多选：函数给选项名，换成选项 ID（函数不可能知道选项 ID）；
+//   任意类型 → 文本字段：字符串原样写，数字 / 布尔值转成字符串，数组 / 对象写成 JSON 字符串；布尔值 → 单选字段：当作名为 "true" / "false" 的选项名；
+//   字符串 "true" / "false"（不分大小写）→ 复选框：转成布尔值。
 
 /** 当前支持写入的字段类型（其余类型，如公式、附件、关联，选了会在运行前被拦住并提示） */
 export const WRITABLE_TYPES = new Set<number>([
@@ -32,6 +35,7 @@ const wrong = (field: FieldMeta, want: string, v: any) =>
   new Error(`“${field.name}”是${typeName(field)}字段，需要${want}，实际得到：${show(v)}`);
 
 function pickOption(field: FieldMeta, options: FieldOption[], v: any): { id: string; text: string } {
+  if (typeof v === 'boolean') v = String(v); // 布尔值当作名为 true / false 的选项名
   if (typeof v !== 'string') throw wrong(field, '选项名（字符串）', v);
   const hit = options.find(o => o.name === v);
   if (!hit) {
@@ -62,6 +66,7 @@ export function toFieldValue(field: FieldMeta, v: any, options: FieldOption[] = 
       if (typeof v !== 'number' || !isFinite(v)) throw wrong(field, '毫秒时间戳（数字）', v);
       return v;
     case FType.CHECKBOX:
+      if (typeof v === 'string' && /^(true|false)$/i.test(v.trim())) return v.trim().toLowerCase() === 'true';
       if (typeof v !== 'boolean') throw wrong(field, 'true / false', v);
       return v;
     case FType.PHONE:
@@ -79,7 +84,6 @@ export function toFieldValue(field: FieldMeta, v: any, options: FieldOption[] = 
       if (!Array.isArray(v) || v.length === 0 || !v.every(x => x && typeof x.id === 'string' && x.id)) throw wrong(field, '人员数组 [{id}]', v);
       return v.map(x => ({ id: x.id }));
     default: // 文本
-      if (typeof v !== 'string' && typeof v !== 'number') throw wrong(field, '字符串', v);
-      return [{ type: 'text', text: String(v) }];
+      return [{ type: 'text', text: typeof v === 'string' ? v : typeof v === 'object' ? JSON.stringify(v) : String(v) }]; // 任意类型都能转成字符串
   }
 }
