@@ -646,6 +646,7 @@ function buildNode(node: LayoutNode): HTMLElement {
         <button type="button" class="group-share${group.shared ? ' on' : ''}" title="${group.shared ? '关闭任一渲染：各字段块恢复各自的渲染区' : '开启任一渲染：组内各字段只留标题栏，共用组底部的一个渲染区，哪个字段的链接能加载就显示哪个'}">任一渲染</button>
         <button type="button" class="group-sync${group.sync ? ' on' : ''}" title="${group.sync ? '关闭同步播放' : '开启同步播放：组内的视频 / 音频一起播放、一起暂停（播放或暂停其中任何一个，其他的跟着一起）'}">同步播放</button>
         <button type="button" class="group-ungroup" title="取消组合：各字段块恢复独立">取消组合</button>
+        <button type="button" class="group-delete" title="删除组合：把组合里的字段块全部从预览窗格移除（字段回到侧边栏）">删除组合</button>
       </div>`;
     const inner = document.createElement('div');
     inner.className = 'group-inner';
@@ -674,6 +675,14 @@ function buildNode(node: LayoutNode): HTMLElement {
     (el.querySelector('.group-ungroup') as HTMLElement).addEventListener('click', () => {
       replaceNode(group, group.child);
       commitLayout();
+    });
+    (el.querySelector('.group-delete') as HTMLElement).addEventListener('click', () => {
+      const members = leaves(group);
+      if (!confirm(`删除这个组合？
+组合里的 ${members.length} 个字段块会全部从预览窗格移除（字段回到侧边栏）。`)) return;
+      members.forEach(removeLeaf);
+      saveLayout();
+      renderBlocks();
     });
     (el.querySelector('.group-handle') as HTMLElement).addEventListener('dragstart', (e) => {
       if (!e.dataTransfer) return;
@@ -1287,6 +1296,37 @@ blocksEl.addEventListener('drop', (e) => {
   }
 });
 document.addEventListener('dragend', endDrag);
+
+// 把预览窗格里的字段块（或整个组合）拖到右侧的侧边栏松开：等同点字段块的 ✕ / 「删除组合」，从预览窗格移除，字段回到侧边栏
+const appEl = document.getElementById('app') as HTMLElement;
+const isPaneDrag = (e: DragEvent) => { const t = e.dataTransfer?.types || []; return t.includes(BLOCK_DRAG_TYPE) || t.includes(NODE_DRAG_TYPE); };
+appEl.addEventListener('dragover', (e) => {
+  if (!isPaneDrag(e)) return;
+  e.preventDefault();
+  e.dataTransfer!.dropEffect = 'move';
+  appEl.classList.add('drop-remove');
+});
+appEl.addEventListener('dragleave', (e) => {
+  if (!appEl.contains(e.relatedTarget as globalThis.Node)) appEl.classList.remove('drop-remove');
+});
+appEl.addEventListener('drop', (e) => {
+  if (!isPaneDrag(e)) return;
+  e.preventDefault();
+  appEl.classList.remove('drop-remove');
+  const blockId = e.dataTransfer?.getData(BLOCK_DRAG_TYPE);
+  const nodeId = e.dataTransfer?.getData(NODE_DRAG_TYPE);
+  endDrag();
+  if (blockId) {
+    const leaf = leaves(root).find(l => l.id === blockId);
+    if (leaf) removeLeaf(leaf);
+  } else if (nodeId) {
+    const g = groups(root).find(x => x.id === nodeId);
+    if (g) leaves(g).forEach(removeLeaf);
+  }
+  saveLayout();
+  renderBlocks();
+});
+document.addEventListener('dragend', () => appEl.classList.remove('drop-remove'));
 
 // 侧边栏标题栏里的标题名「data-engine」可拖：拖到预览窗格放下，把标题行的副本放进去（侧边栏的标题行保留），和拖字段一样按落点切分
 const navHandle = document.getElementById('navHandle') as HTMLElement;

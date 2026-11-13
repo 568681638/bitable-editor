@@ -154,7 +154,8 @@ body.dragging-field .viewer-item {
 
 .group-share,
 .group-sync,
-.group-ungroup {
+.group-ungroup,
+.group-delete {
   padding: 0 8px;
   border: none;
   border-radius: 3px;
@@ -169,6 +170,7 @@ body.dragging-field .viewer-item {
 .group-share.on,
 .group-sync.on { background: #4f7cff; color: #fff; }
 .group-ungroup { margin-left: auto; }
+.group-delete { color: #cf1322; &:hover { background: #ffe3e0; } }
 
 .group-inner {
   flex: 1;
@@ -552,3 +554,6 @@ body.marquee-mode .sel-layer {
     &:hover { background: #ff4d4f; color: #fff; }
   }
 }
+
+// 把预览块拖到侧边栏上方时的提示：整个侧边栏出现红色虚线框，表示松手即从预览窗格移除
+#app.drop-remove { outline: 2px dashed #ff4d4f; outline-offset: -3px; background: rgba(255, 77, 79, 0.05); }
