@@ -53,6 +53,7 @@ functions/
 ├── tte_issue/                  TTE 工单（Python，调 TTE 接口）
 │   ├── function.py             入口
 │   └── tte_client.py           只有这个函数用的客户端模块（和函数放在一起，function.py 里直接 import tte_client）
+├── 机制/url_previewable/       「机制」分类目录：存放和插件内部机理相关的函数（比如判断链接能否在预览窗格里加载）；业务函数放在别处
 ├── 示例/无输出/log_rows/       无输出函数示例：「示例 / 无输出」是两层分类目录，log_rows 是函数文件夹
 │   └── function.mjs
 ├── 示例/异步/slow_upper/       异步函数示例（JS，async: true，模拟耗时 15 秒）
