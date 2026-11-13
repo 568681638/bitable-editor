@@ -511,7 +511,7 @@ body.marquee-mode .sel-layer {
   &:hover { opacity: 1; background: #4f7cff; font-size: 10px; }
 }
 
-// ── 标题行：拖侧边栏标题名「bitable-editor」到预览窗格，放一份标题行的副本（做成字段块）──
+// ── 标题行：拖侧边栏标题名「data-engine」到预览窗格，放一份标题行的副本（做成字段块）──
 .header h3[draggable="true"] { cursor: grab; user-select: none; }
 
 // 标题行块：侧边栏标题行的副本，整行蓝底；☰ 菜单要伸到块外面，所以这种块不裁剪溢出

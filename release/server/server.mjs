@@ -13,6 +13,7 @@ import { tmpdir } from 'os';
 import { spawn } from 'child_process';
 import { pathToFileURL } from 'url';
 import { createJobStore } from './jobs.mjs';
+import { createFnLocks } from './locks.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = join(__dirname, '..', 'dist');
@@ -156,7 +157,7 @@ function frameCheckOnce(targetUrl, redirects) {
       port: parsed.port || undefined,
       path: parsed.pathname + parsed.search,
       method: 'GET',
-      headers: { host: parsed.host, 'user-agent': 'Mozilla/5.0 bitable-editor-frame-check', accept: 'text/html' },
+      headers: { host: parsed.host, 'user-agent': 'Mozilla/5.0 data-engine-frame-check', accept: 'text/html' },
       lookup: safeLookup,
     }, (res) => {
       res.destroy(); // 只要响应头，不读内容
@@ -250,7 +251,90 @@ function validDef(d) {
   const okParams = (list) => Array.isArray(list) && list.every(p => p && typeof p.name === 'string' && p.name);
   // outputs 可以不写 / 写空数组：只调用、不往表格写值的函数（比如发通知、触发任务）
   return d && typeof d.id === 'string' && d.id && typeof d.name === 'string' && typeof d.run === 'function'
-    && okParams(d.inputs) && (d.outputs === undefined || okParams(d.outputs));
+    && okParams(d.inputs) && d.inputs.every(p => validInput(d.id, p)) && (d.outputs === undefined || (okParams(d.outputs) && validOutputs(d.id, d.outputs)));
+}
+
+// ── 出参的类型：type 不写 = 普通出参（值写进表格字段）；
+//   detail   执行详情（旧名 message 仍然认）：一段文本，描述这一行 / 这一批执行得怎么样。不写进字段，也不出现在“＋输出”的选项里，面板每次调用都会收集并展示（悬浮窗）。每个函数最多一个
+// 另外 run 可以不返回数组，而返回 { results: [...与 rows 等长], detail: '本批整体的详情' }（旧名 message 仍然认），detail 是这一批（这一次 run）的详情，同样给面板展示
+const OUTPUT_TYPES = ['detail', 'message'];
+const isDetailOut = (o) => o && (o.type === 'detail' || o.type === 'message');
+const MAX_NOTE = 20000; // 单条说明的字数上限，超出截断（说明是给人看的，免得撑大响应和落盘的任务文件）
+function validOutputs(fnId, list) {
+  let why = '';
+  for (const p of list) if (p.type !== undefined && OUTPUT_TYPES.indexOf(p.type) < 0) { why = '出参 ' + p.name + ' 的 type 只能是 ' + OUTPUT_TYPES.join(' / ') + '（或不写），收到 ' + JSON.stringify(p.type); break; }
+  if (!why && list.filter(isDetailOut).length > 1) why = 'type: "detail" 的出参最多一个';
+  if (why) console.error('[functions] 函数 ' + fnId + ' 不合法：' + why);
+  return !why;
+}
+function noteText(v) {
+  if (v === null || v === undefined) return undefined;
+  let t = typeof v === 'string' ? v : (typeof v === 'object' ? JSON.stringify(v) : String(v));
+  if (!t.trim()) return undefined;
+  if (t.length > MAX_NOTE) t = t.slice(0, MAX_NOTE) + '\n…（说明过长，已截断）';
+  return t;
+}
+// 把 run 的返回规整成 { results: [{ok, outputs} | {ok:false, error}], detail? }。返回的可以是数组，也可以是 { results, detail }
+function shapeRun(fn, out, n) {
+  let list = out, message;
+  if (out && !Array.isArray(out) && typeof out === 'object' && Array.isArray(out.results)) { list = out.results; message = noteText(out.detail !== undefined ? out.detail : out.message); }
+  if (!Array.isArray(list) || list.length !== n) {
+    throw new Error('函数 ' + fn.id + ' 必须返回与 rows 等长的数组（收到 ' + n + ' 行，返回 ' + (Array.isArray(list) ? list.length : typeof list) + '）');
+  }
+  const msgName = ((fn.outputs || []).find(isDetailOut) || {}).name;
+  const results = list.map((o) => {
+    if (o instanceof Error) return { ok: false, error: o.message };
+    const outputs = Object.assign({}, o || {});
+    if (msgName && msgName in outputs) { const t = noteText(outputs[msgName]); if (t === undefined) delete outputs[msgName]; else outputs[msgName] = t; }
+    return { ok: true, outputs };
+  });
+  return message === undefined ? { results } : { results, detail: message };
+}
+
+// ── 入参的取值方式：type 不写（或写 'field'）= 由面板映射到字段，每行取那一格的文本（原来的方式）；
+// 另外三种不来自字段，在面板的函数卡片里直接填，整次运行每一行都是同一个值：
+//   select       单选：从 options 里选一个，run 拿到字符串
+//   multiSelect  多选：从 options 里勾若干个，run 拿到字符串数组（按 options 的顺序）
+//   text         文本：手动输入，run 拿到字符串
+// options：['a', 'b'] 或 [{ value: 'a', label: '显示名' }]（value 是传给 run 的值）；default：面板里的初始值（multiSelect 是数组）；
+// description：给填写的人看的说明，显示在输入行下面
+const INPUT_TYPES = ['field', 'select', 'multiSelect', 'text'];
+const isManualInput = (p) => !!p.type && p.type !== 'field';
+const optionList = (p) => (Array.isArray(p.options) ? p.options : [])
+  .filter(o => o != null && (typeof o !== 'object' || o.value != null))
+  .map(o => (typeof o === 'object' ? { value: String(o.value), label: String(o.label != null ? o.label : o.value) } : { value: String(o), label: String(o) }))
+  .filter(o => o.value !== '');
+
+function validInput(fnId, p) {
+  let why = '';
+  if (p.type !== undefined && INPUT_TYPES.indexOf(p.type) < 0) why = 'type 只能是 ' + INPUT_TYPES.join(' / ') + '，收到 ' + JSON.stringify(p.type);
+  else if ((p.type === 'select' || p.type === 'multiSelect') && !optionList(p).length) why = p.type + ' 必须写 options（非空数组）';
+  else if (p.type === 'select' && p.default !== undefined && !optionList(p).some(o => o.value === String(p.default))) why = 'default 不在 options 里';
+  else if (p.type === 'multiSelect' && p.default !== undefined && !(Array.isArray(p.default) && p.default.every(v => optionList(p).some(o => o.value === String(v))))) why = 'multiSelect 的 default 必须是 options 里的值组成的数组';
+  if (why) console.error('[functions] 函数 ' + fnId + ' 的入参 ' + p.name + ' 不合法：' + why);
+  return !why;
+}
+
+// 给面板的入参描述：字段入参保持原样（name、label），其他取值方式带上 type / options / default / description
+function publicInput(p) {
+  const out = { name: p.name, label: p.label };
+  if (typeof p.description === 'string' && p.description) out.description = p.description;
+  if (!isManualInput(p)) return out;
+  out.type = p.type;
+  if (p.type !== 'text') out.options = optionList(p);
+  if (p.default !== undefined) out.default = p.type === 'multiSelect' ? p.default.map(String) : String(p.default);
+  return out;
+}
+
+// 不来自字段的入参，请求里没带（比如 curl 直接调）时用声明的 default 补上；面板总会带上
+function fillDefaults(fn, rows) {
+  const defs = fn.inputs.filter(p => isManualInput(p) && p.default !== undefined).map(publicInput);
+  if (!defs.length) return rows;
+  return rows.map((r) => {
+    const row = Object.assign({}, r);
+    for (const p of defs) if (!(p.name in row)) row[p.name] = p.default;
+    return row;
+  });
 }
 
 // 函数每次 run 建议拿到的行数：函数用 batchSize 自己声明，没写就是默认值；限制在 1 ~ MAX_BATCH 之间。
@@ -306,12 +390,13 @@ async function runPython(file, mode, input, timeoutMs) {
 async function loadPyDef(full, fallbackId) {
   const meta = await runPython(full, 'meta', undefined, PY_META_TIMEOUT);
   return [{
-    id: meta.id || fallbackId, name: meta.name || meta.id || fallbackId, inputs: meta.inputs, outputs: meta.outputs, batchSize: meta.batchSize, async: meta.async === true,
+    id: meta.id || fallbackId, name: meta.name || meta.id || fallbackId, inputs: meta.inputs, outputs: meta.outputs, batchSize: meta.batchSize, async: meta.async === true, serializeCalls: meta.serializeCalls === true || meta.serializeRuns === true, // serializeRuns 是旧名字，仍然认
     // 与 JS 函数同形：返回与 rows 等长的数组，失败的行是 Error
     async run(rows) {
       const data = await runPython(full, 'run', { rows }, meta.async === true ? PY_ASYNC_TIMEOUT : PY_RUN_TIMEOUT);
       if (!data || !Array.isArray(data.results)) throw new Error('Python 返回格式不对');
-      return data.results.map(r => (r.ok ? r.outputs : new Error(r.error)));
+      const list = data.results.map(r => (r.ok ? r.outputs : new Error(r.error)));
+      return data.detail === undefined || data.detail === null ? list : { results: list, detail: data.detail }; // 带批级详情时用 { results, detail }，和 JS 函数同形
     },
   }].filter(validDef);
 }
@@ -383,7 +468,7 @@ async function loadFunctions() {
         } else {
           const mod = await import(pathToFileURL(full).href + '?v=' + sig);
           defs = (Array.isArray(mod.default) ? mod.default : [mod.default]).filter(Boolean);
-          defs.forEach(d => { if (!d.id) d.id = folderName; if (!d.name) d.name = d.id; }); // id、name 不写就用文件夹名
+          defs.forEach(d => { if (!d.id) d.id = folderName; if (!d.name) d.name = d.id; d.serializeCalls = d.serializeCalls === true || d.serializeRuns === true; }); // id、name 不写就用文件夹名；serializeRuns 是 serializeCalls 的旧名字，仍然认
           defs = defs.filter(validDef);
         }
         defs.forEach(d => { d.folder = categories; }); // 所在的分类目录（各级目录名，不含函数文件夹自己），面板按它分层
@@ -407,8 +492,8 @@ async function loadFunctions() {
 }
 
 // ── 批处理函数接口 ──────────────────────────────
-// GET  /api/functions          → [{ id, name, inputs, outputs, batchSize, async, path }]（path：函数所在分类目录的各级目录名，不含函数文件夹自己）
-// POST /api/functions/<id>/run  body { rows: [{...入参}] } → { results: [{ ok: true, outputs } | { ok: false, error }] }
+// GET  /api/functions          → [{ id, name, inputs, outputs, batchSize, async, serializeCalls, serializeRuns, path }]（serializeRuns 是 serializeCalls 的旧名字，值相同，留给旧版面板）（path：函数所在分类目录的各级目录名，不含函数文件夹自己）
+// POST /api/functions/<id>/run  body { rows: [{...入参}] } → { results: [{ ok: true, outputs } | { ok: false, error }], detail?: 这一批的整体详情 }（执行详情类型的出参就在 outputs 里）
 const MAX_BODY = 64 * 1024 * 1024;
 
 function sendJson(res, status, data) {
@@ -434,7 +519,7 @@ function readJson(req) {
 async function handleFunctions(req, res, path) {
   if (path === '/api/functions' && req.method === 'GET') {
     const FUNCTIONS = await loadFunctions();
-    return sendJson(res, 200, FUNCTIONS.map((d) => ({ id: d.id, name: d.name, inputs: d.inputs, outputs: d.outputs || [], batchSize: batchSizeOf(d), async: d.async === true, path: d.folder || [] })));
+    return sendJson(res, 200, FUNCTIONS.map((d) => ({ id: d.id, name: d.name, inputs: d.inputs.map(publicInput), outputs: (d.outputs || []).map(o => (o.type === 'message' ? { ...o, type: 'detail' } : o)), batchSize: batchSizeOf(d), async: d.async === true, serializeCalls: d.serializeCalls === true, serializeRuns: d.serializeCalls === true, path: d.folder || [] })));
   }
   const m = path.match(/^\/api\/functions\/([^/]+)\/run$/);
   if (m && req.method === 'POST') {
@@ -443,15 +528,27 @@ async function handleFunctions(req, res, path) {
     let body;
     try { body = await readJson(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
     if (!body || !Array.isArray(body.rows)) return sendJson(res, 400, { error: 'rows is required' });
-    // 批量计算：函数一次拿到全部 rows，返回与 rows 等长的数组；Error 项表示该行失败
-    let outs;
-    try { outs = await fn.run(body.rows.map(r => r || {})); }
-    catch (e) { return sendJson(res, 500, { error: e instanceof Error ? e.message : String(e) }); }
-    if (!Array.isArray(outs) || outs.length !== body.rows.length) {
-      return sendJson(res, 500, { error: '函数 ' + fn.id + ' 必须返回与 rows 等长的数组（收到 ' + body.rows.length + ' 行，返回 ' + (Array.isArray(outs) ? outs.length : typeof outs) + '）' });
+    // 声明了 serializeCalls: true 的函数串行执行：同一时间最多一次 run 在跑，不管调用来自哪个运行，按到达先后排队（见 locks.mjs）。
+    // 轮不到时最多等 LOCK_WAIT_MS 就回 202（前端自动重试并提示“排队中”），免得请求挂着被网关掐断
+    let held = false;
+    if (fn.serializeCalls === true) {
+      // 前端第一次请求只等一小会儿（body.wait），好让排队的人马上看到“正在排队”的提示；之后的重试才等满 LOCK_WAIT_MS
+      const askWait = Number(body.wait);
+      const ticket = locks.enter(fn.id, askWait > 0 ? Math.min(askWait, LOCK_WAIT_MS) : LOCK_WAIT_MS);
+      res.on('close', () => { if (!res.writableEnded) ticket.cancel(); }); // 排队时客户端断开了：退出排队
+      const got = await ticket.promise;
+      if (got === 'timeout') return sendJson(res, 202, { waiting: true });
+      if (got !== 'ok') return;
+      held = true;
     }
-    const results = outs.map(o => (o instanceof Error ? { ok: false, error: o.message } : { ok: true, outputs: o || {} }));
-    return sendJson(res, 200, { results });
+    // 批量计算：函数一次拿到全部 rows，返回与 rows 等长的数组；Error 项表示该行失败
+    let shaped;
+    try { shaped = shapeRun(fn, await fn.run(fillDefaults(fn, body.rows.map(r => r || {}))), body.rows.length); }
+    catch (e) { return sendJson(res, 500, { error: e instanceof Error ? e.message : String(e) }); }
+    finally {
+      if (held) locks.leave(fn.id);
+    }
+    return sendJson(res, 200, shaped); // { results, detail? }
   }
   // 异步函数：下发一批行，立刻返回任务 ID，函数在后台执行（任务和结果落盘，见 jobs.mjs）。只有声明了 async: true 的函数能这样用
   const jm = path.match(/^\/api\/functions\/([^/]+)\/jobs$/);
@@ -463,13 +560,9 @@ async function handleFunctions(req, res, path) {
     try { body = await readJson(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
     if (!body || !Array.isArray(body.rows)) return sendJson(res, 400, { error: 'rows is required' });
     if (typeof body.scope !== 'string' || !body.scope || body.scope.length > 200) return sendJson(res, 400, { error: 'scope is required' });
-    const rows = body.rows.map(r => r || {});
-    const job = jobs.create({ fnId: fn.id, fnName: fn.name, scope: body.scope, rows, meta: body.meta }, async (input) => {
-      const outs = await fn.run(input);
-      if (!Array.isArray(outs) || outs.length !== input.length) {
-        throw new Error('函数 ' + fn.id + ' 必须返回与 rows 等长的数组（收到 ' + input.length + ' 行，返回 ' + (Array.isArray(outs) ? outs.length : typeof outs) + '）');
-      }
-      return outs.map(o => (o instanceof Error ? { ok: false, error: o.message } : { ok: true, outputs: o || {} }));
+    const rows = fillDefaults(fn, body.rows.map(r => r || {}));
+    const job = jobs.create({ fnId: fn.id, fnName: fn.name, scope: body.scope, rows, meta: body.meta, locked: fn.serializeCalls === true }, async (input) => {
+      return shapeRun(fn, await fn.run(input), input.length);
     });
     return sendJson(res, 200, { job });
   }
@@ -482,7 +575,9 @@ async function handleFunctions(req, res, path) {
 // POST /api/jobs/<id>/ack    { token, result }   回写完成，任务转为已回写
 // POST /api/jobs/<id>/release { token }  回写没成功，放开认领
 // POST /api/jobs/<id>/cancel { scope }   取消
-const jobs = createJobStore(process.env.JOBS_DIR || join(__dirname, 'data', 'jobs'));
+const LOCK_WAIT_MS = Number(process.env.LOCK_WAIT_MS) || 25000; // 串行函数的同步调用排队等锁，一次请求最多等多久（到点回 202，前端重试）
+const locks = createFnLocks();
+const jobs = createJobStore(process.env.JOBS_DIR || join(__dirname, 'data', 'jobs'), locks);
 
 async function handleJobs(req, res, path) {
   if (path === '/api/jobs' && req.method === 'GET') {

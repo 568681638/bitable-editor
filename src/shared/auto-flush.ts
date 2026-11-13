@@ -25,12 +25,20 @@ export interface AutoFlushHost {
   writeRecords(items: { recordId: string; fields: Record<string, any> }[]): Promise<void>;
 }
 
-interface ParamMeta { name: string; label?: string; requires?: string[] }
-interface FnMeta { id: string; name: string; inputs: ParamMeta[]; outputs: ParamMeta[]; batchSize?: number; async?: boolean /* 异步函数：下发后由服务端后台执行，完成后插件取回结果写回 */; path?: string[] /* 函数所在目录的各级目录名（后端 functions/ 的目录结构） */ }
+interface ParamMeta {
+  name: string; label?: string; requires?: string[];
+  // 以下只有入参有：type 不写 = 来自字段（每行取那一格的文本）；select / multiSelect / text 不来自字段，在卡片里直接填，整次运行每行都是同一个值
+  // 出参的 type 只有 'detail'（执行详情，旧名 message）：不写进字段，面板收集并展示；loadFunctions 会把它从 outputs 里拆出来放进 FnMeta.noteOut
+  type?: 'select' | 'multiSelect' | 'text' | 'detail' | 'message'; options?: { value: string; label: string }[]; default?: string | string[]; description?: string;
+}
+interface FnMeta { id: string; name: string; inputs: ParamMeta[]; outputs: ParamMeta[]; noteOut?: string /* 执行详情出参的名字（type: 'message'）；没有声明则为空 */; batchSize?: number; async?: boolean /* 异步函数：下发后由服务端后台执行，完成后插件取回结果写回 */; serializeCalls?: boolean /* 串行执行：同一时间最多一个 run 在跑，按到达先后排队 */; serializeRuns?: boolean /* serializeCalls 的旧名字（旧版服务端只返回它） */; path?: string[] /* 函数所在目录的各级目录名（后端 functions/ 的目录结构） */ }
 
 type Cond = { kind: 'cond'; fieldId: string; op: string; value: string; sep?: string; customSep?: string };
 type Group = { kind: 'group'; logic: 'and' | 'or'; negate: boolean; children: (Cond | Group)[] };
-type Mapping = { param: string; fieldId: string; fn?: string /* 输入映射属于哪个函数（输出行没有）；旧版输入没有这一项，见 migrateLegacyInputs */ };
+type Mapping = {
+  param: string; fieldId: string; fn?: string /* 输入映射属于哪个函数（输出行没有）；旧版输入没有这一项，见 migrateLegacyInputs */;
+  value?: string | string[] /* 不来自字段的入参（select / multiSelect / text）在卡片里填的值，这时 fieldId 为空 */;
+};
 interface Config { filter: Group; inputs: Mapping[]; outputs: Mapping[] }
 
 const OPS: [string, string][] = [
@@ -42,12 +50,19 @@ const OPS: [string, string][] = [
 const NO_VALUE_OPS = new Set(['empty', 'notEmpty']);
 const LIST_OPS = new Set(['in', 'notIn']);
 // 包含于/不包含于的拆分符，默认英文逗号
-const SEPS: [string, string][] = [[',', '英文逗号 ,'], ['\n', '换行']];
+const SEPS: [string, string][] = [[',', '英文逗号 ,'], ['\n', '换行 ↵']]; // 名字后面的符号和下拉框上显示的一致（见 sepLabel）
 const DEFAULT_SEP = ',';
 const CUSTOM_SEP = '__custom__'; // sep 取这个值时，用 customSep 作为拆分符
 const WRITE_BATCH = 100; // 写回表格每次提交的记录数（不足 100 也算一批），和函数的批大小无关
 const DEFAULT_BATCH = 100; // 函数没有声明 batchSize 时，每次调用传给它的行数
 type FnResult = { ok: boolean; outputs?: Record<string, any>; error?: string };
+// 历史记录里的两种记录（都只存在面板本地，按表格存进 localStorage；异步任务本身在服务端，见下面的 JobSummary）：
+// CallRec：同步函数的一次调用（一批）；ExecNote：这次调用（或异步任务回写时）收集到的执行详情——batch 是这一批的整体说明，rows 是各行的说明（index 是记录在视图里的序号）
+// runId / runAt：属于哪次点「运行」（批次）；part / parts：函数在这个批次里的第几次调用（共几次）
+interface CallRec { uid: number; runId: string; runAt: number; fnId: string; fnName: string; part: number; parts: number; from: number; to: number; time: number; ok: number; failed: number; ms: number; error?: string }
+interface ExecNote { uid: number; runId: string; runAt: number; fnId: string; part: number; parts: number; time: number; fnName: string; from: number; to: number; batch?: string; rows: { index: number; text: string }[]; more?: number /* 超出保存上限、没存下的行数 */; async: boolean }
+const NOTE_ROWS_MAX = 200; // 一条详情最多保存多少行的详情
+const NOTE_ROW_CHARS = 2000; // 保存到本地时，每行详情最多多少字
 
 // 异步函数的任务（服务端见 release/server/jobs.mjs）。下发时把回写需要的信息放进 meta，之后不管页面刷没刷新都能照着写回
 // 批次：一次点「运行」是一个批次，被函数的 batchSize 拆成多个任务；同一批次的任务共用 id，part / parts 是第几个 / 共几个，from–to 是对应批次里的第几到第几条
@@ -59,8 +74,9 @@ interface JobSummary {
 }
 interface JobMeta { recordIds: string[]; indexes: number[]; outs: { name: string; fieldId: string }[]; run?: RunInfo }
 interface AsyncFail { jobId: string; runId?: string; fnId: string; index: number; recordId: string; fnName: string; error: string; time: number }
+// 声明了 serializeCalls 的函数的标记：同一时间只执行一批
+const SERIAL_TAG = '<span class="af-serial-tag" title="串行函数：同一时间只执行一批（一次函数调用），不管来自哪次运行、哪个人。多个人 / 多次同时运行这个函数时，各批按到达先后逐个执行，轮不到的在状态栏提示排队">串行</span>';
 const SS_MIN = 7; // 下拉的选项多于这个数，才换成带搜索框的弹层（选项少的用原生下拉更快）
-const PENDING_SHOWN = 6; // 弹层里每个批次的每个函数最多列几个未完成的任务
 const RUNS_SHOWN = 4; // 弹层里默认显示最近几个批次
 const ASYNC_FAIL_LIMIT = 2000; // 异步任务的失败行最多保留多少条（存在浏览器本地）
 const JOB_POLL_ACTIVE = 3000; // 有任务在跑 / 等回写时的轮询间隔
@@ -70,11 +86,12 @@ const JOB_RETRY_BACKOFF = 60000; // 回写失败后多久再试
 const FN_PREFIX = 'fn:';
 const ALL_PREFIX = 'all:'; // 选择器里函数右侧“全选”图标的值（只在点选时用，不会存进配置）
 const batchOf = (fn: FnMeta) => (fn.batchSize && fn.batchSize > 0 ? fn.batchSize : DEFAULT_BATCH);
+const isSerial = (fn: FnMeta) => !!(fn.serializeCalls ?? fn.serializeRuns); // 旧版服务端只返回 serializeRuns
 
 // 历史记录（类比浏览历史）：每次筛选 / 预览 / 导出 / 运行都记一条，连同当时整套配置（筛选 + 输入 + 输出），之后可以一键恢复
 type HistoryKind = 'filter' | 'preview' | 'stats' | 'export' | 'run';
-interface HistoryEntry { id: string; time: number; kind: HistoryKind; name?: string; config: Config; matched: number; total: number; result?: string; ok?: boolean }
-const HISTORY_LIMIT = 50; // 超出时先丢最旧的未命名记录，命名过的优先保留
+interface HistoryEntry { id: string; time: number; kind: HistoryKind; runId?: string /* 运行记录对应的批次 ID（函数块的历史靠它找到当时的配置） */; name?: string; config: Config; matched: number; total: number; result?: string; ok?: boolean }
+const HISTORY_LIMIT = 50; // 筛选类记录（筛选 / 预览 / 统计 / 导出）和运行记录各自最多这么多条；超出时先丢最旧的未命名记录，命名过的优先保留
 const HISTORY_NAME_MAX = 40;
 const HISTORY_KINDS: Record<HistoryKind, string> = { filter: '筛选', preview: '预览', stats: '统计', export: '导出 CSV', run: '运行' };
 
@@ -185,15 +202,39 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
   let jobTimer: ReturnType<typeof setTimeout> | undefined;
   let jobBusy = false; // 正在轮询 / 回写
   let jobNote = ''; // 最近一次轮询或回写出错的原因
-  let jobPopOpen = false; // 「函数」块右上角的任务标签是否展开着明细
+  // 「有新结果」的提示点：历史按钮和每个批次块右上角各一个，颜色是对应的执行结果（失败红 / 执行中橙 / 完成绿）；出现新的活动才亮，点开（按钮 / 批次）就消失
+  const NOTE_SEEN_KEY = () => `annotator-auto-flush-hist-seen:${host.getTableId()}`;
+  const RUN_SEEN_KEY = () => `annotator-auto-flush-run-seen:${host.getTableId()}`;
+  const readSeen = (): Record<string, number> => { try { return JSON.parse(localStorage.getItem(RUN_SEEN_KEY()) || '{}') || {}; } catch { return {}; } };
+  function markRunSeen(runKey: string) {
+    const m = readSeen(); m[runKey] = Date.now();
+    const keys = Object.keys(m); if (keys.length > 200) keys.sort((a, b) => m[a] - m[b]).slice(0, keys.length - 200).forEach(k => delete m[k]);
+    try { localStorage.setItem(RUN_SEEN_KEY(), JSON.stringify(m)); } catch { /* ignore */ }
+  }
+  const jobTime = (j: JobSummary) => Math.max(j.createdAt || 0, j.startedAt || 0, j.finishedAt || 0, j.appliedAt || 0);
+  const dotState = (failed: boolean, busy: boolean) => (failed ? (busy ? 'bad live' : 'bad') : busy ? 'busy' : 'ok');
+  let histQuery = ''; // 历史窗口里的搜索词
+  const histSel = new Set<string>(); // 历史窗口里勾选的批次（runId）
+  let notePop: HTMLElement | null = null; // 执行详情悬浮窗，打开着才有
+  let notePopList: ExecNote[] = []; // 悬浮窗里正在显示的详情
   let jobShowAllRuns = false; // 弹层里是否显示全部批次（默认只显示最近几个）
-  const doneOpenKeys = new Set<string>(); // 展开着的“已写回的任务”折叠块（key = 批次|函数）
+  const foldOpen = new Map<string, boolean>(); // 历史里用户手动展开 / 折叠过的块（批次 r|<批次>、函数 f|<批次>|<函数>）；没动过的按默认：有没完成的任务或失败就展开
+  let foldKeys: { key: string; def: boolean }[] = []; // 最近一次渲染出来的全部可折叠块，「全部展开 / 折叠」用
+  let jobWin: HTMLElement | null = null; // 历史窗口，打开着才有
   let jobApplying = ''; // 正在回写的任务 ID
   const jobRetryAt = new Map<string, number>(); // 任务 ID → 回写失败后最早什么时候再试
   let asyncFails: AsyncFail[] = [];
   const afailOpenKeys = new Set<string>(); // 展开着的异步失败明细（key = failKey：函数 id）
   let statusText = '';
   let statusKind: '' | 'error' | 'ok' = '';
+  // 执行详情：函数声明了 type: 'message' 的出参，或 run 返回了批级 message 时收集到这里（只在内存里，刷新页面就没了）
+  const noteLog: ExecNote[] = [];
+  const callLog: CallRec[] = []; // 同步函数的调用记录
+  let histTable = ''; // callLog / noteLog 当前对应哪张表
+  let histUid = 0;
+  let runNames: Record<string, string> = {}; // 批次（runId）的名字：命名过的批次超出保留上限时优先保留
+  let renamingRun = false; // 正在给批次改名：此时历史窗口列表不重画，免得把输入框刷掉
+  const hiddenJobs = new Set<string>(); // 在历史里点了「删除」的已写回任务（任务本身在服务端，这里只是不再显示）
 
   // ── 配置按表格存取 ──────────────────────────────
   const storeKey = () => `annotator-auto-flush:${host.getTableId()}`;
@@ -223,10 +264,28 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     } catch { return []; }
   }
   function writeHistory(list: HistoryEntry[]) {
+    // 运行记录和筛选类记录分开计数，互不挤占
     let kept = list;
-    for (let i = kept.length - 1; i >= 0 && kept.length > HISTORY_LIMIT; i--) if (!kept[i].name) kept = kept.filter((_, k) => k !== i);
-    try { localStorage.setItem(historyKey(), JSON.stringify(kept.slice(0, HISTORY_LIMIT))); } catch { /* ignore */ }
+    for (const grp of [true, false]) {
+      const inGrp = (e: HistoryEntry) => (e.kind === 'run') === grp;
+      for (let i = kept.length - 1; i >= 0 && kept.filter(inGrp).length > HISTORY_LIMIT; i--) if (inGrp(kept[i]) && !kept[i].name) kept = kept.filter((_, k) => k !== i);
+      let n = 0;
+      kept = kept.filter(e => !inGrp(e) || ++n <= HISTORY_LIMIT);
+    }
+    try { localStorage.setItem(historyKey(), JSON.stringify(kept)); } catch { /* ignore */ }
   }
+  // 每个批次运行时的配置单独存一份（不依赖运行历史：历史条目被删了、挤掉了，函数块的历史照样能复现）
+  const runCfgKey = () => `annotator-auto-flush-runcfg:${host.getTableId()}`;
+  function readRunCfgs(): Record<string, { at: number; config: Config }> { try { return JSON.parse(localStorage.getItem(runCfgKey()) || '{}') || {}; } catch { return {}; } }
+  function saveRunCfg(runId: string, at: number) {
+    const m = readRunCfgs(); m[runId] = { at, config: cloneConfig() };
+    loadHist();
+    const keys = Object.keys(m).sort((a, b) => Number(!!runNames[b]) - Number(!!runNames[a]) || m[b].at - m[a].at);
+    keys.slice(HISTORY_LIMIT * 2).forEach(k => delete m[k]);
+    try { localStorage.setItem(runCfgKey(), JSON.stringify(m)); } catch { /* ignore */ }
+  }
+  const readSeenAt = (runId: string) => readRunCfgs()[runId]?.at ?? 0;
+  const runConfigOf = (runId: string): Config | null => readRunCfgs()[runId]?.config ?? readHistory().find(e => e.runId === runId)?.config ?? null;
   const cloneConfig = (): Config => JSON.parse(JSON.stringify(config));
 
   // 连续两次用同一套配置做同一件事（筛选 / 预览 / 导出）只留最新一条；运行每次都单独记
@@ -255,6 +314,10 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       const res = await fetch(apiUrl('api/functions'));
       if (!res.ok) throw new Error(`后端服务返回错误：${await serverMessage(res)}`);
       fns = await res.json();
+      for (const f of fns) { // 执行详情出参不是写进字段的值：从 outputs 里拆出来，其余逻辑（选输出、必需入参）不用知道它
+        f.noteOut = f.outputs.find(o => o.type === 'detail' || o.type === 'message')?.name;
+        f.outputs = f.outputs.filter(o => o.type !== 'detail' && o.type !== 'message');
+      }
       fnState = 'ready';
     } catch (e) {
       if (silent) return; // 静默刷新失败就沿用旧列表
@@ -284,6 +347,23 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     return new Set(rows.flatMap(o => findOutput(o.param)!.out.requires || fn.inputs.map(i => i.name)));
   }
   const inputField = (fnId: string, param: string) => config.inputs.find(i => i.fn === fnId && i.param === param)?.fieldId ?? '';
+  // 入参不来自字段（select / multiSelect / text）：值在卡片里直接填，整次运行每一行都传同一个值
+  const isManual = (inp?: ParamMeta) => !!inp?.type;
+  // 新建一行输入：字段入参的字段留空等用户选；其他取值方式先填上函数声明的默认值
+  function newInput(fn: FnMeta, inp: ParamMeta): Mapping {
+    if (!isManual(inp)) return { fn: fn.id, param: inp.name, fieldId: '' };
+    const d = inp.default;
+    return { fn: fn.id, param: inp.name, fieldId: '', value: inp.type === 'multiSelect' ? (Array.isArray(d) ? [...d] : []) : typeof d === 'string' ? d : '' };
+  }
+  // 填写的值有什么问题（没填、已经不是可选值），没问题返回空串
+  function manualProblem(inp: ParamMeta, v: Mapping['value']): string {
+    const allowed = new Set((inp.options || []).map(o => o.value));
+    if (inp.type === 'text') return typeof v === 'string' && v.trim() ? '' : '还没有填写';
+    if (inp.type === 'select') return typeof v !== 'string' || !v ? '还没有选择值' : allowed.has(v) ? '' : `的值“${v}”已不是可选值，请重新选择`;
+    if (!Array.isArray(v) || !v.length) return '至少要勾选一个值';
+    const stale = v.filter(x => !allowed.has(x));
+    return stale.length ? `里有已不是可选值的项：${stale.join('、')}，请取消勾选` : '';
+  }
   // 旧版输入是全局的（同名入参只映射一次，没有 fn）：函数列表加载好后，拆成各函数各自的映射
   function migrateLegacyInputs(c: Config): boolean {
     const legacy = c.inputs.filter(i => !i.fn);
@@ -294,6 +374,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     for (const fn of fns) {
       if (!used.has(fn.id)) continue;
       for (const inp of fn.inputs) {
+        if (isManual(inp)) continue; // 旧版只有字段映射；现在不来自字段的入参由 ensureAllInputs 按默认值补
         const old = legacy.find(l => l.param === inp.name && l.fieldId);
         if (old) migrated.push({ fn: fn.id, param: inp.name, fieldId: old.fieldId });
       }
@@ -301,15 +382,17 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     c.inputs = [...c.inputs.filter(i => i.fn), ...migrated];
     return true;
   }
-  // 新加函数时：必需的入参里，在别的函数里配过同名参数的，直接沿用那个字段（各函数的映射仍然各自独立，之后可以单独改）
+  // 新加函数时：必需的入参里，在别的函数里配过同名参数的，直接沿用那个字段（各函数的映射仍然各自独立，之后可以单独改）。
+  // 不来自字段的入参不沿用，由 ensureAllInputs 填上这个函数自己声明的默认值
   function prefillInputs(fn: FnMeta) {
     for (const name of groupRequired(fn)) {
+      if (isManual(fn.inputs.find(i => i.name === name))) continue;
       if (config.inputs.some(i => i.fn === fn.id && i.param === name)) continue;
       const other = config.inputs.find(i => i.fn !== fn.id && i.param === name && i.fieldId);
       if (other) config.inputs.push({ fn: fn.id, param: name, fieldId: other.fieldId });
     }
   }
-  // 每个用到的函数，把它必需的入参自动补成输入行（字段留空等用户选）；输入行本身和手动加的一样可以改参数、改字段
+  // 每个用到的函数，把它必需的入参自动补成输入行（字段留空等用户选，不来自字段的填上默认值）；输入行本身和手动加的一样可以改参数、改字段
   function ensureAllInputs(): boolean {
     let changed = false;
     const done = new Set<string>();
@@ -318,7 +401,8 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       if (!fn || done.has(fn.id)) continue;
       done.add(fn.id);
       for (const name of groupRequired(fn)) {
-        if (!config.inputs.some(i => i.fn === fn.id && i.param === name)) { config.inputs.push({ fn: fn.id, param: name, fieldId: '' }); changed = true; }
+        const inp = fn.inputs.find(i => i.name === name);
+        if (inp && !config.inputs.some(i => i.fn === fn.id && i.param === name)) { config.inputs.push(newInput(fn, inp)); changed = true; }
       }
     }
     return changed;
@@ -338,19 +422,32 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       (stale ? `<option value="${esc(selected)}" selected>（字段已不存在）</option>` : '') + body;
   }
 
+  // 包含于 / 不包含于的拆分符：放在匹配条件和值之间的小下拉，点开是单选列表，最后一项“自定义”带输入框
+  // 下拉框上直接显示拆分符本身：换行显示成 ↵，空格 / 制表符换成看得见的符号；自定义还没填时显示 ?
+  function sepLabel(node: Cond): string {
+    const v = node.sep === CUSTOM_SEP ? node.customSep ?? '' : node.sep || DEFAULT_SEP;
+    return v ? v.replace(/\r?\n/g, '↵').replace(/\t/g, '⇥').replace(/ /g, '␣') : '?';
+  }
+  function sepPickerHtml(node: Cond, p: string): string {
+    const open = sepOpen === p;
+    const cur = node.sep || DEFAULT_SEP;
+    const radio = (v: string, label: string, extra = '') => `<label class="af-ss-item af-in-chk"><input type="radio" name="sep-${p}" data-act="cond-sep" value="${esc(v)}"${v === cur ? ' checked' : ''} />${label}${extra}</label>`;
+    return `<span class="af-ms af-sep${open ? ' open' : ''}"><button type="button" class="af-ms-btn af-sep-btn" data-act="sep-toggle" title="拆分符：值按它拆成多个，逐个比较（当前：${esc(sepLabel(node) === '?' ? '自定义，还没填' : sepLabel(node))}）"><span class="af-ms-text">${esc(sepLabel(node))}</span><span class="af-ms-caret">▾</span></button>` +
+      (open ? `<div class="af-ss-pop af-ms-pop"><div class="af-ss-list">${SEPS.map(([v, l]) => radio(v, esc(l))).join('')}` +
+        radio(CUSTOM_SEP, '自定义', `<input type="text" class="af-sep-custom" data-act="cond-sep-custom" value="${esc(node.customSep ?? '')}" placeholder="如 、" />`) + '</div></div>' : '') + '</span>';
+  }
+
   function renderNode(node: Cond | Group, path: number[]): string {
     const p = path.join('.');
     if (node.kind === 'cond') {
       return `<div class="af-cond" data-path="${p}">
         <select data-act="cond-field" data-ss>${fieldOptions(node.fieldId)}</select>
         <select data-act="cond-op">${OPS.map(([v, l]) => `<option value="${v}"${v === node.op ? ' selected' : ''}>${l}</option>`).join('')}</select>
+        ${LIST_OPS.has(node.op) ? sepPickerHtml(node, p) : ''}
         ${NO_VALUE_OPS.has(node.op) ? ''
           : LIST_OPS.has(node.op) ? `<textarea data-act="cond-value" rows="1" placeholder="多个值用所选拆分符分隔">${esc(node.value)}</textarea>`
           : `<input data-act="cond-value" type="text" value="${esc(node.value)}" placeholder="值" />`}
         <button class="af-x" data-act="del" title="删除条件">×</button>
-        ${LIST_OPS.has(node.op) ? `<div class="af-seps"><span>拆分符</span>${SEPS.map(([v, l]) =>
-          `<label><input type="radio" name="sep-${p}" data-act="cond-sep" value="${esc(v)}"${v === (node.sep || DEFAULT_SEP) ? ' checked' : ''} />${l}</label>`).join('')}
-          <label><input type="radio" name="sep-${p}" data-act="cond-sep" value="${CUSTOM_SEP}"${node.sep === CUSTOM_SEP ? ' checked' : ''} />自定义<input type="text" class="af-sep-custom" data-act="cond-sep-custom" value="${esc(node.customSep ?? '')}" placeholder="如 、" /></label></div>` : ''}
       </div>`;
     }
     return `<div class="af-group" data-path="${p}">
@@ -376,6 +473,8 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
   let pickerQuery = ''; // 选择器里的搜索词（选了一项后面板会重绘，搜索词要带过去）
   let pickerScope: string | null = null; // 展开中的选择器：'' = 整块底部的“＋函数”；函数 id = 该函数分组里的“＋ 输出参数”
   const pickerOpen = new Set<string>(); // 展开的目录 / 函数节点
+  let msOpen: number | null = null; // 展开着勾选列表的多选输入行（config.inputs 的下标）
+  let sepOpen: string | null = null; // 展开着拆分符列表的筛选条件（条件的 data-path）
 
   const fnOfKey = (key: string): FnMeta | null => findCall(key) ?? findOutput(key)?.fn ?? null;
   // 函数右侧的两个图标按钮：＋ / －（把这个函数加进来——没有输出参数的分组就是只调用；加了之后变成 －，点一下把它连同输出参数移除）、
@@ -418,7 +517,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     const head = (key: string, text: string, tools = '', tag = '') => `<div class="af-tn-row"><div class="af-tn-head" data-tog="${esc(key)}"><span class="af-tn-arrow"></span><span class="af-tn-name">${esc(text)}</span>${tag}</div>${tools}</div>`;
     const fnNode = (fn: FnMeta) => {
       const key = `f:${fn.id}`;
-      return `<div class="af-tn af-tn-fn${open(key)}">${head(key, fn.name, fnTools(fn, present, true), fn.async ? '<span class="af-async-tag" title="异步函数：下发后在服务端后台执行，完成后自动写回">异步</span>' : '')}<div class="af-tn-kids">${renderOutputList(fn, present)}</div></div>`;
+      return `<div class="af-tn af-tn-fn${open(key)}">${head(key, fn.name, fnTools(fn, present, true), (isSerial(fn) ? SERIAL_TAG : '') + (fn.async ? '<span class="af-async-tag" title="异步函数：下发后在服务端后台执行，完成后自动写回">异步</span>' : ''))}<div class="af-tn-kids">${renderOutputList(fn, present)}</div></div>`;
     };
     const walk = (n: TreeNode, prefix: string): string =>
       [...n.folders.values()].sort((x, y) => x.name.localeCompare(y.name, 'zh')).map(f => {
@@ -482,22 +581,55 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     }
   }
 
-  // 卡片里的输入：这个函数的每个入参映射到哪个字段（只属于这个函数）；当前输出参数不需要的入参标“可选”
+  // 输入行右侧（箭头都是 ←）：字段入参是字段下拉；不来自字段的按声明是：单选下拉 / 多选下拉（点开是勾选列表）/ 文本框
+  function inputValueHtml(inp: ParamMeta | undefined, m: Mapping, idx: number): string {
+    if (!inp || !isManual(inp)) return `<span class="af-arrow">←</span><select data-act="in-field" data-ss>${fieldOptions(m.fieldId)}</select>`;
+    const arrow = '<span class="af-arrow" title="这个入参不来自字段：在这里填的值会原样传给每一行">←</span>';
+    if (inp.type === 'text') return `${arrow}<input type="text" class="af-in-text" data-act="in-text" value="${esc(typeof m.value === 'string' ? m.value : '')}" placeholder="输入值" />`;
+    const opts = inp.options || [];
+    if (inp.type === 'select') {
+      const cur = typeof m.value === 'string' ? m.value : '';
+      const stale = cur && !opts.some(o => o.value === cur);
+      return `${arrow}<select data-act="in-value" data-ss><option value="">选择值</option>` +
+        (stale ? `<option value="${esc(cur)}" selected>${esc(cur)}（已不是可选值）</option>` : '') +
+        opts.map(o => `<option value="${esc(o.value)}"${o.value === cur ? ' selected' : ''}>${esc(o.label)}</option>`).join('') + '</select>';
+    }
+    const cur = Array.isArray(m.value) ? m.value : [];
+    const stale = cur.filter(v => !opts.some(o => o.value === v)); // 函数改了可选值：旧值还勾着，让用户自己取消
+    const box = (value: string, label: string, on: boolean, cls = '') => `<label class="af-ss-item af-in-chk${cls}"><input type="checkbox" data-act="in-multi" value="${esc(value)}"${on ? ' checked' : ''} />${esc(label)}</label>`;
+    const open = msOpen === idx;
+    return `${arrow}<span class="af-ms${open ? ' open' : ''}"><button type="button" class="af-ms-btn" data-act="ms-toggle" data-in="${idx}">${msSummary(inp, cur)}<span class="af-ms-caret">▾</span></button>` +
+      (open ? `<div class="af-ss-pop af-ms-pop">${opts.length > SS_MIN ? '<input type="text" class="af-ss-input af-ms-q" placeholder="搜索…" />' : ''}<div class="af-ss-list">` +
+        opts.map(o => box(o.value, o.label, cur.includes(o.value))).join('') + stale.map(v => box(v, `${v}（已不是可选值）`, true, ' stale')).join('') + '</div></div>' : '') + '</span>';
+  }
+
+  // 多选下拉框上显示的内容：已选的值（按可选值的顺序，不认识的旧值原样显示），没选显示占位提示
+  function msSummary(inp: ParamMeta, values: string[]): string {
+    const labelOf = new Map((inp.options || []).map(o => [o.value, o.label]));
+    const text = values.map(v => labelOf.get(v) ?? v).join('、');
+    return text ? `<span class="af-ms-text" title="${esc(text)}">${esc(text)}</span>` : '<span class="af-ms-text af-ms-ph">选择值（可多选）</span>';
+  }
+
+  // 卡片里的输入：这个函数的每个入参映射到哪个字段 / 填什么值（只属于这个函数）；当前输出参数不需要的入参标“可选”
   function renderCardInputs(fn: FnMeta): string {
     if (!fn.inputs.length) return '';
     const req = groupRequired(fn);
     const mine = config.inputs.map((m, i) => ({ m, i })).filter(x => x.m.fn === fn.id);
     const used = new Set(mine.map(x => x.m.param));
-    const rows = mine.map(({ m, i }) => `<div class="af-row" data-in="${i}">
-      <select data-act="in-param" class="af-fg-param" title="这个函数的入参">
-        <option value="">选择参数</option>
-        ${fn.inputs.map(inp => `<option value="${esc(inp.name)}"${inp.name === m.param ? ' selected' : ''}${inp.name !== m.param && used.has(inp.name) ? ' disabled' : ''}>${esc(inp.label || inp.name)}（${esc(inp.name)}）</option>`).join('')}
+    const rows = mine.map(({ m, i }) => {
+      const inp = fn.inputs.find(x => x.name === m.param);
+      const locked = req.has(m.param); // 必需的入参：下拉可以展开看，但其他选项都置灰，不能换成别的参数
+      return `<div class="af-row" data-in="${i}">
+      <select data-act="in-param" class="af-fg-param" title="${esc((inp?.description ? inp.description + '\n' : '') + (locked ? '必需的入参，不能换成别的参数' : '这个函数的入参'))}">
+        <option value=""${locked ? ' disabled' : ''}>选择参数</option>
+        ${fn.inputs.map(x => `<option value="${esc(x.name)}"${x.name === m.param ? ' selected' : ''}${x.name !== m.param && (locked || used.has(x.name)) ? ' disabled' : ''}>${esc(x.label || x.name)}（${esc(x.name)}）</option>`).join('')}
       </select>
-      <span class="af-arrow">←</span>
-      <select data-act="in-field" data-ss>${fieldOptions(m.fieldId)}</select>
-      ${req.has(m.param) ? '<span class="af-lock" title="必需：这个函数要运行就必须映射这个入参。选了输出参数时，是这些输出参数需要的入参；没选输出参数时，函数的全部入参都必需">必需</span>' : `<button class="af-x" data-act="del-in" data-in="${i}" title="删除这个输入">×</button>`}
-    </div>`).join('');
-    return rows ? `<div class="af-iog in" title="输入：入参 ← 字段"><span class="af-iog-label">输入</span><div class="af-iog-body">${rows}</div></div>` : '';
+      ${inputValueHtml(inp, m, i)}
+      ${req.has(m.param) ? '<span class="af-lock" title="必需：这个函数要运行就必须提供这个入参。选了输出参数时，是这些输出参数需要的入参；没选输出参数时，函数的全部入参都必需">必需</span>' : `<button class="af-x" data-act="del-in" data-in="${i}" title="删除这个输入">×</button>`}
+      ${inp?.description ? `<div class="af-in-desc">${esc(inp.description)}</div>` : ''}
+    </div>`;
+    }).join('');
+    return rows ? `<div class="af-iog in" title="输入：入参 ← 字段，或 入参 ← 填写的值"><span class="af-iog-label">输入</span><div class="af-iog-body">${rows}</div></div>` : '';
   }
 
   // 输出字段是可选的：选了，函数返回的结果就顺带写进这个字段；不选，就只调用、不写入
@@ -525,7 +657,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     };
     const cards = [...groups.entries()].map(([key, g]) => `<div class="af-fg" data-fn="${esc(key)}">
       <div class="af-fg-head" title="${esc([...(g.fn?.path || []), g.name].join(' / '))}">
-        <span class="af-fg-title"><span class="af-fg-name">${esc(g.name)}</span>${g.fn?.async ? '<span class="af-async-tag" title="异步函数：点运行只下发数据，函数在服务端后台执行，完成后插件自动取回结果并写回字段（需要保持这张表的插件页面开着）">异步</span>' : ''}</span>
+        <span class="af-fg-title"><span class="af-fg-name">${esc(g.name)}</span>${g.fn && isSerial(g.fn) ? SERIAL_TAG : ''}${g.fn?.async ? '<span class="af-async-tag" title="异步函数：点运行只下发数据，函数在服务端后台执行，完成后插件自动取回结果并写回字段（需要保持这张表的插件页面开着）">异步</span>' : ''}</span>
         <span class="af-fg-actions">
           ${g.fn ? `<button type="button" class="af-add" data-act="add-in" data-fn="${esc(g.fn.id)}" title="${g.fn.inputs.every(inp => config.inputs.some(i => i.fn === g.fn!.id && i.param === inp.name)) ? '这个函数的入参都已添加' : '给这个函数添加一个输入（入参 ← 字段）'}"${g.fn.inputs.every(inp => config.inputs.some(i => i.fn === g.fn!.id && i.param === inp.name)) ? ' disabled' : ''}>＋输入</button><span class="af-pick"><button type="button" class="af-add" data-act="pick-toggle" data-scope="${esc(g.fn.id)}" title="给这个函数添加输出参数" ${g.fn.outputs.length ? '' : 'disabled'}>＋输出</button>${pickerScope === g.fn.id ? `<div class="af-pick-pop">${renderScopedPicker(g.fn, present)}</div>` : ''}</span>` : ''}
           <button class="af-x af-x-group" data-act="del-group" data-fn="${esc(key)}" title="移除这个函数（连同它的全部输出参数）">×</button>
@@ -558,7 +690,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       body = '<div class="af-hint">后端还没有注册任何函数（在服务器的 release/server/functions/ 目录里添加）</div>';
     } else {
       body = `
-        <section class="af-sec"><h4 class="af-h"><span>筛选 <span class="af-count"></span></span><span class="af-h-actions"><button class="af-add" data-act="filter" title="读取视图记录，只计算命中数，不调用函数、不写入"${running || exporting ? ' disabled' : ''}>筛选</button><button class="af-add" data-act="stats-filtered" title="读取视图记录，对符合筛选条件的记录做统计（取值分布等），在新标签页里查看"${running || exporting ? ' disabled' : ''}>统计</button><button class="af-add" data-act="preview-filtered" title="在悬浮窗口里查看符合筛选条件的记录（全部可见字段）"${running || exporting ? ' disabled' : ''}>预览</button><span class="af-menu-wrap"><button class="af-add af-more" data-act="filter-menu" title="更多：导出 CSV、导入 / 导出筛选条件">☰</button>${filterMenuOpen ? `<div class="menu af-menu"><button class="menu-item" data-act="export-filtered" title="把视图里符合筛选条件的记录（全部可见字段）导出为 CSV"${running || exporting ? ' disabled' : ''}>导出 CSV</button><button class="menu-item" data-act="filter-import" title="从文件导入筛选条件（会替换当前条件）"${running || exporting ? ' disabled' : ''}>筛选条件导入</button><button class="menu-item" data-act="filter-export" title="把当前筛选条件导出为文件，方便复用">筛选条件导出</button></div>` : ''}</span></span></h4>${renderNode(config.filter, [])}</section>
+        <section class="af-sec"><h4 class="af-h"><span>筛选 <span class="af-count"></span></span><span class="af-h-actions"><button class="af-pill" data-act="filter" title="读取视图记录，只计算命中数，不调用函数、不写入"${running || exporting ? ' disabled' : ''}>筛选</button><button class="af-pill" data-act="preview-filtered" title="在悬浮窗口里查看符合筛选条件的记录（全部可见字段）"${running || exporting ? ' disabled' : ''}>预览</button><button class="af-pill" data-act="filter-history" title="筛选历史：之前筛选 / 预览 / 统计 / 导出时用过的筛选条件，点一下即可恢复">历史</button><span class="af-menu-wrap"><button class="af-pill af-more" data-act="filter-menu" title="更多：统计、导出 CSV、导入 / 导出筛选条件">☰</button>${filterMenuOpen ? `<div class="menu af-menu"><button class="menu-item" data-act="stats-filtered" title="读取视图记录，对符合筛选条件的记录做统计（取值分布等），在新标签页里查看"${running || exporting ? ' disabled' : ''}>统计</button><button class="menu-item" data-act="export-filtered" title="把视图里符合筛选条件的记录（全部可见字段）导出为 CSV"${running || exporting ? ' disabled' : ''}>导出 CSV</button><button class="menu-item" data-act="filter-import" title="从文件导入筛选条件（会替换当前条件）"${running || exporting ? ' disabled' : ''}>筛选条件导入</button><button class="menu-item" data-act="filter-export" title="把当前筛选条件导出为文件，方便复用">筛选条件导出</button></div>` : ''}</span></span></h4>${renderNode(config.filter, [])}</section>
         <section class="af-sec af-sec-fn"><h4 class="af-h"><span>函数</span><span class="af-h-actions"><span class="af-jobs-badge-wrap" data-jobs-badge>${jobBadgeHtml()}</span>${clearBtn('clear-outputs', '函数', config.outputs.length === 0)}</span></h4>${renderOutputs()}</section>
         <div class="af-status${statusKind ? ' ' + statusKind : ''}">${esc(statusText).replace(/\n/g, '<br />')}</div>
         ${renderFailures()}`;
@@ -644,8 +776,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
 
   container.addEventListener('toggle', (e) => {
     const el = e.target as HTMLDetailsElement;
-    if (el.classList && el.classList.contains('af-done')) { const k = el.dataset.done || ''; if (el.open) doneOpenKeys.add(k); else doneOpenKeys.delete(k); }
-    else if (el.classList && el.classList.contains('af-afail')) { const k = el.dataset.fn || ''; if (el.open) afailOpenKeys.add(k); else afailOpenKeys.delete(k); }
+    if (el.classList && el.classList.contains('af-afail')) { const k = el.dataset.fn || ''; if (el.open) afailOpenKeys.add(k); else afailOpenKeys.delete(k); }
     else if (el.classList && el.classList.contains('af-fail')) failOpen = el.open;
   }, true);
 
@@ -730,6 +861,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     if (ssSel === sel) closeSS(); else openSS(sel);
   });
   container.addEventListener('keydown', (e) => { // 键盘聚焦在下拉上时，Enter / 空格 / ↓ 也打开搜索弹层
+    if (e.key === 'Enter' && (e.target as HTMLElement).classList?.contains('af-sep-custom')) { e.preventDefault(); closeMs(); return; } // 自定义拆分符填完回车：收起列表
     if (e.key !== 'Enter' && e.key !== ' ' && e.key !== 'ArrowDown') return;
     const sel = searchable(e.target);
     if (sel) { e.preventDefault(); openSS(sel); }
@@ -795,16 +927,18 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
   }
   document.addEventListener('click', (e) => { if (!(e.target as HTMLElement).closest('.af-menu-wrap')) closeFilterMenu(); });
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeFilterMenu(); });
-  // 任务标签的明细弹层：点弹层外面 / 按 Esc 收起。用 composedPath 判断点在哪：弹层里的按钮点了会重绘，点击目标可能已经不在页面上
-  function closeJobPop() { if (jobPopOpen) { jobPopOpen = false; updateJobsView(); } }
-  document.addEventListener('click', (e) => { if (jobPopOpen && !e.composedPath().some(n => (n as HTMLElement).classList?.contains('af-jobs-badge-wrap'))) closeJobPop(); });
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeJobPop(); });
+  // 历史窗口 / 执行详情悬浮窗：按 Esc 关闭（先关说明悬浮窗）
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { if (notePop) closeNotePop(); else if (jobWin) closeJobWin(); } });
 
   // 输出选择器：展开 / 折叠目录和函数（不重绘，只切样式）；点选一项
   document.addEventListener('click', (e) => {
     if (pickerScope !== null && !(e.target as HTMLElement).closest('.af-pick')) { pickerScope = null; render(); }
   });
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && pickerScope !== null) { pickerScope = null; render(); } });
+  // 多选输入的勾选列表、筛选条件的拆分符列表：点列表外面 / 按 Esc 收起（收起时重绘，已取消勾选的旧值随之消失）
+  function closeMs() { if (msOpen !== null || sepOpen !== null) { msOpen = null; sepOpen = null; render(); } }
+  document.addEventListener('click', (e) => { if ((msOpen !== null || sepOpen !== null) && !(e.target as HTMLElement).closest('.af-ms')) closeMs(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeMs(); });
 
   container.addEventListener('click', (e) => {
     const target = e.target as HTMLElement;
@@ -832,6 +966,26 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     }
     pickerScope = null;
     const act = btn.dataset.act!;
+    if (handleJobAct(act, btn)) return;
+    if (act === 'ms-toggle') {
+      const idx = Number(btn.dataset.in);
+      msOpen = msOpen === idx ? null : idx;
+      sepOpen = null;
+      render();
+      const pop = container.querySelector('.af-ms-pop') as HTMLElement | null;
+      if (pop) { (pop.querySelector('.af-ms-q') as HTMLInputElement | null)?.focus({ preventScroll: true }); pop.scrollIntoView({ block: 'nearest' }); }
+      return;
+    }
+    if (act === 'sep-toggle') {
+      const p = (btn.closest('[data-path]') as HTMLElement).dataset.path!;
+      sepOpen = sepOpen === p ? null : p;
+      msOpen = null;
+      render();
+      (container.querySelector('.af-ms-pop') as HTMLElement | null)?.scrollIntoView({ block: 'nearest' });
+      return;
+    }
+    msOpen = null; // 其他操作（增删条件 / 输入行）会让下标、路径错位：先收起展开着的列表
+    sepOpen = null;
     if (act.startsWith('fail-')) { onFailAction(act, btn); return; }
     if (act.startsWith('afail-')) { onAsyncFailAction(act, btn); return; }
     const nodeEl = btn.closest('[data-path]') as HTMLElement | null;
@@ -851,7 +1005,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       case 'add-in': { // 新加一行输入：默认选这个函数里第一个还没用的入参（可以再改）
         const fn = fns.find(f => f.id === btn.dataset.fn);
         const free = fn?.inputs.find(inp => !config.inputs.some(i => i.fn === fn.id && i.param === inp.name));
-        if (fn && free) config.inputs.push({ fn: fn.id, param: free.name, fieldId: '' });
+        if (fn && free) config.inputs.push(newInput(fn, free));
         break;
       }
       case 'del-in': config.inputs.splice(Number(btn.dataset.in), 1); break;
@@ -861,14 +1015,11 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
         break;
       }
       case 'reload-fns': loadFunctions(); return;
-      case 'jobs-refresh': refreshJobs(); return;
-      case 'jobs-toggle': jobPopOpen = !jobPopOpen; updateJobsView(); return;
-      case 'jobs-runs': jobShowAllRuns = !jobShowAllRuns; updateJobsView(); return;
-      case 'job-cancel': cancelJob(btn.dataset.id!); return;
       case 'filter-menu': filterMenuOpen = !filterMenuOpen; render(); return;
       case 'filter': applyFilter(); return;
       case 'preview-filtered': previewFiltered(); return;
-      case 'stats-filtered': statsFiltered(); return;
+      case 'stats-filtered': closeFilterMenu(); statsFiltered(); return;
+      case 'filter-history': closeFilterMenu(); openHistory('filter'); return;
       case 'export-filtered': closeFilterMenu(); exportFiltered(); return;
       case 'filter-export': closeFilterMenu(); exportFilterConditions(); return;
       case 'filter-import': closeFilterMenu(); importFilterConditions(); return;
@@ -880,17 +1031,29 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
   container.addEventListener('input', (e) => {
     const el = e.target as HTMLInputElement | HTMLTextAreaElement;
     if (el.classList && el.classList.contains('af-pick-q')) { pickerQuery = el.value; filterPicker(); return; }
+    if (el.classList && el.classList.contains('af-ms-q')) { // 多选勾选列表里的搜索：只隐藏不匹配的项，不重绘
+      const q = el.value.trim().toLowerCase();
+      el.closest('.af-ms-pop')?.querySelectorAll<HTMLElement>('.af-in-chk').forEach(x => x.classList.toggle('ss-hide', !!q && !(x.textContent || '').toLowerCase().includes(q)));
+      return;
+    }
+    if (el.dataset.act === 'in-text') { // 输入行的文本值：边输入边存，不重绘（重绘会丢焦点）
+      const m = config.inputs[Number((el.closest('[data-in]') as HTMLElement | null)?.dataset.in)];
+      if (m) { m.value = el.value; saveConfig(); }
+      return;
+    }
     const nodeEl = el.closest('[data-path]') as HTMLElement | null;
     if (!nodeEl) return;
     if (el.dataset.act === 'cond-value') {
       (nodeAt(nodeEl.dataset.path!).node as Cond).value = el.value;
     } else if (el.dataset.act === 'cond-sep-custom') {
-      // 往自定义框里输入时，自动选中它前面的单选框
+      // 往自定义框里输入时，自动选中它前面的单选框，下拉框上显示的拆分符跟着变
       const cond = nodeAt(nodeEl.dataset.path!).node as Cond;
       cond.customSep = el.value;
       cond.sep = CUSTOM_SEP;
       const radio = el.closest('label')?.querySelector('input[type="radio"]') as HTMLInputElement | null;
       if (radio) radio.checked = true;
+      const text = nodeEl.querySelector(':scope > .af-sep .af-ms-text');
+      if (text) text.textContent = sepLabel(cond);
     } else return;
     saveConfig();
     updateFilterCount();
@@ -899,11 +1062,29 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
   container.addEventListener('change', (e) => {
     const el = e.target as HTMLSelectElement | HTMLInputElement;
     const act = el.dataset.act;
-    if (!act || act === 'cond-sep-custom') return;
+    if (!act || act === 'cond-sep-custom' || act === 'in-text') return;
     const inRow = el.closest('[data-in]') as HTMLElement | null;
-    if (inRow && (act === 'in-param' || act === 'in-field')) { // 卡片里的输入行：入参 / 字段
-      const m = config.inputs[Number(inRow.dataset.in)];
-      if (m) { if (act === 'in-param') m.param = el.value; else m.fieldId = el.value; }
+    if (inRow && act.startsWith('in-')) { // 卡片里的输入行：入参 / 字段 / 填写的值
+      const idx = Number(inRow.dataset.in);
+      const m = config.inputs[idx];
+      if (m && act === 'in-param') {
+        const fn = fns.find(f => f.id === m.fn);
+        if (fn && groupRequired(fn).has(m.param)) { render(); return; } // 必需的入参不能换（选项已置灰，这里兜底），重绘恢复原来的选择
+        // 换参数：字段入参之间换，字段保留；只要涉及不来自字段的入参，就按新参数重建这一行（填上它的默认值）
+        const next = fn?.inputs.find(i => i.name === el.value);
+        if (fn && next && (isManual(next) || isManual(fn.inputs.find(i => i.name === m.param)))) config.inputs[idx] = newInput(fn, next);
+        else m.param = el.value;
+      } else if (m && act === 'in-field') m.fieldId = el.value;
+      else if (m && act === 'in-value') m.value = el.value;
+      else if (m && act === 'in-multi') {
+        // 勾选列表开着时不重绘（保住列表的滚动位置和搜索词），只更新下拉框上显示的已选值
+        m.value = [...inRow.querySelectorAll<HTMLInputElement>('input[data-act="in-multi"]:checked')].map(x => x.value); // 按可选值的顺序
+        saveConfig();
+        const inp = fns.find(f => f.id === m.fn)?.inputs.find(i => i.name === m.param);
+        const text = inRow.querySelector('.af-ms-text');
+        if (inp && text) text.outerHTML = msSummary(inp, m.value);
+        return;
+      }
       saveConfig();
       render();
       return;
@@ -919,12 +1100,16 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       if (node.kind === 'cond') {
         if (act === 'cond-field') node.fieldId = el.value;
         else if (act === 'cond-op') node.op = el.value;
-        else if (act === 'cond-sep') node.sep = el.value;
+        else if (act === 'cond-sep') {
+          node.sep = el.value;
+          if (el.value !== CUSTOM_SEP) sepOpen = null; // 选了固定的拆分符就收起；选自定义留着，接着在框里输入
+        }
       } else if (act === 'logic') node.logic = el.value as 'and' | 'or';
       else if (act === 'negate') node.negate = (el as HTMLInputElement).checked;
     }
     saveConfig();
     render();
+    if (act === 'cond-sep' && el.value === CUSTOM_SEP) (container.querySelector(`[data-path="${nodeEl!.dataset.path}"] .af-sep-custom`) as HTMLInputElement | null)?.focus({ preventScroll: true });
   });
 
   // ── 运行 ────────────────────────────────────────
@@ -957,7 +1142,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     if (new Set(outFields).size !== outFields.length) return '多个输出参数写入了同一个字段';
     const calls = config.outputs.filter(o => o.param.startsWith(FN_PREFIX)).map(o => o.param);
     if (new Set(calls).size !== calls.length) return '同一个函数被选了多次';
-    // 每个函数需要的入参都要映射到字段
+    // 每个函数需要的入参都要映射到字段（不来自字段的入参要填好值）
     const fieldIds = new Set(host.getAllFields().map(f => f.id));
     const checked = new Set<string>();
     for (const o of config.outputs) {
@@ -965,12 +1150,20 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       if (!fn || checked.has(fn.id)) continue;
       checked.add(fn.id);
       for (const name of groupRequired(fn)) {
-        const fid = inputField(fn.id, name);
-        const label = fn.inputs.find(i => i.name === name)?.label || name;
-        if (!fid) return `函数“${fn.name}”缺少输入参数“${label}”的字段`;
+        const inp = fn.inputs.find(i => i.name === name);
+        if (isManual(inp)) continue; // 输入行由 ensureAllInputs 保证存在，值在下面逐行检查
+        if (!inputField(fn.id, name)) return `函数“${fn.name}”缺少输入参数“${inp?.label || name}”的字段`;
       }
       for (const m of config.inputs.filter(i => i.fn === fn.id)) {
-        if (!m.param || !m.fieldId) return `函数“${fn.name}”的输入项里有未选完整的参数或字段`;
+        if (!m.param) return `函数“${fn.name}”的输入项里有未选完整的参数或字段`;
+        const inp = fn.inputs.find(i => i.name === m.param);
+        if (!inp) return `函数“${fn.name}”已经没有入参“${m.param}”，请删掉这一行输入或换一个参数`;
+        if (isManual(inp)) {
+          const why = manualProblem(inp, m.value);
+          if (why) return `函数“${fn.name}”的输入“${inp.label || inp.name}”${why}`;
+          continue;
+        }
+        if (!m.fieldId) return `函数“${fn.name}”的输入项里有未选完整的参数或字段`;
         if (!fieldIds.has(m.fieldId)) return `函数“${fn.name}”的输入字段已不存在，请重新选择（可点右上角 ↻ 刷新字段）`;
       }
     }
@@ -978,23 +1171,30 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
   }
 
   // 这里抛出的错误都是已经带上函数名的中文说明，用 describedError 标记，避免被通用翻译二次改写
-  async function callFunction(fn: FnMeta, rows: Record<string, any>[]): Promise<FnResult[]> {
+  async function callFunction(fn: FnMeta, rows: Record<string, any>[]): Promise<{ results: FnResult[]; message?: string }> {
     const prefix = `函数“${fn.name}”调用失败：`;
+    const waitStart = Date.now();
     let res: Response;
-    try {
-      res = await fetch(apiUrl(`api/functions/${encodeURIComponent(fn.id)}/run`), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rows }),
-      });
-    } catch (e) {
-      throw describedError(prefix + describeError(e, 'read'));
+    for (let attempt = 0; ; attempt++) {
+      try {
+        res = await fetch(apiUrl(`api/functions/${encodeURIComponent(fn.id)}/run`), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ rows, wait: attempt === 0 ? 1500 : undefined }), // 第一次请求只等 1.5 秒，轮不到就马上回“排队中”让状态栏及时提示；之后的重试才等满
+        });
+      } catch (e) {
+        throw describedError(prefix + describeError(e, 'read'));
+      }
+      // 声明了 serializeCalls 的函数同一时间只执行一批：轮不到时服务端过一会儿回 202（还在排队），这里自动重试，状态栏提示在排队
+      if (res.status !== 202) break;
+      if (cancelled) throw describedError(`已取消，函数“${fn.name}”还在排队等待其他调用，未执行`);
+      setStatus(`函数“${fn.name}”同一时间只执行一批，正在排队等待其他调用完成…（已等 ${fmtDuration(Date.now() - waitStart)}，可点取消）`, '');
     }
     if (!res.ok) throw describedError(prefix + await serverMessage(res));
     let data: any;
     try { data = await res.json(); } catch { throw describedError(prefix + '后端返回的不是合法数据'); }
     if (!data || !Array.isArray(data.results) || data.results.length !== rows.length) throw describedError(prefix + '返回的结果条数与请求不一致');
-    return data.results;
+    return { results: data.results, message: typeof (data.detail ?? data.message) === 'string' ? (data.detail ?? data.message) : undefined };
   }
 
   // ── 异步函数：下发任务、取回结果并用前端 SDK 写回 ──────────
@@ -1042,6 +1242,8 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       return `整批失败：${why}（${meta.recordIds.length} 条）`;
     }
     if (results.length !== meta.recordIds.length) throw new Error('结果条数与下发的记录数不一致');
+    const noteFn = fns.find(f => f.id === job.fnId) ?? { id: job.fnId, name: job.fnName, inputs: [], outputs: [] } as FnMeta;
+    pushNote(makeNote(noteFn, results, typeof (job.detail ?? job.message) === 'string' ? (job.detail ?? job.message) : undefined, meta.indexes, true, meta.run ? { id: meta.run.id, at: meta.run.at, part: meta.run.part, parts: meta.run.parts } : undefined));
     const optionsOf = new Map<string, FieldOption[]>();
     for (const o of meta.outs) {
       const f = fieldById.get(o.fieldId);
@@ -1161,9 +1363,17 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
   };
 
   // 图标（线条风格，颜色跟随文字色）：转圈 = 正在进行，钟 = 等待，对勾 = 完成，叹号 = 出错，列表 = 任务
-  type IcoKind = 'spin' | 'clock' | 'check' | 'alert' | 'refresh' | 'list';
+  type IcoKind = 'spin' | 'clock' | 'check' | 'alert' | 'refresh' | 'list' | 'expand' | 'collapse' | 'chevron' | 'down1' | 'down2' | 'restore' | 'copy' | 'trash';
   function ico(kind: IcoKind): string {
     const paths: Record<IcoKind, string> = {
+      copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h8"/>',
+      trash: '<path d="M4 7h16"/><path d="M9 7V4h6v3"/><path d="M6 7l1 13h10l1-13"/><path d="M10 11v6M14 11v6"/>',
+      expand: '<path d="m7 7 5 5 5-5"/><path d="m7 13 5 5 5-5"/>',
+      collapse: '<path d="m7 11 5-5 5 5"/><path d="m7 18 5-5 5 5"/>',
+      chevron: '<path d="m9 6 6 6-6 6"/>',
+      restore: '<path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/>',
+      down1: '<path d="m6 9 6 6 6-6"/>',
+      down2: '<path d="m6 5 6 6 6-6"/><path d="m6 12 6 6 6-6"/>',
       spin: '<path d="M21 12a9 9 0 1 1-6.2-8.56"/>',
       clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
       check: '<circle cx="12" cy="12" r="9"/><path d="M8 12.5l3 3 5-6"/>',
@@ -1174,6 +1384,88 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     return `<svg class="af-svg${kind === 'spin' ? ' af-spin' : ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[kind]}</svg>`;
   }
 
+  // ── 历史记录的数据 ──────────────────────────────
+  // 函数除了返回值，还可以返回执行详情（出参 type: 'message'，或 run 返回的批级 message），面板每调用一批就收集一份。
+  // 同步函数的每次调用也记一条（CallRec），和异步任务、说明一起放进「函数」块右上角的「历史」里，按「批次 → 函数 → 每次调用」分层。
+  const histKey = () => `annotator-auto-flush-hist:${host.getTableId()}`;
+  function loadHist() {
+    const t = host.getTableId();
+    if (t === histTable) return;
+    histTable = t;
+    callLog.length = 0;
+    noteLog.length = 0;
+    hiddenJobs.clear();
+    runNames = {};
+    try {
+      const d = JSON.parse(localStorage.getItem(histKey()) || '{}');
+      if (Array.isArray(d.calls)) callLog.push(...d.calls);
+      if (Array.isArray(d.notes)) noteLog.push(...d.notes);
+      if (Array.isArray(d.hidden)) d.hidden.forEach((id: any) => hiddenJobs.add(String(id)));
+      if (d.names && typeof d.names === 'object') for (const k of Object.keys(d.names)) if (typeof d.names[k] === 'string' && d.names[k]) runNames[k] = d.names[k];
+    } catch { /* 存档坏了就当没有 */ }
+    histUid = Math.max(histUid, ...callLog.map(c => c.uid), ...noteLog.map(n => n.uid));
+  }
+  function saveHist() {
+    for (let i = 0; i < 3; i++) {
+      try { localStorage.setItem(histKey(), JSON.stringify({ calls: callLog, notes: noteLog, hidden: [...hiddenJobs].slice(-500), names: runNames })); return; }
+      catch { callLog.splice(0, Math.ceil(callLog.length / 2)); noteLog.splice(0, Math.ceil(noteLog.length / 2)); } // 超出配额：丢掉较早的一半再试
+    }
+  }
+  // 历史最多保留 HISTORY_LIMIT 个批次：命名过的优先保留（即使比较旧），其余按最近的保留；超出的批次连同它的调用记录和详情一起丢掉
+  function trimHist() {
+    const at = new Map<string, number>();
+    [...callLog, ...noteLog].forEach(x => at.set(x.runId, Math.max(at.get(x.runId) || 0, x.runAt || x.time)));
+    if (at.size <= HISTORY_LIMIT) return;
+    const keep = new Set([...at.keys()].sort((a, b) => Number(!!runNames[b]) - Number(!!runNames[a]) || at.get(b)! - at.get(a)!).slice(0, HISTORY_LIMIT));
+    const calls = callLog.filter(x => keep.has(x.runId)), notes = noteLog.filter(x => keep.has(x.runId));
+    callLog.length = 0; callLog.push(...calls);
+    noteLog.length = 0; noteLog.push(...notes);
+    for (const k of Object.keys(runNames)) if (!keep.has(k) && at.has(k)) delete runNames[k];
+  }
+  const idxRange = (indexes: number[]) => { const nums = indexes.filter(n => n > 0); return { from: nums.length ? Math.min(...nums) : 0, to: nums.length ? Math.max(...nums) : 0 }; };
+  type RunRef = { id: string; at: number; part: number; parts: number };
+
+  function makeCall(fn: FnMeta, indexes: number[], run: RunRef, results: FnResult[], ms: number, error?: string): CallRec {
+    const ok = results.filter(r => r.ok).length;
+    return { uid: ++histUid, runId: run.id, runAt: run.at, fnId: fn.id, fnName: fn.name, part: run.part, parts: run.parts, ...idxRange(indexes), time: Date.now(), ok, failed: error ? 0 : results.length - ok, ms, ...(error ? { error } : {}) };
+  }
+  function makeNote(fn: FnMeta, results: FnResult[], batch: string | undefined, indexes: number[], isAsync: boolean, run?: RunRef): ExecNote | null {
+    const all: { index: number; text: string }[] = [];
+    if (fn.noteOut) {
+      results.forEach((r, i) => {
+        const t = r.ok ? r.outputs?.[fn.noteOut!] : undefined;
+        if (typeof t === 'string' && t.trim()) all.push({ index: indexes[i] || 0, text: t.length > NOTE_ROW_CHARS ? t.slice(0, NOTE_ROW_CHARS) + '…' : t });
+      });
+    }
+    if (!batch && all.length === 0) return null;
+    const rows = all.slice(0, NOTE_ROWS_MAX);
+    return { uid: ++histUid, runId: run?.id ?? '', runAt: run?.at ?? 0, fnId: fn.id, part: run?.part ?? 0, parts: run?.parts ?? 0, time: Date.now(), fnName: fn.name, ...idxRange(indexes),
+      batch: batch && batch.length > NOTE_ROW_CHARS * 4 ? batch.slice(0, NOTE_ROW_CHARS * 4) + '…' : batch, rows, ...(all.length > rows.length ? { more: all.length - rows.length } : {}), async: isAsync };
+  }
+
+  function pushCall(c: CallRec) {
+    loadHist();
+    callLog.push(c);
+    trimHist();
+    saveHist();
+    updateJobsView();
+  }
+  function pushNote(note: ExecNote | null) {
+    if (!note) return;
+    loadHist();
+    noteLog.push(note);
+    trimHist();
+    saveHist();
+    updateJobsView();
+  }
+
+  function noteInnerHtml(n: ExecNote): string {
+    const same = n.rows.length > 1 && n.rows.every(r => r.text === n.rows[0].text); // 每行详情都一样：只列一次
+    const rowsHtml = same
+      ? `<div class="af-note-row"><span class="af-note-idx">全部 ${n.rows.length} 行</span><pre>${esc(n.rows[0].text)}</pre></div>`
+      : n.rows.map(r => `<div class="af-note-row"><span class="af-note-idx">${r.index ? `第 ${r.index} 条` : '—'}</span><pre>${esc(r.text)}</pre></div>`).join('');
+    return (n.batch ? `<div class="af-note-batch"><pre>${esc(n.batch)}</pre></div>` : '') + rowsHtml + (n.more ? `<div class="af-note-row"><span class="af-note-idx"></span><span class="af-jobs-more">…另有 ${n.more} 行详情未保存</span></div>` : '');
+  }
   // 下发时间：今天只显示时:分，其他天带上月-日
   function fmtClock(ms: number, seconds = false): string {
     const d = new Date(ms);
@@ -1198,20 +1490,43 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     }
   }
 
-  // 异步失败行的分组 key：批次 + 函数。复制 / 导出 / 清空都按它来
+  // 异步失败行的分组 key：批次 + 函数。复制 / 导出 / 删除都按它来
   function failKey(f: AsyncFail): string { return `${f.runId || ''}|${f.fnId || 'name:' + f.fnName}`; }
 
-  // 一个任务一行：第几个任务（共几个）、对应批次里的第几到第几条，下面是状态
-  function jobLineHtml(j: JobSummary): string {
+  // 历史里的一行（一次调用 / 一个任务）：状态色竖线、图标、标题（第几个任务 · 第几–几条）、一句话状态（太长截断，悬停看全文；独立窗口里不截断）、尾部按钮
+  function histLine(cls: string, icon: IcoKind, title: string, state: string, tail: string): string {
+    return `<div class="af-job ${cls}"><span class="af-job-ico">${ico(icon)}</span><span class="af-job-title">${title}</span><span class="af-job-state" title="${esc(state)}">${esc(state)}</span>${tail}</div>`;
+  }
+  // 这次调用有说明时，行尾放一个「说明」按钮，点击弹出悬浮窗专门查看（不在列表里向下展开）
+  function noteToggle(n: ExecNote | undefined, _def: boolean): { chip: string; body: string } {
+    if (!n) return { chip: '', body: '' };
+    return { chip: `<button type="button" class="af-note-chip" data-act="note-view" data-uid="${n.uid}" title="查看这次调用的执行详情">详情</button>`, body: '' };
+  }
+  const rangeText = (from: number, to: number) => (from ? (from === to ? `第 ${from} 条` : `第 ${from}–${to} 条`) : '');
+
+  // 异步任务
+  function jobLineHtml(j: JobSummary, note?: ExecNote, def = false): string {
     const v = jobView(j);
     const cancelable = j.status === 'queued' || j.status === 'running' || ((j.status === 'done' || j.status === 'failed') && !j.claimed && jobApplying !== j.id);
     const title = j.run ? `任务 ${j.run.part}/${j.run.parts}<span class="af-job-range">第 ${j.run.from}–${j.run.to} 条</span>` : `${j.count} 条`;
-    return `<div class="af-job ${v.cls}"><span class="af-job-ico">${ico(v.ico)}</span>` +
-      `<div class="af-job-body"><div class="af-job-title">${title}</div><div class="af-job-state">${esc(v.text)}</div></div>` +
-      `${cancelable ? `<button class="af-x" data-act="job-cancel" data-id="${esc(j.id)}" title="取消这个任务">×</button>` : ''}</div>`;
+    const nt = noteToggle(note, def);
+    return histLine(v.cls, v.ico, title, v.text, nt.chip + (cancelable ? `<button class="af-x" data-act="job-cancel" data-id="${esc(j.id)}" title="取消这个任务">×</button>` : '')) + nt.body;
+  }
+  // 同步函数的一次调用
+  function callLineHtml(c: CallRec, note?: ExecNote, def = false): string {
+    const took = c.ms < 1000 ? `${c.ms} 毫秒` : fmtDuration(c.ms);
+    const text = c.error ? `调用失败：${c.error}` : `成功 ${c.ok} 条${c.failed ? `，失败 ${c.failed} 条` : ''}，用时 ${took}`;
+    const title = `${c.part ? `调用 ${c.part}/${c.parts}` : '调用'}<span class="af-job-range">${esc(rangeText(c.from, c.to))}</span>`;
+    const nt = noteToggle(note, def);
+    return histLine(c.error ? 'st-failed' : c.failed ? 'st-queued' : 'st-applied', c.error ? 'alert' : 'check', title, text, nt.chip) + nt.body;
+  }
+  // 只有说明、找不到对应调用记录的（比如调用记录被清掉了）
+  function noteLineHtml(n: ExecNote, def: boolean): string {
+    const nt = noteToggle(n, def);
+    return histLine('st-applied', 'check', `${n.part ? `${n.async ? '任务' : '调用'} ${n.part}/${n.parts}` : '详情'}<span class="af-job-range">${esc(rangeText(n.from, n.to))}</span>`, fmtClock(n.time, true), nt.chip) + nt.body;
   }
 
-  // 失败明细：key 是（批次 + 函数）的分组 key，复制 / 导出 / 清空只针对这一组
+  // 失败明细：key 是（批次 + 函数）的分组 key，复制 / 导出 / 删除只针对这一组
   function failDetailsHtml(fails: AsyncFail[], key: string): string {
     if (fails.length === 0) return '';
     return `<details class="af-fail af-afail" data-fn="${esc(key)}"${afailOpenKeys.has(key) ? ' open' : ''}>
@@ -1220,73 +1535,357 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
         <button class="af-add" data-act="afail-copy" data-fn="${esc(key)}">复制全部</button>
         <button class="af-add" data-act="afail-csv" data-fn="${esc(key)}">导出 CSV</button>
         <button class="af-add" data-act="afail-ids" data-fn="${esc(key)}">仅复制记录 ID</button>
-        <button class="af-add" data-act="afail-clear" data-fn="${esc(key)}">清空</button>
+        <button class="af-add" data-act="afail-clear" data-fn="${esc(key)}">删除</button>
       </div>
       <div class="af-fail-list">${fails.slice(0, FAIL_SHOW_LIMIT).map(f =>
         `<div class="af-fail-item">第 ${f.index} 条 <span class="af-fail-id">${esc(f.recordId)}</span><div class="af-fail-err">${esc(f.error)}</div></div>`).join('')}</div>
     </details>`;
   }
 
-  // 一个批次里某个函数的任务：先是它的进度，再列没写回的任务，已写回的折叠起来，最后是失败明细
-  function fnTasksHtml(runKey: string, fnId: string, g: { name: string; jobs: JobSummary[]; fails: AsyncFail[] }): string {
-    const jobs = g.jobs.slice().sort((a, b) => (a.run?.part ?? 0) - (b.run?.part ?? 0) || a.createdAt - b.createdAt);
-    const pending = jobs.filter(j => j.status !== 'applied');
-    const done = jobs.filter(j => j.status === 'applied');
-    const total = jobs[0]?.run?.parts || jobs.length;
-    const key = `${runKey}|${fnId}`;
-    const shown = pending.slice(0, PENDING_SHOWN);
-    return `<div class="af-run-fn"><div class="af-run-fn-head"><span class="af-run-fn-name">${esc(g.name)}</span>` +
-      (jobs.length ? `<span class="af-run-fn-prog">${done.length}/${total} 已写回</span>` : '') + '</div>' +
-      (jobs.length ? `<div class="af-bar"><i style="width:${Math.round(done.length / Math.max(total, 1) * 100)}%"></i></div>` : '') +
-      shown.map(jobLineHtml).join('') +
-      (pending.length > shown.length ? `<div class="af-jobs-more">另有 ${pending.length - shown.length} 个未完成的任务</div>` : '') +
-      (done.length ? `<details class="af-done" data-done="${esc(key)}"${doneOpenKeys.has(key) ? ' open' : ''}><summary>已写回的任务 · ${done.length} 个</summary>${done.map(jobLineHtml).join('')}</details>` : '') +
-      failDetailsHtml(g.fails, `${runKey}|${fnId}`) + '</div>';
+  // 历史的外观和「批处理历史记录」统一：每个批次是一张 .af-hist-item 卡片（勾选圆、类型标签、时间、× 删除、摘要行、结果行、底部文字按钮）；
+  // 批次里的每个函数只占一行（函数名、结果、「复现」「详情」），函数被拆成多批执行时，行尾的「N 批」可以展开成逐批的执行情况
+  const isFold = (key: string, def: boolean) => (foldOpen.has(key) ? foldOpen.get(key)! : def);
+  // 一组任务的状态标签：运行中 / 待写回 / 失败行数
+  function statChips(jobs: JobSummary[], failN: number): string {
+    const busy = jobs.filter(j => j.status === 'queued' || j.status === 'running').length;
+    const wait = jobs.filter(j => j.status === 'done' || j.status === 'failed').length;
+    return (busy ? `<span class="af-chip busy">运行中 ${busy}</span>` : '') + (wait ? `<span class="af-chip wait">待写回 ${wait}</span>` : '') + (failN ? `<span class="af-chip bad">${failN} 条失败</span>` : '');
+  }
+  const callFailN = (c: CallRec) => c.failed + (c.error ? 1 : 0);
+  const visibleJobs = () => jobList.filter(j => j.status !== 'cancelled' && !hiddenJobs.has(j.id));
+
+  type FnGroup = { name: string; jobs: JobSummary[]; fails: AsyncFail[]; calls: CallRec[]; notes: ExecNote[] /* 没有对应调用 / 任务的详情 */ };
+  type RunGroup = { at: number; total: number; fns: Map<string, FnGroup> };
+  const noteKey = (runId: string, fnId: string, part: number) => `${runId}|${fnId}|${part}`;
+  // 分组：批次（runId，没有批次信息的归到“更早的记录”）→ 函数；最新的批次在前，没有批次信息的放最后
+  function groupHistory(): { runs: [string, RunGroup][]; noteOf: Map<string, ExecNote> } {
+    loadHist();
+    const runs = new Map<string, RunGroup>();
+    const runOf = (id: string) => { if (!runs.has(id)) runs.set(id, { at: 0, total: 0, fns: new Map() }); return runs.get(id)!; };
+    const fnOf2 = (r: RunGroup, id: string, name: string) => { if (!r.fns.has(id)) r.fns.set(id, { name, jobs: [], fails: [], calls: [], notes: [] }); return r.fns.get(id)!; };
+    const bump = (r: RunGroup, at: number) => { if (at && !r.at) r.at = at; };
+    visibleJobs().forEach(j => { const r = runOf(j.run?.id || ''); if (j.run) { r.at = j.run.at; r.total = j.run.total; } fnOf2(r, j.fnId, j.fnName).jobs.push(j); });
+    asyncFails.forEach(f => { const r = runOf(f.runId || ''); if (f.runId) bump(r, f.time); fnOf2(r, f.fnId || 'name:' + f.fnName, f.fnName).fails.push(f); });
+    callLog.forEach(c => { const r = runOf(c.runId); bump(r, c.runAt || c.time); fnOf2(r, c.fnId, c.fnName).calls.push(c); });
+    // 说明挂到同一批次、同一函数、同一序号的调用 / 任务下面；对不上的单列
+    const noteOf = new Map<string, ExecNote>();
+    const matched = new Set<string>();
+    for (const g of runs.entries()) for (const [fid, fg] of g[1].fns) {
+      fg.jobs.forEach(j => matched.add(noteKey(g[0], fid, j.run?.part ?? 0)));
+      fg.calls.forEach(c => matched.add(noteKey(g[0], fid, c.part)));
+    }
+    noteLog.forEach(n => {
+      const k = noteKey(n.runId, n.fnId, n.part);
+      if (n.part && matched.has(k)) { noteOf.set(k, n); return; }
+      const r = runOf(n.runId);
+      bump(r, n.runAt || n.time);
+      fnOf2(r, n.fnId, n.fnName).notes.push(n);
+    });
+    return { runs: [...runs.entries()].sort((a, b) => (a[0] === '' ? 1 : 0) - (b[0] === '' ? 1 : 0) || b[1].at - a[1].at), noteOf };
   }
 
-  // 「函数」块右上角的标签：图标 + “任务”，右上角一个状态点（执行中橙、有失败红、全部完成绿）；点开弹出任务记录，
-  // 按「批次 → 函数 → 任务」分组：一次点「运行」是一个批次，被函数的 batchSize 拆成多个任务。
+  // 复制用的文本：不传参数是全部，传了批次（和函数）就只复制那些
+  function noteLines(n?: ExecNote): string[] {
+    return n ? [...(n.batch ? [`    详情：${n.batch}`] : []), ...n.rows.map(r => `    ${r.index ? `第 ${r.index} 条：` : ''}${r.text}`)] : [];
+  }
+  function histText(runKeys?: string[], fnId?: string): string {
+    const { runs, noteOf } = groupHistory();
+    const out: string[] = [];
+    for (const [rk, r] of runs) {
+      if (runKeys !== undefined && !runKeys.includes(rk)) continue;
+      out.push(rk === '' ? '【更早的记录】' : `【批次 ${fmtClock(r.at, true)}${runNames[rk] ? ` ${runNames[rk]}` : ''}${r.total ? `，${r.total} 条` : ''}】`);
+      for (const [fid, g] of r.fns) {
+        if (fnId !== undefined && fid !== fnId) continue;
+        out.push(`  ${g.name}`);
+        g.jobs.slice().sort((a, b) => (a.run?.part ?? 0) - (b.run?.part ?? 0)).forEach(j => {
+          out.push(`  - 任务 ${j.run ? `${j.run.part}/${j.run.parts} ${rangeText(j.run.from, j.run.to)}` : `${j.count} 条`}：${jobView(j).text}`, ...noteLines(noteOf.get(noteKey(rk, fid, j.run?.part ?? 0))));
+        });
+        g.calls.slice().sort((a, b) => a.part - b.part).forEach(c => {
+          out.push(`  - 调用 ${c.part}/${c.parts} ${rangeText(c.from, c.to)}：${c.error ? `调用失败：${c.error}` : `成功 ${c.ok} 条${c.failed ? `，失败 ${c.failed} 条` : ''}`}`, ...noteLines(noteOf.get(noteKey(rk, fid, c.part))));
+        });
+        g.notes.forEach(n => out.push(`  - ${n.part ? `${n.async ? '任务' : '调用'} ${n.part}/${n.parts} ` : ''}${rangeText(n.from, n.to)}`, ...noteLines(n)));
+      }
+    }
+    return out.join('\n');
+  }
+  // 删除：不传参数是全部，传了批次（和函数）就只清那些。本地的调用记录、说明、异步失败明细直接删；
+  // 已写回的异步任务在服务端，只是不再显示；还没跑完 / 没写回的任务保留（要停用「取消」）
+  function clearHist(runKeys?: string[], fnId?: string) {
+    const what = runKeys === undefined ? '全部历史' : fnId !== undefined ? '这个函数在该批次里的记录' : runKeys.length > 1 ? `所选的 ${runKeys.length} 个批次` : '这个批次的记录';
+    if (!confirm(`删除${what}？\n未完成的异步任务会保留；清掉后无法恢复。`)) return;
+    loadHist();
+    const inScope = (rid: string, fid: string) => (runKeys === undefined || runKeys.includes(rid)) && (fnId === undefined || fid === fnId);
+    const keepCalls = callLog.filter(c => !inScope(c.runId, c.fnId));
+    callLog.length = 0; callLog.push(...keepCalls);
+    const keepNotes = noteLog.filter(n => !inScope(n.runId, n.fnId));
+    noteLog.length = 0; noteLog.push(...keepNotes);
+    jobList.forEach(j => { if (j.status === 'applied' && inScope(j.run?.id || '', j.fnId)) hiddenJobs.add(j.id); });
+    asyncFails = asyncFails.filter(f => !inScope(f.runId || '', f.fnId || 'name:' + f.fnName));
+    try { localStorage.setItem(asyncFailKey(), JSON.stringify(asyncFails)); } catch { /* ignore */ }
+    if (runKeys) runKeys.forEach(k => { histSel.delete(k); delete runNames[k]; }); else { histSel.clear(); runNames = {}; }
+    saveHist();
+    updateJobsView();
+  }
+
+  // 一个批次里某个函数：一行（函数名、结果、状态标签、复现 / 详情 / 展开按钮）；拆成多批或有失败明细时可展开逐批的执行情况（失败的批排前面）
+  function fnTasksHtml(runKey: string, fnId: string, g: FnGroup, latest: boolean, noteOf: Map<string, ExecNote>): string {
+    const jobs = g.jobs.slice().sort((a, b) => (a.run?.part ?? 0) - (b.run?.part ?? 0) || a.createdAt - b.createdAt);
+    const calls = g.calls.slice().sort((a, b) => a.part - b.part || a.time - b.time);
+    const done = jobs.filter(j => j.status === 'applied').length;
+    const total = jobs[0]?.run?.parts || jobs.length;
+    const callFail = calls.reduce((n, c) => n + callFailN(c), 0);
+    const callOk = calls.reduce((n, c) => n + c.ok, 0);
+    const took = calls.reduce((n, c) => n + c.ms, 0);
+    const state = jobs.length ? `${done}/${total} 已写回` : calls.length ? `成功 ${callOk} 条${callFail ? `，失败 ${callFail} 条` : ''}，用时 ${took < 1000 ? `${took} 毫秒` : fmtDuration(took)}` : '';
+    const lineCount = jobs.length + calls.length + g.notes.length;
+    const expandable = lineCount > 1 || g.fails.length > 0;
+    const key = `f|${runKey}|${fnId}`;
+    const open = expandable && isFold(key, g.fails.length > 0 || callFail > 0 || jobs.some(j => j.status === 'failed'));
+    if (expandable) foldKeys.push({ key, def: false });
+    // 只有一批时，详情直接放在函数行上；多批时详情在各批行里
+    const only = lineCount === 1 ? (jobs[0] ? noteOf.get(noteKey(runKey, fnId, jobs[0].run?.part ?? 0)) : calls[0] ? noteOf.get(noteKey(runKey, fnId, calls[0].part)) : g.notes[0]) : undefined;
+    const attrs = `data-run="${esc(runKey)}" data-fn="${esc(fnId)}"`;
+    const restore = runKey !== '' && runConfigOf(runKey) !== null ? `<button type="button" class="af-fnbtn" data-act="jobs-restore" data-mode="fns" ${attrs} title="只恢复这个函数运行时的输入映射和输出字段；面板上其他函数和筛选条件不动，这个函数当前的配置会被替换">复现</button>` : '';
+    const detail = only ? `<button type="button" class="af-fnbtn" data-act="note-view" data-uid="${only.uid}" title="查看这次执行的详情">详情</button>` : '';
+    const copyBtn = `<button type="button" class="af-fnbtn" data-act="jobs-copy" ${attrs} title="复制这个函数分批执行记录的详情">复制</button>`;
+    const toggle = expandable ? `<button type="button" class="af-fnbtn${open ? ' on' : ''}" data-act="jobs-fold" data-key="${esc(key)}" data-open="${open ? 1 : 0}" title="${open ? '收起' : '展开'}逐批的执行情况">${lineCount > 1 ? `${lineCount} 批` : '明细'} ${open ? '▴' : '▾'}</button>` : '';
+    const unfinished = jobs.some(j => j.status !== 'applied');
+    const lines = [...jobs.map(j => ({ bad: j.status === 'failed', html: jobLineHtml(j, noteOf.get(noteKey(runKey, fnId, j.run?.part ?? 0)), latest) })),
+      ...calls.map(cc => ({ bad: callFailN(cc) > 0, html: callLineHtml(cc, noteOf.get(noteKey(runKey, fnId, cc.part)), latest) })),
+      ...g.notes.slice().sort((a, b) => a.part - b.part).map(n => ({ bad: false, html: noteLineHtml(n, latest) }))]
+      .sort((a, b) => Number(b.bad) - Number(a.bad)).map(x => x.html).join('');
+    return `<div class="af-fnrow"><span class="af-fnrow-name" title="${esc(g.name)}">${esc(g.name)}</span><span class="af-fnrow-state" title="${esc(state)}">${esc(state)}</span>` +
+      `${statChips(jobs.filter(j => j.status !== 'applied'), g.fails.length + (jobs.length ? 0 : 0))}${restore}${copyBtn}${detail}${toggle}</div>` +
+      (jobs.length && unfinished ? `<div class="af-bar"><i style="width:${Math.round(done / Math.max(total, 1) * 100)}%"></i></div>` : '') +
+      (open ? `<div class="af-fn-detail">${lines}${failDetailsHtml(g.fails, `${runKey}|${fnId}`)}</div>` : '');
+  }
+
+  const dayLabelOf = (t: number) => {
+    const d = new Date(t), today = new Date();
+    const diff = Math.round((new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime() - new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()) / 86400000);
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return diff === 0 ? '今天' : diff === 1 ? '昨天' : `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  };
+
+  // 历史的内容：状态标签、汇总、是否全部展开，以及按天分组、每个批次一张可勾选卡片的列表；有搜索词时只留匹配的函数，并全部展开
+  function historyPanelHtml(showAllRuns: boolean): { chips: string; info: string; runKeys: string[]; body: string } {
+    const live = visibleJobs();
+    loadHist();
+    const failN = asyncFails.length + callLog.reduce((n, c) => n + callFailN(c), 0);
+    const chips = statChips(live, failN) + (live.some(j => j.status === 'applied') ? `<span class="af-chip ok">已写回 ${live.filter(j => j.status === 'applied').length}</span>` : '');
+    foldKeys = [];
+    const grouped = groupHistory();
+    const noteOf = grouped.noteOf;
+    const q = histQuery.trim().toLowerCase();
+    let ordered = grouped.runs;
+    if (q) {
+      const fnText = (rk: string, fid: string, g: FnGroup) => [g.name, ...g.jobs.map(j => jobView(j).text), ...g.calls.map(c => c.error || ''), ...g.fails.map(f => f.error),
+        ...noteLog.filter(n => n.runId === rk && n.fnId === fid).flatMap(n => [n.batch || '', ...n.rows.map(r => r.text)])].join('\n').toLowerCase();
+      ordered = ordered.flatMap(([rk, r]): [string, RunGroup][] => {
+        const runHit = `批次 ${fmtClock(r.at, true)} ${dayLabelOf(r.at)} ${runNames[rk] || ''}`.toLowerCase().includes(q);
+        const fns = new Map([...r.fns].filter(([fid, g]) => runHit || fnText(rk, fid, g).includes(q)));
+        return fns.size ? [[rk, { ...r, fns }]] : [];
+      });
+    }
+    const visible = showAllRuns || q ? ordered : ordered.slice(0, RUNS_SHOWN);
+    let lastDay = '';
+    const body = visible.map(([runKey, r], idx) => {
+      const groups = [...r.fns.values()];
+      const all = groups.flatMap(g => g.jobs);
+      const runFail = groups.reduce((n, g) => n + g.fails.length + g.calls.reduce((m, c) => m + callFailN(c), 0), 0);
+      const doneN = all.filter(j => j.status === 'applied').length;
+      const parts = groups.reduce((n, g) => n + (g.jobs[0]?.run?.parts || g.jobs.length), 0);
+      const callN = groups.reduce((n, g) => n + g.calls.length, 0);
+      const unfinished = all.some(j => j.status !== 'applied');
+      const day = runKey === '' ? '更早的记录' : dayLabelOf(r.at);
+      const dayHead = day !== lastDay ? `<div class="af-hist-day">${esc(day)}</div>` : '';
+      lastDay = day;
+      const check = `<button type="button" class="af-hist-check${histSel.has(runKey) ? ' on' : ''}" data-act="hist-sel" data-run="${esc(runKey)}" title="选择这个批次，可批量复制 / 删除"></button>`;
+      const runAct = Math.max(0, ...all.map(jobTime), ...groups.flatMap(g => [...g.calls.map(cc => cc.time), ...g.fails.map(f => f.time)]), ...noteLog.filter(n => n.runId === runKey).map(n => n.time));
+      const runDot = runAct > (readSeen()[runKey] || 0) ? `<i class="af-dot af-run-dot ${dotState(runFail > 0, unfinished)}" title="有新的结果，点击这个批次后消失"></i>` : '';
+      const okN = groups.reduce((n, g) => n + g.calls.reduce((m, cc) => m + cc.ok, 0), 0);
+      const names = groups.map(g => g.name).join('、');
+      const stat = [callN ? `成功 ${okN} 条${runFail ? `，失败 ${runFail} 条` : ''}` : runFail ? `失败 ${runFail} 条` : '', all.length ? `${doneN}/${parts} 个异步任务已写回` : ''].filter(Boolean).join(' · ') || '无执行结果';
+      const attrs = `data-run="${esc(runKey)}"`;
+      const canRestore = runKey !== '' && runConfigOf(runKey) !== null; // 从面板运行过、记着当时的配置，才能复现
+      const restoreBtns = canRestore ? `<button class="af-add" data-act="jobs-restore" data-mode="fns" ${attrs} title="把「函数」块整体换成这个批次运行时的配置（各函数、输入映射、输出字段）。筛选条件不动；面板上现有的函数配置会被替换，只想恢复其中一个函数请用函数行上的「复现」">恢复函数配置</button>` : '';
+      return dayHead + `<div class="af-hist-item af-runcard${unfinished ? ' live' : ''}${histSel.has(runKey) ? ' sel' : ''}" data-run="${esc(runKey)}">${runDot}${check}` +
+        `<button type="button" class="af-hist-x" data-act="jobs-clear" ${attrs} title="删除这个批次的记录（已写回的任务只是不再显示）">×</button>` +
+        `<div class="af-hist-title"><span class="af-hist-kind run">批次</span>${runKey === '' ? '' : `<span class="af-hist-name${runNames[runKey] ? '' : ' empty'}" data-act="run-rename" data-run="${esc(runKey)}" title="点击给这个批次命名 / 改名，方便以后查找；命名过的批次超出保留上限时优先保留">${runNames[runKey] ? esc(runNames[runKey]) : '＋ 命名'}</span>`}<span class="af-hist-time">${runKey === '' ? '无批次信息' : esc(fmtClock(r.at, true).replace(/^\d\d-\d\d /, ''))}</span></div>` +
+        `<div class="af-hist-line" title="${esc(names)}">${r.total ? `${r.total} 条记录 · ` : ''}函数：${esc(names)}</div>` +
+        `<div class="af-hist-line stat${runFail > 0 ? ' bad' : ''}" title="${esc(stat)}">${esc(stat)}${statChips(all, 0)}</div>` +
+        `<div class="af-fnrows">${[...r.fns.entries()].map(([fid, g]) => fnTasksHtml(runKey, fid, g, idx === 0 || !!q, noteOf)).join('')}</div>` +
+        `<div class="af-hist-btns"><span class="af-hist-btns-left">${restoreBtns}<button class="af-add" data-act="jobs-copy" ${attrs} title="复制这个批次的记录和执行详情">复制</button></span></div></div>`;
+    }).join('') + (!q && ordered.length > RUNS_SHOWN ? `<button type="button" class="af-add af-runs-toggle" data-act="jobs-runs">${showAllRuns ? '收起较早的批次' : `显示更早的 ${ordered.length - RUNS_SHOWN} 个批次`}</button>` : '');
+    const execN = live.length + callLog.length;
+    const info = ordered.length ? `${q ? '匹配 ' : ''}${ordered.length} 个批次 · ${execN} 次执行${failN ? ` · ${failN} 条失败` : ''}` : '';
+    return {
+      chips, info, runKeys: visible.map(([k]) => k),
+      body: body || `<div class="af-note-empty">${q ? '没有匹配的记录' : '还没有运行记录。运行函数后，每次调用、异步任务和函数返回的执行详情都会记在这里'}</div>`,
+    };
+  }
+  // 历史里的点击（历史窗口、面板本身共用）；处理了返回 true
+  function handleJobAct(act: string, btn: HTMLElement): boolean {
+    const runScope = (): string[] | undefined => (btn.dataset.run !== undefined ? [btn.dataset.run] : undefined); // 没有 data-run = 全部
+    const copied = (text: string) => copyText(text).then(() => { const old = btn.innerHTML; const isIcon = !!btn.querySelector('svg'); btn.innerHTML = isIcon ? ico('check') : '已复制'; setTimeout(() => { btn.innerHTML = old; }, 1500); }, () => { /* 复制失败不打扰 */ });
+    switch (act) {
+      case 'jobs-refresh': refreshJobs(); return true;
+      case 'jobs-toggle': if (jobWin) closeJobWin(); else openJobWin(); return true;
+      case 'jobs-runs': jobShowAllRuns = !jobShowAllRuns; updateJobsView(); return true;
+      case 'jobs-fold': foldOpen.set(btn.dataset.key || '', btn.dataset.open !== '1'); updateJobsView(); return true;
+      case 'jobs-win-close': closeJobWin(); return true;
+      case 'jobs-copy': copied(histText(runScope(), btn.dataset.fn)); return true;
+      case 'jobs-clear': clearHist(runScope(), btn.dataset.fn); return true;
+      case 'jobs-restore': {
+        const cfg = runConfigOf(btn.dataset.run || '');
+        const mode = btn.dataset.mode === 'all' ? 'all' : btn.dataset.mode === 'filter' ? 'filter' : 'fns';
+        if (cfg && restoreHistory({ id: '', time: Number(readSeenAt(btn.dataset.run || '')) || Date.now(), kind: 'run', config: cfg, matched: 0, total: 0 }, mode, btn.dataset.fn)) closeJobWin();
+        return true;
+      }
+      case 'hist-sel': { const k = btn.dataset.run || ''; if (histSel.has(k)) histSel.delete(k); else histSel.add(k); updateJobsView(); return true; }
+      case 'hist-sel-all': {
+        const keys = historyPanelHtml(jobShowAllRuns).runKeys;
+        if (keys.length && keys.every(k => histSel.has(k))) keys.forEach(k => histSel.delete(k)); else keys.forEach(k => histSel.add(k));
+        updateJobsView(); return true;
+      }
+      case 'jobs-copy-sel': copied(histText([...histSel])); return true;
+      case 'jobs-clear-sel': clearHist([...histSel]); return true;
+      case 'note-view': { const n = noteLog.find(x => String(x.uid) === btn.dataset.uid); if (n) showNotePop(n, false); return true; }
+      case 'job-cancel': cancelJob(btn.dataset.id!); return true;
+      default: return false;
+    }
+  }
+
+  // 批次改名：原地换成输入框，回车 / 失焦保存，Esc 放弃，留空就是取消命名（和批处理历史的命名一样）
+  function renameRun(el: HTMLElement) {
+    const runKey = el.dataset.run || '';
+    loadHist();
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'af-hist-name-input';
+    input.value = runNames[runKey] || '';
+    input.maxLength = HISTORY_NAME_MAX;
+    input.placeholder = '给这个批次起个名字';
+    let done = false;
+    const finish = (save: boolean) => {
+      if (done) return;
+      done = true;
+      renamingRun = false;
+      const body = jobWin?.querySelector('[data-jobwin-body]');
+      if (body) lastHtml.delete(body as HTMLElement); // 输入框是直接换进 DOM 的，内容没变时 setHtml 会跳过重画，输入框就留在那里；清掉缓存强制重画
+      if (save) {
+        const v = input.value.trim();
+        if (v) runNames[runKey] = v; else delete runNames[runKey];
+        trimHist();
+        saveHist();
+      }
+      updateJobsView();
+    };
+    input.addEventListener('keydown', (e) => {
+      e.stopPropagation(); // Esc 只放弃命名，不关历史窗口
+      if (e.key === 'Enter') finish(true);
+      else if (e.key === 'Escape') finish(false);
+    });
+    input.addEventListener('blur', () => finish(true));
+    renamingRun = true;
+    el.replaceWith(input);
+    input.focus();
+    input.select();
+  }
+
+  // 历史窗口（挂在 body 上，样式沿用批处理的「历史记录」窗口）：搜索 + 选择栏 + 按天分组的批次卡片
+  function openJobWin() {
+    if (!jobWin) {
+      try { localStorage.setItem(NOTE_SEEN_KEY(), String(Date.now())); } catch { /* ignore */ }
+      histQuery = '';
+      const overlay = document.createElement('div');
+      overlay.className = 'af-modal';
+      overlay.innerHTML = `<div class="af-modal-box af-hist-box af-histwin-box" role="dialog" aria-modal="true">
+        <div class="af-modal-head"><span>历史（函数运行记录）</span><span class="af-pop-chips" data-jobwin-chips></span><button type="button" class="af-x" data-act="jobs-win-close" title="关闭">×</button></div>
+        <div class="af-hist-search"><input type="text" data-hist-search placeholder="搜索批次名称、函数名、批次时间、执行详情、失败原因…" /></div>
+        <div class="af-hist-bar"><button type="button" class="af-hist-check" data-act="hist-sel-all" data-hist-selall title="全选 / 取消全选（当前列表里的批次）"></button><span class="af-hist-selinfo" data-jobwin-info></span>
+          <button type="button" class="af-add" data-act="jobs-copy-sel" data-hist-selbtn disabled title="复制勾选的批次">复制</button><button type="button" class="af-add" data-act="jobs-clear-sel" data-hist-selbtn disabled title="删除勾选的批次">删除</button>
+          <button type="button" class="af-add" data-act="jobs-refresh" title="立即刷新任务状态，并写回已完成的任务">刷新</button></div>
+        <div class="af-modal-body af-hist-list" data-jobwin-body></div></div>`;
+      overlay.addEventListener('click', (e) => {
+        const t = e.target as HTMLElement;
+        if (t === overlay) { closeJobWin(); return; }
+        const card = t.closest('.af-runcard') as HTMLElement | null;
+        const dot = card?.querySelector('.af-run-dot');
+        if (card && dot) { markRunSeen(card.dataset.run || ''); dot.remove(); } // 点这个批次卡片的任何位置，它的提示点消失
+        const nameEl = t.closest('[data-act="run-rename"]') as HTMLElement | null;
+        if (nameEl) { renameRun(nameEl); return; }
+        const btn = t.closest('button[data-act]') as HTMLElement | null;
+        if (!btn) return;
+        const act = btn.dataset.act!;
+        if (act.startsWith('afail-')) onAsyncFailAction(act, btn); else handleJobAct(act, btn);
+      });
+      overlay.addEventListener('input', (e) => {
+        const t = e.target as HTMLInputElement;
+        if (t.matches('[data-hist-search]')) { histQuery = t.value; updateJobsView(); }
+      });
+      overlay.addEventListener('toggle', (e) => { // 失败明细展开 / 折叠要记住，重绘后保持原样
+        const el = e.target as HTMLDetailsElement;
+        if (el.classList?.contains('af-afail')) { const k = el.dataset.fn || ''; if (el.open) afailOpenKeys.add(k); else afailOpenKeys.delete(k); }
+      }, true);
+      document.body.appendChild(overlay); // 挂在 body 上，不受面板缩放影响
+      jobWin = overlay;
+      (overlay.querySelector('[data-hist-search]') as HTMLInputElement).focus();
+    }
+    updateJobsView();
+  }
+  function closeJobWin() { if (jobWin) { jobWin.remove(); jobWin = null; histSel.clear(); updateJobsView(); } }
+
+  // 执行详情悬浮窗：点历史里某次调用的「说明」打开（只看这一条）；函数返回了说明且开着“自动弹出”时也会弹出（同一次运行的后续说明追加在里面）。不遮罩，不挡操作
+  function noteItemHtml(n: ExecNote): string {
+    const title = `${n.part ? `${n.async ? '任务' : '调用'} ${n.part}/${n.parts}` : '详情'}${n.from ? ` · ${rangeText(n.from, n.to)}` : ''}`;
+    return `<div class="af-notepop-item"><div class="af-note-head"><b>${esc(n.fnName)}</b><span>${esc(title)}</span><span>${esc(fmtClock(n.time, true))}</span></div>${noteInnerHtml(n)}</div>`;
+  }
+  function showNotePop(n: ExecNote, append: boolean) {
+    if (!append || !notePop) notePopList = [n]; else notePopList.push(n);
+    if (notePopList.length > 50) notePopList.splice(0, notePopList.length - 50);
+    if (!notePop) {
+      const win = document.createElement('div');
+      win.className = 'af-modal af-notepop';
+      win.innerHTML = `<div class="af-modal-box"><div class="af-modal-head"><span>执行详情</span>
+        <span class="af-modal-actions"><button type="button" class="af-add" data-npop="copy">复制</button><button type="button" class="af-x" data-npop="close" title="关闭">×</button></span></div>
+        <div class="af-modal-body af-notepop-body"></div></div>`;
+      win.addEventListener('click', (e) => {
+        if (e.target === win) { closeNotePop(); return; } // 点遮罩关闭
+        const act = (e.target as HTMLElement).closest('[data-npop]')?.getAttribute('data-npop');
+        if (act === 'close') closeNotePop();
+        else if (act === 'copy') {
+          const btn = (e.target as HTMLElement).closest('[data-npop]') as HTMLElement;
+          copyText(notePopList.map(x => [`【${x.fnName}${x.part ? ` 任务${x.part}/${x.parts}` : ''} ${fmtClock(x.time, true)}】`, ...noteLines(x).map(l => l.trim())].join('\n')).join('\n\n')).then(() => { btn.textContent = '已复制'; setTimeout(() => { btn.textContent = '复制'; }, 1500); }, () => { /* ignore */ });
+        }
+      });
+      document.body.appendChild(win);
+      notePop = win;
+    }
+    const body = notePop.querySelector('.af-notepop-body') as HTMLElement;
+    body.innerHTML = notePopList.map(noteItemHtml).join('');
+    if (append) body.scrollTop = body.scrollHeight;
+  }
+  function closeNotePop() { if (notePop) { notePop.remove(); notePop = null; notePopList = []; } }
+
+  // 「函数」块右上角常驻的「历史」按钮：右上角一个状态点（执行中橙、有失败红、全部完成绿，没有记录时不显示）；点击打开历史窗口。
   // 状态不占面板版面，所以下发之后可以继续配置、运行别的函数
   function jobBadgeHtml(): string {
-    const live = jobList.filter(j => j.status !== 'cancelled');
-    if (live.length === 0 && asyncFails.length === 0) return '';
+    loadHist();
+    const live = visibleJobs();
+    const seenAt = Number(localStorage.getItem(NOTE_SEEN_KEY()) || 0);
+    const activity = Math.max(0, ...live.map(jobTime), ...callLog.map(c => c.time), ...noteLog.map(n => n.time), ...asyncFails.map(f => f.time));
+    const unseen = activity > seenAt; // 有新的活动（新调用 / 任务状态变化 / 新详情）：亮点，点开历史就消失
     const busy = live.filter(j => j.status === 'queued' || j.status === 'running').length;
     const waiting = live.filter(j => j.status === 'done' || j.status === 'failed').length;
     const applied = live.filter(j => j.status === 'applied').length;
+    const failN = asyncFails.length + callLog.reduce((n, c) => n + callFailN(c), 0);
     // 红色只表示失败：只要有失败的行就立刻变红（还有任务没结束时，红点呼吸，表示“有失败，且还没跑完”）；没有失败：执行中橙色呼吸，全部完成绿色
     const live2 = busy > 0 || waiting > 0;
-    const state = asyncFails.length ? (live2 ? 'bad live' : 'bad') : live2 ? 'busy' : 'ok';
-    const tip = ['异步任务', busy ? `运行中 ${busy}` : '', waiting ? `待写回 ${waiting}` : '', applied ? `已写回 ${applied}` : '', asyncFails.length ? `${asyncFails.length} 条失败` : ''].filter(Boolean).join(' · ');
-    let pop = '';
-    if (jobPopOpen) {
-      const chip = (cls: string, text: string) => `<span class="af-chip ${cls}">${esc(text)}</span>`;
-      const chips = [busy ? chip('busy', `运行中 ${busy}`) : '', waiting ? chip('wait', `待写回 ${waiting}`) : '', applied ? chip('ok', `已写回 ${applied}`) : '',
-        asyncFails.length ? chip('bad', `${asyncFails.length} 条失败`) : ''].join('');
-      // 分组：批次（runId，没有批次信息的归到“更早的任务”）→ 函数
-      type FnGroup = { name: string; jobs: JobSummary[]; fails: AsyncFail[] };
-      const runs = new Map<string, { at: number; total: number; fns: Map<string, FnGroup> }>();
-      const runOf = (id: string) => { if (!runs.has(id)) runs.set(id, { at: 0, total: 0, fns: new Map() }); return runs.get(id)!; };
-      const fnOf2 = (r: { fns: Map<string, FnGroup> }, id: string, name: string) => { if (!r.fns.has(id)) r.fns.set(id, { name, jobs: [], fails: [] }); return r.fns.get(id)!; };
-      live.forEach(j => { const r = runOf(j.run?.id || ''); if (j.run) { r.at = j.run.at; r.total = j.run.total; } fnOf2(r, j.fnId, j.fnName).jobs.push(j); });
-      asyncFails.forEach(f => { const r = runOf(f.runId || ''); if (f.runId && !r.at) r.at = f.time; fnOf2(r, f.fnId || 'name:' + f.fnName, f.fnName).fails.push(f); });
-      const ordered = [...runs.entries()].sort((a, b) => (a[0] === '' ? 1 : 0) - (b[0] === '' ? 1 : 0) || b[1].at - a[1].at); // 最新的批次在前，没有批次信息的放最后
-      const visible = jobShowAllRuns ? ordered : ordered.slice(0, RUNS_SHOWN);
-      const body = visible.map(([runKey, r]) => {
-        const all = [...r.fns.values()].flatMap(g => g.jobs);
-        const doneN = all.filter(j => j.status === 'applied').length;
-        const parts = [...r.fns.values()].reduce((n, g) => n + (g.jobs[0]?.run?.parts || g.jobs.length), 0);
-        const open = all.some(j => j.status !== 'applied');
-        const head = runKey === ''
-          ? `<span class="af-run-title">更早的任务</span>`
-          : `<span class="af-run-title">批次 ${esc(fmtClock(r.at, true))}</span><span class="af-run-meta">${r.total ? `${r.total} 条` : ''}</span>`;
-        return `<div class="af-run${open ? ' live' : ''}"><div class="af-run-head">${head}<span class="af-run-prog">${all.length ? `${doneN}/${parts} 已写回` : ''}</span></div>` +
-          [...r.fns.entries()].map(([fid, g]) => fnTasksHtml(runKey, fid, g)).join('') + '</div>';
-      }).join('') + (ordered.length > RUNS_SHOWN ? `<button type="button" class="af-add af-runs-toggle" data-act="jobs-runs">${jobShowAllRuns ? '收起较早的批次' : `显示更早的 ${ordered.length - RUNS_SHOWN} 个批次`}</button>` : '');
-      pop = `<div class="af-job-pop"><div class="af-pop-head"><span class="af-pop-title">任务记录</span><span class="af-pop-chips">${chips}</span>` +
-        `<button type="button" class="af-pop-icon" data-act="jobs-refresh" title="立即刷新任务状态，并写回已完成的任务">${ico('refresh')}</button>` +
-        `<button type="button" class="af-pop-icon" data-act="jobs-toggle" title="关闭">×</button></div><div class="af-pop-body">${body}</div></div>`;
-    }
-    return `<button type="button" class="af-job-badge${jobPopOpen ? ' on' : ''}" data-act="jobs-toggle" title="${esc(tip)}">${ico('list')}<span>任务</span><i class="af-dot ${state}"></i></button>${pop}`;
+    const hasAny = live.length > 0 || callLog.length > 0 || noteLog.length > 0 || failN > 0;
+    const state = dotState(failN > 0, live2);
+    const tip = ['运行历史', busy ? `运行中 ${busy}` : '', waiting ? `待写回 ${waiting}` : '', applied ? `已写回 ${applied}` : '', callLog.length ? `同步调用 ${callLog.length} 次` : '', failN ? `${failN} 条失败` : ''].filter(Boolean).join(' · ');
+    return `<button type="button" class="af-job-badge${jobWin ? ' on' : ''}" data-act="jobs-toggle" title="${esc(tip + (hasAny && unseen ? ' · 有新的结果' : ''))}">${ico('list')}<span>历史</span>${hasAny && unseen ? `<i class="af-dot ${state}"></i>` : ''}</button>`;
   }
 
   function jobNoteHtml(): string { return jobNote ? `<div class="af-hint af-err">${esc(jobNote)}</div>` : ''; }
@@ -1302,6 +1901,16 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
   function updateJobsView() {
     const badge = container.querySelector('[data-jobs-badge]') as HTMLElement | null;
     if (badge) setHtml(badge, jobBadgeHtml());
+    if (jobWin && !renamingRun) { // 历史窗口：只换列表内容，滚动位置保持不变
+      const panel = historyPanelHtml(jobShowAllRuns);
+      [...histSel].forEach(k => { if (!panel.runKeys.includes(k)) histSel.delete(k); }); // 被搜索过滤掉 / 已删除的批次不再算选中
+      const n = histSel.size;
+      setHtml(jobWin.querySelector('[data-jobwin-chips]') as HTMLElement, panel.chips);
+      setHtml(jobWin.querySelector('[data-jobwin-info]') as HTMLElement, esc(n ? `已选 ${n} 个批次` : panel.info));
+      setHtml(jobWin.querySelector('[data-jobwin-body]') as HTMLElement, panel.body);
+      (jobWin.querySelector('[data-hist-selall]') as HTMLElement).className = 'af-hist-check' + (n === 0 ? '' : n >= panel.runKeys.length ? ' on' : ' part');
+      jobWin.querySelectorAll('[data-hist-selbtn]').forEach(b => { (b as HTMLButtonElement).disabled = n === 0; });
+    }
     const note = container.querySelector('.af-jobs-note') as HTMLElement | null;
     if (note) setHtml(note, jobNoteHtml());
   }
@@ -1315,7 +1924,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     const rows = asyncFails.filter(f => failKey(f) === key);
     try {
       if (act === 'afail-clear') {
-        if (!confirm('清空这个函数的异步失败明细？')) return;
+        if (!confirm('删除这个函数的异步失败明细？')) return;
         asyncFails = asyncFails.filter(f => failKey(f) !== key);
         try { localStorage.setItem(asyncFailKey(), JSON.stringify(asyncFails)); } catch { /* ignore */ }
         updateJobsView();
@@ -1417,7 +2026,8 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
 
   // ── 导出 / 导入筛选条件（JSON 文件），方便跨表格、跨人复用 ──
   // 文件里每个条件除了字段 ID，还带上字段名：换一张表时字段 ID 对不上，就按字段名重新匹配
-  const FILTER_FILE_TYPE = 'bitable-editor-filter';
+  const FILTER_FILE_TYPE = 'data-engine-filter';
+  const LEGACY_FILTER_FILE_TYPE = 'bitable-editor-filter'; // 插件改名（bitable-editor → data-engine）前导出的文件，仍可导入
   const FILTER_MAX_DEPTH = 8;
 
   function filterForExport(g: Group): any {
@@ -1479,7 +2089,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       try {
         let data: any;
         try { data = JSON.parse(await file.text()); } catch { throw new Error('文件不是合法的 JSON'); }
-        if (!data || data.type !== FILTER_FILE_TYPE) throw new Error('这不是本插件导出的筛选条件文件');
+        if (!data || (data.type !== FILTER_FILE_TYPE && data.type !== LEGACY_FILTER_FILE_TYPE)) throw new Error('这不是本插件导出的筛选条件文件');
         const filter = parseFilter(data.filter);
         const missing: string[] = [];
         mapImportedFields(filter, missing);
@@ -1606,39 +2216,62 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     return walk(g, true) || '无（全部记录）';
   }
 
-  function describeIo(c: Config): string {
+  // 按函数描述配置：每个函数一行——函数名、入参 ← 字段（或 = 填写的值）、输出 → 字段
+  function describeFns(c: Config): string[] {
     const names = new Map(host.getAllFields().map(f => [f.id, f.name]));
     const fieldName = (id: string) => (id ? names.get(id) ?? '（字段已不存在）' : '未选字段');
-    const ins = [...new Set(c.inputs.filter(i => i.fieldId || !i.fn).map(i => `${i.param || '未选参数'} ← ${fieldName(i.fieldId)}`))];
-    const outs = c.outputs.map(o => o.param.startsWith(FN_PREFIX) ? `调用 ${outLabel(o.param)}` : `${findOutput(o.param)?.out.label || o.param || '未选参数'}${o.fieldId ? ` → ${fieldName(o.fieldId)}` : '（不写入）'}`);
-    return [ins.length ? `输入：${ins.join('，')}` : '', outs.length ? `函数：${outs.join('，')}` : ''].filter(Boolean).join('；') || '未配置输入 / 函数';
+    const fnIdOf = (key: string) => findCall(key)?.id ?? findOutput(key)?.fn.id ?? '';
+    const order: string[] = [];
+    for (const o of c.outputs) { const id = fnIdOf(o.param); if (id && !order.includes(id)) order.push(id); }
+    const lines = order.map((id) => {
+      const fn = fns.find(f => f.id === id);
+      const ins = c.inputs.filter(i => i.fn === id && (i.fieldId || i.value !== undefined)).map(i => (i.value !== undefined
+        ? `${i.param} = ${Array.isArray(i.value) ? i.value.join('、') || '（未选）' : i.value || '（未填）'}`
+        : `${i.param} ← ${fieldName(i.fieldId)}`));
+      const outs = c.outputs.filter(o => fnIdOf(o.param) === id && !o.param.startsWith(FN_PREFIX))
+        .map(o => `${findOutput(o.param)?.out.label || o.param}${o.fieldId ? ` → ${fieldName(o.fieldId)}` : '（不写入）'}`);
+      return `${fn?.name || id}${ins.length ? `｜入参：${ins.join('，')}` : ''}${outs.length ? `｜写入：${outs.join('，')}` : outs.length === 0 ? '｜只调用' : ''}`;
+    });
+    // 旧版历史里没带函数归属的输入，单独列出来
+    const legacy = c.inputs.filter(i => !i.fn && (i.fieldId || i.value !== undefined)).map(i => `${i.param || '未选参数'} ← ${fieldName(i.fieldId)}`);
+    if (legacy.length) lines.push(`输入：${legacy.join('，')}`);
+    return lines;
   }
 
-  function restoreHistory(entry: HistoryEntry, only: 'all' | 'filter'): boolean {
+  function restoreHistory(entry: HistoryEntry, only: 'all' | 'filter' | 'fns', fnId?: string): boolean {
     if (running || exporting) { alert('正在读取记录或运行中，完成后再恢复历史配置'); return false; }
     const hasContent = config.filter.children.length > 0 || config.inputs.length > 0 || config.outputs.length > 0;
     const cur = JSON.stringify(config);
     // 当前配置没跑过（历史里找不到一模一样的）：恢复会把它覆盖掉，先确认
     if (hasContent && !readHistory().some(h => JSON.stringify(h.config) === cur) &&
-        !confirm('当前配置还没有筛选 / 运行过，恢复历史配置会覆盖它，确定吗？')) return false;
+        !confirm('当前配置还没有运行过，恢复历史配置会覆盖它，确定吗？')) return false;
     const saved = JSON.parse(JSON.stringify(entry.config)) as Config;
-    config = only === 'filter' ? { ...config, filter: saved.filter } : { ...newConfig(), ...saved };
+    if (only === 'filter') config = { ...config, filter: saved.filter };
+    else if (only === 'fns') {
+      migrateLegacyInputs(saved);
+      if (fnId === undefined) config = { ...config, inputs: saved.inputs, outputs: saved.outputs }; // 整套函数配置（筛选条件不动）
+      else { // 只换这个函数：先去掉当前配置里它的输出 / 输入，再放进当时的
+        const mine = (o: Mapping) => (fnOfKey(o.param)?.id ?? findCall(o.param)?.id) === fnId;
+        config = { ...config, outputs: [...config.outputs.filter(o => !mine(o)), ...saved.outputs.filter(mine)], inputs: [...config.inputs.filter(i => i.fn !== fnId), ...saved.inputs.filter(i => i.fn === fnId)] };
+      }
+    } else config = { ...newConfig(), ...saved };
     migrateSeps(config.filter);
     migrateLegacyInputs(config); // 旧版历史里的输入是全局的
     saveConfig();
     const when = new Date(entry.time);
     const pad2 = (n: number) => String(n).padStart(2, '0');
-    setStatus(`已恢复 ${when.getMonth() + 1}-${when.getDate()} ${pad2(when.getHours())}:${pad2(when.getMinutes())} 的${only === 'filter' ? '筛选条件' : '整套配置'}`, 'ok');
+    setStatus(`已恢复 ${when.getMonth() + 1}-${when.getDate()} ${pad2(when.getHours())}:${pad2(when.getMinutes())} 的${only === 'filter' ? '筛选条件' : only === 'fns' ? (fnId !== undefined ? '函数配置（该函数）' : '函数配置') : '整套配置'}`, 'ok');
     render();
     return true;
   }
 
   // ── 历史记录导出 / 导入（JSON 文件）：和筛选条件一样，字段除了 ID 还带上字段名，换一张表时按字段名重新对应 ──
-  const HISTORY_FILE_TYPE = 'bitable-editor-history';
+  const HISTORY_FILE_TYPE = 'data-engine-history';
+  const LEGACY_HISTORY_FILE_TYPE = 'bitable-editor-history'; // 改名前导出的文件，仍可导入
 
   function entryForExport(e: HistoryEntry): any {
     const byId = new Map(host.getAllFields().map(f => [f.id, f.name]));
-    const io = (m: Mapping) => ({ param: m.param, fieldId: m.fieldId, fieldName: byId.get(m.fieldId) ?? '', ...(m.fn ? { fn: m.fn } : {}) });
+    const io = (m: Mapping) => ({ param: m.param, fieldId: m.fieldId, fieldName: byId.get(m.fieldId) ?? '', ...(m.fn ? { fn: m.fn } : {}), ...(m.value !== undefined ? { value: m.value } : {}) });
     return {
       time: e.time, kind: e.kind, ...(e.name ? { name: e.name } : {}), matched: e.matched, total: e.total,
       ...(e.result ? { result: e.result } : {}), ...(e.ok !== undefined ? { ok: e.ok } : {}),
@@ -1654,7 +2287,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
   function parseHistoryFile(text: string): { entries: HistoryEntry[]; skipped: number; missing: string[] } {
     let data: any;
     try { data = JSON.parse(text); } catch { throw new Error('文件不是合法的 JSON'); }
-    if (!data || data.type !== HISTORY_FILE_TYPE || !Array.isArray(data.entries)) throw new Error('这不是本插件导出的历史记录文件');
+    if (!data || (data.type !== HISTORY_FILE_TYPE && data.type !== LEGACY_HISTORY_FILE_TYPE) || !Array.isArray(data.entries)) throw new Error('这不是本插件导出的历史记录文件');
     const all = host.getAllFields();
     const missing: string[] = [];
     const mapField = (id: string, name: string): string => {
@@ -1666,9 +2299,11 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       missing.push(name || id);
       return '';
     };
+    // 不来自字段的入参填的值：字符串，或（多选）字符串数组
+    const value = (v: any) => (typeof v === 'string' ? { value: v } : Array.isArray(v) ? { value: v.map(String) } : {});
     const io = (raw: any): Mapping[] => {
-      if (!Array.isArray(raw)) throw new Error('输入 / 函数的结构不对');
-      return raw.map((m: any) => ({ param: String(m?.param ?? ''), fieldId: mapField(String(m?.fieldId ?? ''), String(m?.fieldName ?? '')), ...(typeof m?.fn === 'string' && m.fn ? { fn: m.fn } : {}) }));
+      if (!Array.isArray(raw)) throw new Error('函数配置的结构不对');
+      return raw.map((m: any) => ({ param: String(m?.param ?? ''), fieldId: mapField(String(m?.fieldId ?? ''), String(m?.fieldName ?? '')), ...(typeof m?.fn === 'string' && m.fn ? { fn: m.fn } : {}), ...value(m?.value) }));
     };
     const entries: HistoryEntry[] = [];
     let skipped = 0;
@@ -1690,7 +2325,10 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     return { entries, skipped, missing };
   }
 
-  function openHistory() {
+  // mode：'run' 运行历史（标题行的历史按钮）：只列运行记录，用来复现整套「筛选 + 函数」配置；'filter' 筛选历史（筛选块菜单里的历史）：只列筛选 / 预览 / 统计 / 导出，只管筛选条件
+  function openHistory(mode: 'run' | 'filter' = 'run') {
+    const isRunMode = mode === 'run';
+    const inMode = (e: HistoryEntry) => (e.kind === 'run') === isRunMode;
     const pad = (n: number) => String(n).padStart(2, '0');
     const dayLabel = (t: number) => {
       const d = new Date(t), today = new Date();
@@ -1700,8 +2338,8 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     const overlay = document.createElement('div');
     overlay.className = 'af-modal';
     overlay.innerHTML = `<div class="af-modal-box af-hist-box" role="dialog" aria-modal="true">
-      <div class="af-modal-head"><span>历史记录（最多 ${HISTORY_LIMIT} 条，命名过的优先保留）</span><button class="af-x" data-close title="关闭">×</button></div>
-      <div class="af-hist-search"><input type="text" data-search placeholder="搜索名称、字段名、条件、函数…" /></div>
+      <div class="af-modal-head"><span>${isRunMode ? '运行历史' : '筛选历史'}（最多 ${HISTORY_LIMIT} 条，命名过的优先保留）</span><button class="af-x" data-close title="关闭">×</button></div>
+      <div class="af-hist-search"><input type="text" data-search placeholder="搜索名称、字段名、条件、函数名…" /></div>
       <div class="af-hist-bar"><button type="button" class="af-hist-check" data-selall title="全选 / 取消全选（当前列表里显示的记录）"></button><span class="af-hist-selinfo" data-selinfo></span><button class="af-add" data-import title="从文件导入历史记录（和现有的合并，不会覆盖）">导入</button><button class="af-add" data-export-all disabled title="先勾选要导出的记录">导出</button><button class="af-add" data-delsel disabled title="先勾选要删除的记录">删除</button></div>
       <div class="af-hist-msg" data-msg hidden></div>
       <div class="af-modal-body af-hist-list"></div>
@@ -1718,9 +2356,9 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     const notice = (text: string, isError = false) => { msgEl.textContent = text; msgEl.hidden = !text; msgEl.classList.toggle('error', isError); };
 
     const draw = () => {
-      const items = readHistory().map(e => {
+      const items = readHistory().filter(inMode).map(e => {
         const when = new Date(e.time);
-        const lines = [`筛选：${describeFilter(e.config.filter)}`, describeIo(e.config)];
+        const lines = isRunMode ? [`筛选：${describeFilter(e.config.filter)}`, ...(describeFns(e.config).length ? describeFns(e.config).map(l => `函数：${l}`) : ['函数：未配置'])] : [`筛选：${describeFilter(e.config.filter)}`];
         const stat = e.kind === 'run' && e.result ? e.result : `命中 ${e.matched} / 共 ${e.total} 条`;
         return { e, when, lines, stat, text: [e.name || '', HISTORY_KINDS[e.kind], ...lines, stat].join('\n').toLowerCase() };
       });
@@ -1736,7 +2374,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       (delSelEl as HTMLButtonElement).disabled = (exportAllEl as HTMLButtonElement).disabled = selected.size === 0;
       delSelEl.title = selected.size ? `删除勾选的 ${selected.size} 条历史记录` : '先勾选要删除的记录';
       exportAllEl.title = selected.size ? `把勾选的 ${selected.size} 条历史记录导出为文件，方便备份或分享给别人` : '先勾选要导出的记录';
-      if (!shown.length) { listEl.innerHTML = `<div class="af-hint">${items.length ? '没有匹配的历史记录' : '还没有历史记录：筛选、预览、导出或运行之后，会自动记在这里'}</div>`; return; }
+      if (!shown.length) { listEl.innerHTML = `<div class="af-hint">${items.length ? '没有匹配的历史记录' : (isRunMode ? '还没有运行记录：运行之后，会把当时的筛选条件和函数配置记在这里' : '还没有筛选记录：筛选、预览、统计或导出之后，会把当时的筛选条件记在这里')}</div>`; return; }
       let lastDay = '';
       listEl.innerHTML = shown.map(({ e, when, lines, stat }) => {
         const day = dayLabel(e.time);
@@ -1748,7 +2386,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
           <div class="af-hist-title"><span class="af-hist-kind ${e.kind}">${HISTORY_KINDS[e.kind]}</span><span class="af-hist-name${e.name ? '' : ' empty'}" data-h="rename" title="点击给这条记录命名 / 改名，方便以后查找">${e.name ? esc(e.name) : '＋ 命名'}</span><span class="af-hist-time">${pad(when.getHours())}:${pad(when.getMinutes())}:${pad(when.getSeconds())}</span></div>
           ${lines.map(l => `<div class="af-hist-line" title="${esc(l)}">${esc(l)}</div>`).join('')}
           <div class="af-hist-line stat${e.ok === false ? ' bad' : ''}" title="${esc(stat)}">${esc(stat)}</div>
-          <div class="af-hist-btns"><span class="af-hist-btns-left"><button class="af-add" data-h="all" title="把筛选、输入、函数整套换成这条记录当时的配置">恢复全部</button><button class="af-add" data-h="filter" title="只替换筛选条件，输入 / 输出保持不变">仅恢复筛选</button><button class="af-add" data-h="export" title="把这条历史记录导出为文件">导出</button></span></div>
+          <div class="af-hist-btns"><span class="af-hist-btns-left">${isRunMode ? `<button class="af-add" data-h="all" title="把筛选条件和函数配置整套换成这条记录当时的配置">恢复全部</button><button class="af-add" data-h="filter" title="只替换筛选条件，函数配置保持不变">仅恢复筛选</button><button class="af-add" data-h="fns" title="只替换函数配置（各函数、入参映射、输出字段），筛选条件保持不变">仅恢复函数</button>` : `<button class="af-add" data-h="filter" title="把筛选条件换成这条记录当时的条件，函数配置保持不变">恢复筛选条件</button>`}<button class="af-add" data-h="export" title="把这条历史记录导出为文件">导出</button></span></div>
         </div>`;
       }).join('');
       listEl.scrollTop = keep;
@@ -1835,7 +2473,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       if (btn.dataset.h === 'sel') { if (!selected.delete(id)) selected.add(id); draw(); return; }
       if (btn.dataset.h === 'del') { selected.delete(id); writeHistory(readHistory().filter(h => h.id !== id)); draw(); return; }
       const entry = readHistory().find(h => h.id === id);
-      if (entry && restoreHistory(entry, btn.dataset.h === 'filter' ? 'filter' : 'all')) close();
+      if (entry && restoreHistory(entry, btn.dataset.h === 'filter' ? 'filter' : btn.dataset.h === 'fns' ? 'fns' : 'all')) close();
     });
     searchEl.addEventListener('input', draw);
     document.addEventListener('keydown', onKey);
@@ -1896,23 +2534,32 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     if (err) { setStatus(err, 'error'); return; }
     running = true;
     cancelled = false;
+    // 每次点「运行」生成一个唯一的运行 ID（也就是函数历史里的“批次”）：异步任务带着它，历史才能按批次分组
+    const runId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    const runAt = Date.now();
     setStatus('正在读取视图记录…', '');
     render();
     const fieldById = new Map(host.getAllFields().map(f => [f.id, f]));
     let written = 0, failed = 0, skipped = 0, called = 0, matchedCount = 0, dispatched = 0;
     let hasWrites = true; // 输出里有没有要写进字段的（全是“只调用的函数”则没有）
     failures = [];
-    // 失败明细里带上送给函数的输入：用到的各函数的输入映射，相同的（参数 + 字段）只列一列
-    const inCols: { label: string; fieldId: string }[] = [];
+    // 失败明细里带上送给函数的输入：用到的各函数的输入映射，相同的（参数 + 字段）只列一列；不来自字段的入参，列里是填写的值
+    const inCols: { label: string; fieldId: string; value?: string }[] = [];
     for (const fn of new Map(config.outputs.flatMap(o => { const f = fnOfKey(o.param); return f ? [[f.id, f] as [string, FnMeta]] : []; })).values()) {
       for (const inp of fn.inputs) {
+        if (isManual(inp)) {
+          const m = config.inputs.find(i => i.fn === fn.id && i.param === inp.name);
+          const value = Array.isArray(m?.value) ? m!.value.join(',') : m?.value ?? '';
+          const label = `${inp.name}(填写值)`;
+          if (m && !inCols.some(c => c.label === label && c.value === value)) inCols.push({ label, fieldId: '', value });
+          continue;
+        }
         const fid = inputField(fn.id, inp.name);
         const label = `${inp.name}(${fieldById.get(fid)?.name ?? fid})`;
         if (fid && !inCols.some(c => c.label === label && c.fieldId === fid)) inCols.push({ label, fieldId: fid });
       }
     }
     failureHeaders = inCols.map(c => c.label);
-    const inputCols = inCols.map(c => c.fieldId);
     const optionsOf = new Map<string, FieldOption[]>(); // 单选/多选输出字段的选项
     let historyId = '';
     try {
@@ -1944,6 +2591,8 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
         return;
       }
       historyId = recordHistory('run', matched.length, all.length);
+      updateHistory(historyId, { runId });
+      saveRunCfg(runId, runAt); // 记下批次 ID，函数块的历史据此复现当时的函数配置
 
       // 按函数分组：同一个函数的多个输出，一次调用拿齐
       const byFn = new Map<string, { fn: FnMeta; outs: { name: string; fieldId: string }[] }>();
@@ -1968,8 +2617,6 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       // 一轮算完，结果再按 100 条一批写回。取消在一轮处理完后生效（只选一个函数时，一轮就是一次调用）
       const sentBy = new Map<string, number>(); // 异步函数 → 已下发条数
       // 批次：这次点「运行」是一个批次，被函数的 batchSize 拆成多个任务，任务带着批次信息，面板里才看得出它们的关系
-      const runId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-      const runAt = Date.now();
       const partSeq = new Map<string, number>(); // 异步函数 → 已拆出几个任务
       const partsOf = (fn: FnMeta) => { // 这个函数在这个批次里一共会拆成几个任务（每一轮取 roundSize 条，再按函数的批大小拆）
         const size = batchOf(fn);
@@ -1991,19 +2638,38 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
         };
         const values = chunk.map(() => ({} as Record<string, any>));
         const bad = chunk.map(() => '');
-        const buildRows = (fn: FnMeta) => chunk.map(rec => {
-          const row: Record<string, any> = {};
-          for (const inp of fn.inputs) {
-            const fid = inputField(fn.id, inp.name);
-            if (fid) row[inp.name] = cellOf(rec, fid);
-          }
-          return row;
-        });
+        // 字段入参每行取那一格的文本；不来自字段的入参每行都是卡片里填的同一个值（多选是字符串数组）
+        const buildRows = (fn: FnMeta) => {
+          const plan = fn.inputs.flatMap((inp): { name: string; fieldId: string; value?: string | string[] }[] => {
+            const m = config.inputs.find(i => i.fn === fn.id && i.param === inp.name);
+            if (!m) return [];
+            if (isManual(inp)) return [{ name: inp.name, fieldId: '', value: m.value ?? (inp.type === 'multiSelect' ? [] : '') }];
+            return m.fieldId ? [{ name: inp.name, fieldId: m.fieldId, value: undefined }] : [];
+          });
+          return chunk.map(rec => {
+            const row: Record<string, any> = {};
+            for (const p of plan) row[p.name] = p.fieldId ? cellOf(rec, p.fieldId) : p.value;
+            return row;
+          });
+        };
         for (const { fn, outs } of syncFns) {
           const rows = buildRows(fn);
           const size = batchOf(fn);
           const results: FnResult[] = [];
-          for (let s = 0; s < rows.length; s += size) results.push(...await callFunction(fn, rows.slice(s, s + size)));
+          for (let s = 0; s < rows.length; s += size) {
+            // 每一批调用都记进历史（成功 / 失败条数、用时），有执行详情的一起收进去（有说明就弹出 / 追加到历史窗口）
+            const indexes = chunk.slice(s, s + size).map(r => indexOf.get(r.recordId) || 0);
+            const seq = (partSeq.get(fn.id) || 0) + 1;
+            partSeq.set(fn.id, seq);
+            const ref = { id: runId, at: runAt, part: seq, parts: partsOf(fn) };
+            const t0 = Date.now();
+            let part: { results: FnResult[]; message?: string };
+            try { part = await callFunction(fn, rows.slice(s, s + size)); }
+            catch (e) { pushCall(makeCall(fn, indexes, ref, [], Date.now() - t0, e instanceof Error ? e.message : String(e))); throw e; }
+            results.push(...part.results);
+            pushCall(makeCall(fn, indexes, ref, part.results, Date.now() - t0));
+            pushNote(makeNote(fn, part.results, part.message, indexes, false, ref));
+          }
           results.forEach((r, i) => {
             if (bad[i]) return;
             if (!r.ok) { bad[i] = r.error || '函数执行失败'; return; }
@@ -2022,7 +2688,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
           if (syncFns.length === 0) return; // 这次选的全是异步函数：没有同步结果可统计
           if (bad[i]) {
             failed++;
-            failures.push({ index: indexOf.get(rec.recordId) || 0, recordId: rec.recordId, inputs: inputCols.map(fid => cellText(rec.fields[fid])), error: bad[i] });
+            failures.push({ index: indexOf.get(rec.recordId) || 0, recordId: rec.recordId, inputs: inCols.map(c => (c.fieldId ? cellText(rec.fields[c.fieldId]) : c.value ?? '')), error: bad[i] });
           } else if (!hasWrites) called++; // 只调用的函数：成功就算已调用，没有要写的内容
           else if (Object.keys(values[i]).length === 0) skipped++; // 所有输出都是 null，没有可写的内容
           else items.push({ recordId: rec.recordId, fields: values[i] });

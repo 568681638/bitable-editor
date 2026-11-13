@@ -19,7 +19,9 @@ const SWEEP_EVERY = 3600 * 1000;
 const now = () => Date.now();
 const errText = (e) => (e instanceof Error ? e.message : String(e));
 
-export function createJobStore(dir) {
+// locks：函数的串行锁（见 locks.mjs）。声明了 serializeCalls: true 的函数，同一时间最多一个任务在执行，不管任务来自哪个运行；
+// 轮不到的任务留在队列里（不占并发槽位、不挡后面别的函数的任务），前一个跑完再按队列顺序开始下一个
+export function createJobStore(dir, locks) {
   const jobs = new Map(); // id → 任务（落盘的内容）
   const rowsOf = new Map(); // id → 下发的行（只在内存里，任务开始执行后就释放）
   const execOf = new Map(); // id → 执行函数
@@ -32,6 +34,7 @@ export function createJobStore(dir) {
   function save(job) {
     const prev = saving.get(job.id) || Promise.resolve();
     const next = prev.then(async () => {
+      await mkdir(dir, { recursive: true }); // 目录被人手动删了也能自己建回来，不然任务一直存不下来
       const tmp = fileOf(job.id) + '.tmp';
       await writeFile(tmp, JSON.stringify(job), 'utf8');
       await rename(tmp, fileOf(job.id)); // 先写临时文件再改名，进程中途退出也不会留下写了一半的文件
@@ -68,23 +71,33 @@ export function createJobStore(dir) {
     save(job);
     let results = null;
     let error = '';
-    try { results = await exec(rows); } catch (e) { error = errText(e); }
+    let message;
+    try {
+      const r = await exec(rows); // 数组，或 { results, detail }（detail 是这一批的整体详情）
+      results = Array.isArray(r) ? r : r.results;
+      message = Array.isArray(r) ? undefined : r.detail;
+    } catch (e) { error = errText(e); }
+    if (job.locked) locks.leave(job.fnId); // 这个任务执行完了：放开锁，下一个排队的调用 / 任务可以开始
     if (job.status === 'cancelled') return; // 运行期间被取消：结果丢弃
     job.finishedAt = now();
     if (error) { job.status = 'failed'; job.error = error; }
-    else { job.status = 'done'; job.results = results; }
+    else { job.status = 'done'; job.results = results; if (message !== undefined) job.detail = message; }
     await save(job);
   }
 
   function pump() {
-    while (running < MAX_RUNNING && queue.length) {
-      const id = queue.shift();
+    // 按队列顺序找能开始的任务：要锁的函数已经有 run 在执行，就跳过（留在队列里等），后面的任务不被它挡住
+    for (let i = 0; i < queue.length && running < MAX_RUNNING;) {
+      const id = queue[i];
       const job = jobs.get(id);
-      if (!job || job.status !== 'queued') continue;
+      if (!job || job.status !== 'queued') { queue.splice(i, 1); continue; }
+      if (job.locked && !locks.tryStart(job.fnId)) { i++; continue; } // tryStart 成功会占上锁，runOne 跑完放开
+      queue.splice(i, 1);
       running++;
       runOne(job).catch((e) => console.error('[jobs] 执行出错 ' + id + ':', errText(e))).then(() => { running--; pump(); });
     }
   }
+  if (locks) locks.onChange(() => pump()); // 锁放开了：排队的任务可能能开始了
 
   return {
     async init() {
@@ -109,10 +122,12 @@ export function createJobStore(dir) {
       console.log('[jobs] 已加载 ' + jobs.size + ' 个异步任务（' + dir + '）');
     },
 
-    // exec(rows) → 与 rows 等长的 [{ ok, outputs } | { ok: false, error }]，整批失败就抛异常
-    create({ fnId, fnName, scope, rows, meta }, exec) {
+    // exec(rows) → 与 rows 等长的 [{ ok, outputs } | { ok: false, error }]，或 { results: 前者, detail: 这一批的整体详情 }；整批失败就抛异常
+    // locked：它的函数是不是要串行执行（声明了 serializeCalls: true）
+    create({ fnId, fnName, scope, rows, meta, locked }, exec) {
       const id = randomBytes(12).toString('hex');
       const job = { id, fnId, fnName, scope, status: 'queued', count: rows.length, createdAt: now(), meta: meta === undefined ? null : meta, run: meta && typeof meta.run === 'object' ? meta.run : undefined, claim: null };
+      if (locked && locks) job.locked = true;
       jobs.set(id, job);
       rowsOf.set(id, rows);
       execOf.set(id, exec);
@@ -137,7 +152,7 @@ export function createJobStore(dir) {
       if (j.claim && now() - j.claim.at < CLAIM_TTL) return { error: '任务已被其他页面认领', status: 409 };
       j.claim = { token: randomBytes(8).toString('hex'), at: now() };
       save(j);
-      return { job: { ...summary(j), meta: j.meta, results: j.results || null }, token: j.claim.token };
+      return { job: { ...summary(j), meta: j.meta, results: j.results || null, detail: j.detail !== undefined ? j.detail : j.message }, token: j.claim.token };
     },
 
     // 回写完成后确认：任务转为已回写，结果释放掉（只留一句摘要）

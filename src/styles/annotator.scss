@@ -509,19 +509,17 @@ body.sidebar-zoom #app {
 
 .af-hint { padding: 24px 0; text-align: center; color: #999; &.af-err { color: #ff4d4f; } }
 
-.af-seps {
-  flex-basis: 100%;
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 4px 10px;
-  font-size: 12px;
-  color: #666;
+// 筛选条件的字段下拉：固定窄一些，长字段名截断（完整名字点开下拉能看到），给值输入框留出空间
+.af-cond select[data-act="cond-field"] { flex: none; width: 112px; text-overflow: ellipsis; }
+// 匹配条件下拉：选项最长四个字（不包含于、大于等于），按它定宽，不再随原生下拉的默认宽度撑开
+.af-cond select[data-act="cond-op"] { flex: none; width: 78px; padding-left: 4px; padding-right: 2px; }
 
-  label { display: flex; align-items: center; gap: 3px; cursor: pointer; white-space: nowrap; }
-}
-
-.af-seps .af-sep-custom { width: 56px; padding: 2px 4px; font-size: 12px; }
+// 包含于 / 不包含于的拆分符：匹配条件和值之间的小下拉（样式沿用多选下拉），点开是单选列表，“自定义”项里带输入框
+.af-cond .af-sep { flex: none; min-width: 0; }
+.af-sep .af-sep-btn { width: auto; min-width: 34px; max-width: 64px; padding: 5px 5px; gap: 3px; }
+.af-sep .af-ms-pop { min-width: 140px; }
+.af-sep .af-ss-list { overflow: visible; }
+.af-cond .af-sep .af-sep-custom { flex: none; width: 56px; margin-left: 4px; padding: 2px 4px; font-size: 12px; }
 
 // 失败明细
 .af-fail {
@@ -551,17 +549,29 @@ body.sidebar-zoom #app {
 }
 
 // 异步函数：卡片头的“异步”标记，卡片里的“异步”组（任务状态 + 失败行），每个任务一块（条数 + 状态）
+.af-serial-tag { flex: none; margin: 0 0 0 6px; padding: 0 5px; border-radius: 3px; background: #f0eaff; color: #6a3fc2; font-size: 11px; line-height: 16px; }
 .af-async-tag { flex: none; margin: 0 0 0 6px; padding: 0 5px; border-radius: 3px; background: #fff7e6; color: #d46b08; font-size: 11px; line-height: 16px; }
-// 「函数」块右上角的任务标签：图标 + “任务”，右上角一个状态点——红色只表示失败（有失败就变红，没跑完时呼吸），执行中橙（呼吸），全部完成绿。点开弹出任务记录
+// 「函数」块右上角的历史按钮：图标 + “历史”，右上角一个状态点——红色只表示失败（有失败就变红，没跑完时呼吸），执行中橙（呼吸），全部完成绿。点开打开函数历史
 @keyframes af-spin { to { transform: rotate(360deg); } }
 @keyframes af-pulse-red { 0%, 100% { box-shadow: 0 0 0 0 rgba(245, 34, 45, 0.55); } 50% { box-shadow: 0 0 0 4px rgba(245, 34, 45, 0); } }
 @keyframes af-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(250, 140, 22, 0.55); } 50% { box-shadow: 0 0 0 4px rgba(250, 140, 22, 0); } }
 .af-svg { flex: none; width: 14px; height: 14px; }
 .af-spin { animation: af-spin 1s linear infinite; }
 .af-jobs-badge-wrap { display: inline-flex; align-self: center; }
+
+// 执行说明（显示在历史里每次调用的下面）
+.af-note-call-body pre, .af-note-batch pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: inherit; }
+// 一次函数调用（一批）：折叠标题 + 批级说明 + 各行说明
+.af-note-call { margin: 2px 0; }
+.af-note-call-head { padding: 3px 6px; border-radius: 3px; &:hover { background: #f4f7fc; } }
+.af-note-call-title { font-weight: 500; color: #333; }
+.af-note-time { margin-left: auto; font-size: 12px; color: #999; }
+.af-note-call-body { padding: 0 6px 4px 22px; }
+.af-note-batch { margin: 4px 0; padding: 4px 8px; background: #f3f6ff; border-left: 3px solid #4f7cff; border-radius: 2px; }
+.af-note-row { display: flex; gap: 8px; margin-top: 3px; .af-note-idx { flex: none; min-width: 52px; color: #999; font-size: 12px; } pre { flex: 1; min-width: 0; } }
 .af-job-badge {
-  position: relative; display: inline-flex; align-items: center; gap: 4px; padding: 2px 9px 2px 7px;
-  border: 1px solid #d5dbe6; border-radius: 12px; background: #fff; color: #4a5568; font-size: 12px; line-height: 18px; white-space: nowrap; cursor: pointer;
+  position: relative; display: inline-flex; align-items: center; gap: 4px; padding: 4px 10px 4px 8px;
+  border: 1px solid #d5dbe6; border-radius: 4px; background: #fff; color: #4a5568; font-size: 12px; line-height: 18px; white-space: nowrap; cursor: pointer;
   &:hover { border-color: #4f7cff; color: #4f7cff; }
   &.on { border-color: #4f7cff; color: #4f7cff; box-shadow: 0 0 0 2px rgba(79, 124, 255, 0.2); }
   .af-dot { position: absolute; top: -3px; right: -3px; width: 9px; height: 9px; border: 2px solid #fff; border-radius: 50%; box-sizing: content-box; }
@@ -597,41 +607,61 @@ body.sidebar-zoom #app {
 }
 .af-pop-body { flex: 1; min-height: 0; overflow: auto; padding: 10px 12px 8px; }
 
-// 批次：一次点「运行」。标题行是下发时间、总条数、整个批次的进度；下面是这个批次里每个函数的任务
-.af-run { margin-bottom: 12px; border: 1px solid #e6eaf1; border-radius: 6px; background: #fbfcfe; overflow: hidden; &:last-child { margin-bottom: 4px; } }
+// 批次：一次点「运行」，一张卡片（参照批处理历史记录的条目）。里面的函数缩进一级、左侧一条竖线表示隶属关系，再里面是每次调用。
+// 三层的标题行都是“整行可点的折叠按钮 + 右侧自己的复制 / 清空”
+.af-fold {
+  flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; margin: 0; padding: 0; border: none; background: none; font: inherit; color: inherit; text-align: left; cursor: pointer;
+  > span { white-space: nowrap; }
+}
+.af-caret { flex: none; display: inline-block; width: 10px; color: #999; font-size: 11px; transition: transform 0.15s; &.open { transform: rotate(90deg); } }
+.af-hact { flex: none; display: inline-flex; gap: 4px; margin-left: 6px; }
+.af-hbtn {
+  display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 20px; padding: 0; border: 1px solid #e0e4ec; border-radius: 3px; background: #fff; color: #888; cursor: pointer;
+  .af-svg { width: 13px; height: 13px; }
+  &:hover { border-color: #4f7cff; color: #4f7cff; }
+  &.danger:hover { border-color: #ff7875; color: #cf1322; }
+}
+.af-icon-btn { display: inline-flex; align-items: center; padding: 2px 6px; }
+.af-run { margin-bottom: 8px; border: 1px solid #e3e7ef; border-radius: 6px; background: #fff; overflow: hidden; &:hover { border-color: #b8c8f5; } &:last-child { margin-bottom: 4px; } }
 .af-run-head {
-  display: flex; align-items: baseline; gap: 8px; padding: 6px 10px; background: #f1f4fa; border-bottom: 1px solid #e6eaf1;
+  display: flex; align-items: center; padding: 7px 10px; background: #f7f9fc;
+  &:hover { background: #f0f4fb; }
   .af-run-title { font-weight: 600; color: #333; }
   .af-run-meta { color: #888; font-size: 12px; }
   .af-run-prog { margin-left: auto; color: #888; font-size: 12px; }
-  > span { white-space: nowrap; }
+  .af-hist-kind { flex: none; }
 }
-.af-run.live .af-run-head { background: #fff5e6; border-bottom-color: #ffe0b3; }
-.af-run-fn { padding: 8px 10px 4px; & + .af-run-fn { border-top: 1px dashed #e6eaf1; } }
-.af-run-fn-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 4px; }
-.af-run-fn-name { font-weight: 600; color: #4f5fd0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.af-run-fn-prog { flex: none; font-size: 12px; color: #888; }
-.af-bar { height: 4px; margin-bottom: 8px; border-radius: 2px; background: #e8ecf3; overflow: hidden; i { display: block; height: 100%; background: #52c41a; transition: width 0.3s; } }
-.af-jobs-more { margin: -2px 0 6px; font-size: 12px; color: #aaa; text-align: center; }
+.af-run.live .af-run-head { background: #fff5e6; &:hover { background: #ffefd6; } }
+.af-run-body { padding: 6px 10px 6px 14px; border-top: 1px solid #eceff4; }
+// 函数：相对批次缩进，左侧竖线
+.af-run-fn { margin: 2px 0 4px 6px; padding-left: 10px; border-left: 2px solid #dbe3f5; }
+.af-run-fn-head { display: flex; align-items: center; padding: 3px 4px; border-radius: 3px; &:hover { background: #f4f7fc; } }
+.af-run-fn-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; font-weight: 600; color: #4f5fd0; }
+.af-run-fn-prog { margin-left: auto; flex: none; font-size: 12px; color: #888; }
+// 每次调用：再缩进一级
+.af-run-fn-body { padding: 2px 0 4px 16px; }
+.af-bar { height: 3px; margin: 2px 4px 4px 20px; border-radius: 2px; background: #e8ecf3; overflow: hidden; i { display: block; height: 100%; background: #52c41a; transition: width 0.3s; } }
 .af-runs-toggle { display: block; width: 100%; margin-top: 2px; }
 
-// 每个任务一张小卡片：左边一条状态色竖线，图标 + “任务 第几个/共几个 · 第几–几条” + 一句话状态，右侧是取消
+// 每个任务一行：左边一条状态色竖线，图标 + “任务 第几个/共几个 · 第几–几条” + 一句话状态（超长截断），右侧是取消
 .af-job {
-  display: flex; align-items: flex-start; gap: 8px; margin-bottom: 6px; padding: 6px 8px;
-  border: 1px solid #eef0f4; border-left: 3px solid #d9d9d9; border-radius: 4px; background: #fff;
+  display: flex; align-items: center; gap: 8px; margin-bottom: 2px; padding: 3px 6px;
+  border-left: 3px solid #d9d9d9; border-radius: 2px; background: #fff;
 
-  .af-job-ico { flex: none; display: inline-flex; margin-top: 2px; color: #aaa; }
-  .af-job-body { flex: 1; min-width: 0; }
-  .af-job-title { color: #333; font-weight: 500; }
-  .af-job-range { margin-left: 8px; font-size: 12px; font-weight: 400; color: #888; }
-  .af-job-state { margin-top: 1px; font-size: 12px; color: #666; word-break: break-all; }
+  .af-job-ico { flex: none; display: inline-flex; color: #aaa; }
+  .af-job-title { flex: none; color: #333; font-weight: 500; white-space: nowrap; }
+  .af-job-range { margin-left: 6px; font-size: 12px; font-weight: 400; color: #888; }
+  .af-job-state { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; font-size: 12px; color: #666; }
   &.st-running { border-left-color: #4f7cff; .af-job-ico { color: #4f7cff; } }
   &.st-queued, &.st-done { border-left-color: #fa8c16; .af-job-ico { color: #fa8c16; } }
   &.st-failed { border-left-color: #ff4d4f; .af-job-ico { color: #ff4d4f; } .af-job-state { color: #cf1322; } }
   &.st-applied { border-left-color: #52c41a; .af-job-ico { color: #52c41a; } }
 }
-// 已写回的任务折叠在一起，免得一个批次拆出几十个任务时刷屏
-.af-done { margin: 2px 0 6px; summary { padding: 3px 0; color: #52a21a; font-size: 12px; cursor: pointer; } }
+// 独立窗口：宽一些，状态文字完整显示（自动换行）
+.af-histwin-box { width: min(680px, 96vw); height: min(760px, 88vh); }
+.af-jobwin-body { font-size: 13px; }
+.af-histwin-box .af-job-state { white-space: normal; word-break: break-all; }
+.af-histwin-box .af-modal-head .af-pop-chips { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; gap: 4px; margin: 0 8px; }
 // 失败明细：折叠块，标题带红色叹号
 .af-run .af-afail {
   margin: 2px 0 6px;
@@ -748,6 +778,13 @@ body.sidebar-zoom #app {
 
 // 筛选块右上角的 ☰ 菜单：导出 CSV、导入 / 导出筛选条件这些低频操作收在这里（样式沿用 ☰ 菜单的 .menu / .menu-item）
 .af-menu-wrap { position: relative; display: flex; }
+// 块右上角的操作按钮（筛选、预览、历史、☰）：实线胶囊，和函数块右上角的「历史」同一风格
+.af-pill {
+  display: inline-flex; align-items: center; justify-content: center; padding: 4px 10px;
+  border: 1px solid #d5dbe6; border-radius: 4px; background: #fff; color: #4a5568; font-size: 12px; line-height: 18px; white-space: nowrap; cursor: pointer;
+  &:hover:not(:disabled) { border-color: #4f7cff; color: #4f7cff; }
+  &:disabled { color: #bbb; background: #f7f7f7; cursor: not-allowed; }
+}
 .af-more { height: 100%; line-height: 1; } // 和旁边的“预览”等高（☰ 字形比汉字高，不统一设行高会撑出高度差）
 .af-menu { font-weight: 400; }
 .af-menu .menu-item:disabled { color: #ccc; cursor: not-allowed; background: none; }
@@ -841,7 +878,7 @@ body.sidebar-zoom #app {
 }
 
 // 历史记录窗口（挂在 body 上，沿用预览窗口的 .af-modal）：按天分组的条目列表，每条是一套完整配置的摘要
-.af-hist-box { width: min(560px, 94vw); }
+.af-hist-box { width: min(560px, 94vw); height: min(760px, 88vh); } // 固定高度：列表内容变化（搜索、删除、展开）时窗口不再忽大忽小地跳动
 .af-hist-search { padding: 8px 14px; border-bottom: 1px solid #e8e8e8; background: #fff; }
 .af-hist-search input { width: 100%; padding: 5px 8px; border: 1px solid #d9d9d9; border-radius: 4px; font-size: 13px; outline: none; &:focus { border-color: #4f7cff; } }
 .af-hist-msg { padding: 6px 14px; border-bottom: 1px solid #e8e8e8; background: #f6ffed; color: #389e0d; font-size: 12px; &.error { background: #fff7e6; color: #d46b08; } &[hidden] { display: none; } }
@@ -1009,6 +1046,26 @@ body.sidebar-zoom #app {
 .af-row select.af-fg-param { flex: 0 1 40%; min-width: 80px; }
 .af-row span.af-fg-param { flex: 0 1 40%; min-width: 60px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .af-lock { font-size: 12px; color: #d46b08; white-space: nowrap; }
+// 不来自字段的入参：文本框 / 多选下拉框占满“=”右边；入参说明另起一行
+.af-row input.af-in-text { flex: 1; min-width: 100px; }
+// 多选：样子和单选下拉一样，点开是勾选列表（复用带搜索下拉的弹层样式）
+.af-ms { position: relative; flex: 1; min-width: 100px; }
+.af-ms-btn {
+  display: flex; align-items: center; gap: 4px; width: 100%; box-sizing: border-box; padding: 5px 6px;
+  border: 1px solid #d9d9d9; border-radius: 4px; background: #fff; font-size: 13px; text-align: left; cursor: pointer;
+  &:hover { border-color: #4f7cff; }
+}
+.af-ms.open .af-ms-btn { border-color: #4f7cff; }
+.af-ms-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.af-ms-ph { color: #999; }
+.af-ms-caret { flex: none; color: #999; font-size: 11px; }
+.af-ms-pop { top: calc(100% + 2px); left: 0; min-width: 100%; }
+.af-ms-pop .af-ss-list { margin-top: 0; }
+.af-ms-pop .af-ss-input + .af-ss-list { margin-top: 6px; }
+.af-ms-pop .ss-hide { display: none; }
+.af-in-chk { display: flex; align-items: center; gap: 6px; &:hover { background: #f0f4ff; } input { margin: 0; } }
+.af-in-chk.stale { color: #cf1322; }
+.af-in-desc { flex-basis: 100%; margin-top: -2px; font-size: 12px; color: #8c8c8c; line-height: 1.4; }
 .af-fg-actions .af-add:disabled { opacity: 0.4; cursor: not-allowed; }
 // 函数卡片里的输入 / 输出各成一组：样式参考筛选条件组（浅底、细边框、左边一条粗竖线），输入蓝线、输出绿线，不额外占标题行
 .af-iog {
@@ -1061,3 +1118,40 @@ body.sidebar-zoom #app {
 .af-pick-search .af-pick-q { display: block; width: 100%; box-sizing: border-box; padding: 4px 8px; border: 1px solid #d9d9d9; border-radius: 4px; font-size: 13px; outline: none; &:focus { border-color: #4f7cff; } }
 .af-pick-pop .ss-hide { display: none !important; }
 .af-tn.ss-open > .af-tn-kids { display: block; }
+
+// 历史里每次调用行尾的「说明」开关
+.af-note-chip {
+  flex: none; padding: 0 7px; border: 1px solid #c8d4f5; border-radius: 9px; background: #f3f6ff; color: #2f5fd0; font-size: 11px; line-height: 17px; cursor: pointer;
+  &:hover, &.on { background: #e1eaff; border-color: #4f7cff; }
+}
+.af-note-auto { display: inline-flex; align-items: center; gap: 3px; font-size: 12px; font-weight: 400; color: #666; cursor: pointer; white-space: nowrap; }
+// 执行详情窗口：居中显示在历史窗口上面（比历史窗口高一层，带一层淡遮罩），不再贴在页面角落
+.af-notepop { z-index: 1002; background: rgba(0, 0, 0, 0.3); .af-modal-box { width: min(520px, 94vw); max-height: 72vh; } }
+.af-notepop-body { padding: 4px 12px 10px; font-size: 13px; }
+.af-notepop-item { padding: 8px 0; border-bottom: 1px dashed #e6e9ef; &:last-child { border-bottom: 0; } }
+.af-hist-bar { flex-wrap: wrap; }
+.af-pop-body.af-hist-list { padding: 0 10px 8px; }
+.af-jobs-more { font-size: 12px; color: #aaa; }
+.af-run.sel { border-color: #4f7cff; background: #f7f9ff; }
+.af-run-head .af-hist-check { margin-right: 8px; }
+
+// 批次块右上角的提示点（颜色是结果状态，和历史按钮上的点一致）
+.af-run { position: relative; }
+.af-run-dot { position: absolute; top: 3px; right: 3px; z-index: 2; width: 9px; height: 9px; border: 2px solid #fff; border-radius: 50%; box-sizing: content-box; pointer-events: none;
+  &.busy { background: #fa8c16; animation: af-pulse 1.4s ease-out infinite; } &.bad { background: #f5222d; } &.bad.live { animation: af-pulse-red 1.4s ease-out infinite; } &.ok { background: #52c41a; } }
+
+// 函数历史的批次卡片：沿用 .af-hist-item（和批处理历史同一套），里面每个函数一行
+.af-runcard { padding-top: 9px; &.sel { border-color: #4f7cff; background: #f7f9ff; } &.live { border-color: #ffd591; } }
+.af-runcard .af-run-dot { top: 6px; right: 28px; }
+.af-runcard .af-hist-line.stat .af-chip { margin-left: 6px; }
+.af-fnrows { margin-top: 6px; }
+.af-fnrow {
+  display: flex; align-items: center; gap: 6px; margin-top: 4px; padding: 3px 6px; border-radius: 4px; background: #f6f8fc; font-size: 12px;
+  .af-fnrow-name { flex: none; max-width: 38%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; color: #4f5fd0; }
+  .af-fnrow-state { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #666; }
+}
+.af-fnbtn {
+  flex: none; padding: 0 7px; border: 1px solid #d5dbe8; border-radius: 9px; background: #fff; color: #555; font-size: 11px; line-height: 17px; cursor: pointer;
+  &:hover, &.on { border-color: #4f7cff; color: #4f7cff; }
+}
+.af-fn-detail { margin: 2px 0 4px 10px; padding-left: 8px; border-left: 2px solid #dbe3f5; }

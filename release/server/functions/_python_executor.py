@@ -1,6 +1,6 @@
 # 批处理的 Python 函数执行器：由 server.mjs 调用，不要直接运行。
 #   python _python_executor.py <函数入口 function.py> meta <输入文件> <输出文件>   → 把该文件的 META 写进输出文件
-#   python _python_executor.py <函数入口 function.py> run  <输入文件> <输出文件>   → 读输入文件 {"rows": [...]}，把 {"results": [...]} 写进输出文件
+#   python _python_executor.py <函数入口 function.py> run  <输入文件> <输出文件>   → 读输入文件 {"rows": [...]}，把 {"results": [...], "detail": 可选，这一批的整体详情} 写进输出文件
 # 数据全部走文件（JSON，UTF-8），不经过命令行参数和管道，数据量不受限制；
 # 函数里 print 的内容会被转到 stderr（进服务日志）。
 import sys
@@ -26,6 +26,10 @@ def main():
         with open(in_path, 'r', encoding='utf-8') as f:
             rows = json.load(f)['rows']
         outs = mod.run(rows)
+        message = None
+        if isinstance(outs, dict) and 'results' in outs:  # {"results": [...], "detail": "这一批的整体详情"}（旧名 message 也认）
+            message = outs.get('detail', outs.get('message'))
+            outs = outs['results']
         if not isinstance(outs, (list, tuple)) or len(outs) != len(rows):
             raise ValueError('run(rows) 必须返回与 rows 等长的列表（收到 %d 行，返回 %s）' % (
                 len(rows), len(outs) if isinstance(outs, (list, tuple)) else type(outs).__name__))
@@ -36,6 +40,8 @@ def main():
             else:
                 results.append({'ok': True, 'outputs': o if isinstance(o, dict) else {}})
         result = {'results': results}
+        if message is not None:
+            result['detail'] = message if isinstance(message, str) else str(message)
 
     with open(out_path, 'w', encoding='utf-8') as f:
         json.dump(result, f, ensure_ascii=False)

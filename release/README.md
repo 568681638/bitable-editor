@@ -1,5 +1,7 @@
 # 部署包 — bitable-annotator
 
+> **只想往服务器上注册 / 修改批处理函数？直接读 [`server/functions/README.md`](server/functions/README.md) 就够了**（函数写法、两个可选开关 `async` / `serializeCalls`、出参格式、本地怎么测、加函数的清单，都在那一份里）；要把现成的函数接进来，也可以用 Claude Code skill [`skills/register-function/`](skills/register-function/SKILL.md)（用法见下）。下面的部署、代理、运行时配置等和注册函数无关。
+
 **这个 `release/` 目录就是要部署到服务器上的全部内容**，整个目录拷过去即可，不需要拷项目的其他文件，也**不需要 `node_modules`**（服务端只用 Node 自带模块）。
 
 ```
@@ -9,10 +11,22 @@ release/
 │   ├── deploy.sh     一键部署脚本
 │   └── supervisor.conf   supervisord 程序配置模板
 ├── server/
-│   ├── server.mjs    生产服务：托管 dist/ + /api-proxy/ 通用代理 + /api/functions 批处理函数接口 + /api/config 运行时配置
+│   ├── server.mjs    生产服务：托管 dist/ + /api-proxy/ 通用代理 + /api/functions 批处理函数接口 + /api/jobs 异步任务接口 + /api/config 运行时配置
+│   ├── jobs.mjs      异步函数的任务存储（排队、执行、落盘到 server/data/jobs/、认领 / 确认、定期清理）；只有声明了 async 的函数才用到
+│   ├── locks.mjs     函数的串行锁（同一时间最多一个 run 在执行）；只有声明了 serializeCalls 的函数才用到
+│   ├── data/         运行时生成：异步任务和结果（不入库；服务重启后保留，在途任务会被标记为失败）
 │   ├── config.json   运行时配置（目前只有教程链接 helpUrl）
 │   └── functions/    批处理函数：一个函数一个文件夹（入口 function.mjs 或 function.py，模板见 _template/），可放多层分类目录，热加载
+├── skills/
+│   └── register-function/   给 Claude Code 用的 skill：把现成的 Python / JS 函数接入批处理函数注册表（SKILL.md 是流程，check_function.py 是注册检查脚本）
 └── dist/             前端构建产物（npm run build 生成，不入库，要自己带过去）
+```
+
+**用 skill 注册函数**：`skills/register-function/` 是一个 Claude Code skill。要让 Claude Code 自动用上它，把这个文件夹复制（或链接）到项目的 `.claude/skills/` 下（或个人的 `~/.claude/skills/` 下），之后说“把 xxx 函数注册到批处理”即可。不用 Claude Code 时，`SKILL.md` 也可以当作人工接入的步骤清单；`check_function.py` 可以单独用来检查任何函数是否注册成功：
+
+```bash
+python -I release/skills/register-function/check_function.py --list                       # 列出已注册的函数、判断服务端版本
+python -I release/skills/register-function/check_function.py <函数 id> --rows rows.json   # 检查声明，并用样例行实际调用一次
 ```
 
 本项目部署在 **阿里云 PAI DSW 容器**中，PID 1 是 `/etc/dsw/bin/entrypoint`，进程管理用的是 `supervisord`（不是 systemd，`systemctl` / `pm2 startup` 都不能用）。
@@ -32,6 +46,10 @@ release/
 **完整的扩展规则见 [`server/functions/README.md`](server/functions/README.md)**（函数定义、批量约定、出参格式、环境变量、本地测试），下面是摘要。
 
 在服务器的 `release/server/functions/` 下新增或修改函数文件夹即可，服务每次收到请求都会重新扫描目录：新增、修改、删除立即生效；一个函数 = 一个文件夹（入口文件 `function.mjs` / `function.py`，依赖的文件放同一个文件夹），文件夹可以放在任意多层分类目录里（目录结构就是面板里选函数的层级）；以 `_` 或 `.` 开头的文件和目录被忽略；某个文件语法错误只会在日志里报错，不影响其他函数。写法见 `functions/_template/`。前端切到“批处理”面板时会重新读取函数列表（也可点标题行的 ↻，或函数列表加载失败时面板里的「重试」）。
+
+**两个可选开关**（都不写就是最普通的同步函数，写法完全不变，只影响调度；详见 functions/README.md 的“30 秒上手”）：
+- `async: true`（Python 在 `META` 里写 `"async": True`）：**异步函数**，一批要跑很久（几分钟到几小时）时用。面板下发完就算完成，函数在服务端后台执行，结果存在服务端磁盘，**打开着这张表的插件页面**取回并写回表格。
+- `serializeCalls: true`（Python：`"serializeCalls": True`）：**串行执行**，函数里有多步操作、两次执行不能交错时用。服务端保证这个函数同一时间最多只有一个 `run` 在跑，不管调用来自哪次运行、哪个人，按到达先后排队（不同运行的批次可能交替执行）。两个开关可以一起用。
 
 **批量计算**：所有函数（JS 和 Python）统一是批量接口，`run(rows)` 一次拿到一批行（函数每次拿多少行由它的 `batchSize` 决定，默认 100，最大 5000，由面板按这个数攒批 / 拆分；写回表格固定每 100 条一次），返回与 `rows` 等长、顺序一致的结果数组，方便把查询、模型推理合并成一次请求。某一行算不出来，就在对应位置返回一个 Error 对象（JS 的 `new Error('原因')` / Python 的 `ValueError('原因')`），只让这一行失败；某个出参这一行没有值、不想覆盖字段，就把它设为 `None` / `null`（该字段保留原值）；`run` 里直接抛异常则整批失败、运行中断。
 

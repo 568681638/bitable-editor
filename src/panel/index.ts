@@ -819,7 +819,8 @@ function renderBlocks() {
 // ── 布局导入 / 导出：把当前数据表的预览窗格字段块布局存成文件，方便分享给别人 ──
 // 布局记在浏览器 localStorage 里，换电脑、换浏览器、发给同事都带不走，所以提供文件导出。
 // 文件里每个字段块除了字段 ID，还带上字段名：对方是另一张表（字段 ID 不同）时，按字段名重新匹配。
-const LAYOUT_FILE_TYPE = 'bitable-editor-layout';
+const LAYOUT_FILE_TYPE = 'data-engine-layout';
+const LEGACY_LAYOUT_FILE_TYPE = 'bitable-editor-layout'; // 插件改名（bitable-editor → data-engine）前导出的文件，仍可导入
 const layoutMsgEl = document.getElementById('layoutMsg') as HTMLElement;
 let layoutMsgTimer: number | undefined;
 
@@ -896,7 +897,7 @@ function importLayout() {
     try {
       let data: any;
       try { data = JSON.parse(await file.text()); } catch { throw new Error('文件不是合法的 JSON'); }
-      if (!data || data.type !== LAYOUT_FILE_TYPE) throw new Error('这不是本插件导出的布局文件');
+      if (!data || (data.type !== LAYOUT_FILE_TYPE && data.type !== LEGACY_LAYOUT_FILE_TYPE)) throw new Error('这不是本插件导出的布局文件');
       if (!snapshot) throw new Error('还没有连上侧边栏，无法对应字段，请稍后再试');
       const missing: string[] = [];
       const mapped = normalize(mapImportedLayout(data.layout, snapshot.fields, missing));
@@ -1287,7 +1288,7 @@ blocksEl.addEventListener('drop', (e) => {
 });
 document.addEventListener('dragend', endDrag);
 
-// 侧边栏标题栏里的标题名「bitable-editor」可拖：拖到预览窗格放下，把标题行的副本放进去（侧边栏的标题行保留），和拖字段一样按落点切分
+// 侧边栏标题栏里的标题名「data-engine」可拖：拖到预览窗格放下，把标题行的副本放进去（侧边栏的标题行保留），和拖字段一样按落点切分
 const navHandle = document.getElementById('navHandle') as HTMLElement;
 navHandle.addEventListener('dragstart', (e) => {
   if (!e.dataTransfer) return;
