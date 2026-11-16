@@ -1223,3 +1223,16 @@ body.sidebar-zoom #app {
 .media-wrap.is-audio .media-more { order: 6; }
 .field-value .url-preview:has(.media-wrap.is-audio) { overflow: visible; } // 音频的 ⋮ 菜单向上弹出，不能被预览框裁掉
 .media-wrap.is-audio .media-seek { height: 24px; }
+// 全屏时控制条整体放大（图标、按钮、时间文字），和原生全屏的控制条一样大；上面的 zoom 只是抵消侧边栏的页面缩放，不负责放大
+.media-wrap:fullscreen {
+  .media-row { height: 44px; padding: 0 10px; }
+  .media-bar button { width: 44px; height: 44px; svg { width: 30px; height: 30px; } }
+  .media-time { margin-left: 8px; font-size: 16px; }
+  .media-vol:hover .media-volume, .media-vol:focus-within .media-volume { width: 90px; }
+  .media-bar { padding: 28px 16px 8px; }
+  .media-seek { height: 28px; width: calc(100% - 32px); margin: 0 16px 8px; }
+  .media-menu { bottom: 52px; width: 210px; max-height: none; font-size: 14px; }
+  .media-bar .media-menu button { width: auto; height: auto; }
+  .media-bar .media-menu .media-rates button { padding: 4px 9px; }
+  .media-bar .media-menu .media-menu-item { padding: 7px 10px; }
+}
