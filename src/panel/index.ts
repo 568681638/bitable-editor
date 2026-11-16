@@ -12,13 +12,14 @@ import { setupZoom } from '../shared/zoom';
 import { setupMenu } from '../shared/menu';
 import { describedError } from '../shared/errors';
 import { autosizeTextarea, trackManualResize, installLineSelectAll, fitValueBox } from '../shared/textarea';
+import { SIDEBAR_WINDOW_NAME } from '../shared/bridge';
 import type { HostMessage, PanelCommand, SnapshotMessage } from '../shared/bridge';
 
 installProxyFallback();
 installMediaStep();
 
 // ── 与侧边栏插件通信 ──────────────────────────────
-const opener = window.opener as Window | null;
+let opener = window.opener as Window | null; // 重新连接成功后会换成新找到的侧边栏窗口
 const session = Math.random().toString(36).slice(2) + Date.now().toString(36); // 本次页面加载的标识
 const pendingSaves = new Map<number, { resolve: () => void; reject: (e: Error) => void }>();
 let saveSeq = 0;
@@ -31,6 +32,28 @@ function send(cmd: PanelCommand) {
 }
 
 const connBanner = document.getElementById('connBanner') as HTMLElement;
+
+// 重新连接：侧边栏被关掉重开（或飞书重建了它的 iframe）后，面板手里的 opener 就失效了，只能回侧边栏点 ⧉。
+// 侧边栏页面会给自己起名（SIDEBAR_WINDOW_NAME），这里按名字重新找到它：地址传空串，找到就直接返回已有窗口，不会导航。
+// 没找到时浏览器会新开一个空白页，立刻关掉；这个操作要由点击触发（否则会被当成弹窗拦截）
+function reconnectSidebar(): boolean {
+  let w: Window | null = null;
+  try { w = window.open('', SIDEBAR_WINDOW_NAME); } catch { w = null; }
+  if (!w || w === window) return false;
+  let found = false;
+  try { found = w.location.href !== 'about:blank' && w.location.origin === location.origin; } catch { found = false; }
+  if (!found) { try { w.close(); } catch { /* ignore */ } return false; }
+  opener = w;
+  send({ type: 'panel-ready', session }); // 侧边栏收到后会记下这个面板并推送全量快照
+  return true;
+}
+document.getElementById('connRetry')?.addEventListener('click', () => {
+  const btn = document.getElementById('connRetry') as HTMLButtonElement;
+  const ok = reconnectSidebar();
+  btn.textContent = ok ? '已重新连接' : '没找到侧边栏，请回到侧边栏点 ⧉';
+  setTimeout(() => { btn.textContent = '重新连接'; }, 4000);
+  if (ok) lastPong = Date.now(); // 先收起提示，等侧边栏的响应；没响应的话下一次心跳会再显示
+});
 
 const ui = createAnnotatorUI({
   urlPreview: true,

@@ -7,6 +7,7 @@ import { setupZoom } from '../shared/zoom';
 import { setupMenu } from '../shared/menu';
 import { describeError } from '../shared/errors';
 import { createAutoFlush } from '../shared/auto-flush';
+import { SIDEBAR_WINDOW_NAME } from '../shared/bridge';
 import type { MessageStatus, PanelCommand, SnapshotMessage, AckMessage, PongMessage } from '../shared/bridge';
 
 // ── 全局状态 ──────────────────────────────────────
@@ -43,6 +44,7 @@ let status: MessageStatus = { kind: 'loading', text: '' };
 let panelWin: Window | null = null;
 let panelSession = '';
 
+window.name = SIDEBAR_WINDOW_NAME; // 让面板在连接断开后能按窗口名重新找到这里（见 panel 的「重新连接」）
 installProxyFallback();
 installMediaStep();
 

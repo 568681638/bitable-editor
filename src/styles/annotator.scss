@@ -1203,7 +1203,7 @@ body.sidebar-zoom #app {
   &::-webkit-slider-runnable-track { background: linear-gradient(to right, #5f6368 var(--p, 0%), #c4c7c9 var(--p, 0%)); }
   &::-webkit-slider-thumb { background: #5f6368; }
 }
-.media-wrap:fullscreen { background: #000; justify-content: center; }
+.media-wrap:fullscreen { background: #000; justify-content: center; zoom: calc(1 / var(--ann-zoom, 1)); } // 侧边栏整页有字号缩放（--ann-zoom），全屏时抵消掉，控制条和预览窗格里全屏一样大
 // ⋮ 菜单：倍速、画中画、下载
 .media-more { position: relative; display: inline-flex; }
 .media-menu {

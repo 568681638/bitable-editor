@@ -3,6 +3,9 @@ import type { FieldMeta, FieldOption, RecordData } from './common';
 // 侧边栏插件（持有飞书 SDK）与双栏面板页之间的 postMessage 协议。
 // 面板页由插件 window.open 打开，通过 window.opener 回传命令。
 
+// 侧边栏页面（飞书里的 iframe）给自己起的窗口名：面板按它重新找到侧边栏，连接断了不用回侧边栏点 ⧉
+export const SIDEBAR_WINDOW_NAME = 'bitable-annotator-sidebar';
+
 export type MessageStatus = { kind: 'loading' | 'empty' | 'error'; text: string } | null;
 
 // 插件 → 面板
