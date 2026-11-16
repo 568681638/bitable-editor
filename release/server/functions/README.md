@@ -80,7 +80,7 @@ functions/
 | `async` | 可选，默认不写（= 同步）。`true` 表示异步函数：耗时很久，面板下发完就算完成，服务端后台执行，完成后插件取回结果写回。见下面“异步函数”一节 |
 | `serializeCalls` | 可选，默认不写（= 不限制）。`true` 表示串行执行：这个函数同一时间最多只有一个 `run` 在跑（不管来自哪次运行、是同步的一批还是异步的一个任务），按到达先后排队。见下面“串行执行”一节 |
 | `batchSize` | 可选。`run` 每次最多拿到多少行（最后一批可能不足），默认 100，范围 1 ~ 5000（超出会被收到范围内）。下游一次能处理很多就调大，下游慢、限流、单次耗时长（调模型）就调小 |
-| `run(rows)` | 批量计算，见下 |
+| `run(rows)` | 批量计算，见下。可选第二个参数 `ctx`：`ctx.outputs` 是这次前端要回写的出参名数组（含执行详情出参），多出参的函数可以只算这些，省掉没选出参的开销；没选的出参不用返回（返回了也会被忽略）。JS 写 `run(rows, ctx)`，Python 写 `def run(rows, ctx)`，`ctx` 是 `{"outputs": [...]}`；只写 `run(rows)` 的旧函数照常工作。异步函数同样会拿到 |
 
 ### JS（`.mjs`）
 
@@ -159,6 +159,32 @@ Python 一样写在 `META["inputs"]` 里（`"type": "multiSelect"` 这类键名�
 - 用 curl 直接调用 `/run` 时，传多少行函数就一次拿到多少行，不会按 `batchSize` 拆分。
 
 **返回值**：必须是**与 `rows` 等长、顺序一致**的数组，每一项是 `{出参名: 值}`。长度对不上整批报错。（也可以返回 `{results: 这个数组, detail: '这一批的详情'}`，见“执行详情”一节。）
+
+**按需计算出参（`ctx`）**：`run` 可以带第二个参数 `ctx`，`ctx.outputs` 是**这次前端要回写的出参名数组**（用户在面板里选了字段的出参，加上执行详情出参——面板总会收集它）。出参很多、各自计算开销不同的函数，据此只算被选中的出参，省掉不必要的开销：
+
+```js
+async run(rows, ctx) {
+  const want = new Set(ctx.outputs);
+  return rows.map((row) => {
+    const o = {};
+    if (want.has('upper')) o.upper = row.text.toUpperCase();
+    if (want.has('embedding')) o.embedding = expensive(row.text);   // 没选就不算
+    return o;
+  });
+}
+```
+```python
+def run(rows, ctx):
+    want = set(ctx["outputs"])
+    ...
+```
+
+- 没被选中的出参**不用返回**，返回了也会被面板忽略；被选中的出参仍必须返回（不想写值就返回 `null` / `None`）。
+- 没选字段的出参、没被选的出参都不在 `ctx.outputs` 里。只调用的函数（`outputs` 为空）`ctx.outputs` 是空数组（声明了执行详情出参时只有它）。
+- 同步和异步函数都会拿到；异步函数拿到的是下发那一刻选中的出参。
+- 只写 `run(rows)` 的函数不受影响，照常工作（Python 执行器用参数个数判断要不要传 `ctx`）。
+- 用 curl 调 `/run` 时在 body 里加 `"outputs": ["upper"]` 就是指定出参；不带就是全部声明过的出参（和以前一样）。示例见 `示例/按需出参`。
+- **和 `requires` 配合**：出参的 `requires` 声明它需要哪些入参。入参只有在用户选了需要它的出参时才是必需的；没选的话它在面板里标「可选」，用户可以不映射，这时 `row` 里**没有这个键**。所以只在某个出参里用到的入参，要放在 `if (want.has('…'))` 里再读，别在外面无条件读（缺键会得到 `undefined` / `KeyError`）。入参被映射了就一定会传，不管有没有选对应的出参，函数忽略即可。
 
 **某一行失败**：在那个位置返回一个错误对象，只让这一行失败，其他行照常写入，失败原因会出现在面板的失败明细里。
 - JS：`return new Error('原因')`
@@ -313,6 +339,11 @@ curl -X POST localhost:6868/api/functions/text_stats/run \
   -H "Content-Type: application/json" \
   -d '{"rows":[{"text":"hello"},{"text":"a\nb"}]}'
 # 返回：{"results":[{"ok":true,"outputs":{...}},{"ok":false,"error":"..."}]}
+
+# 只要其中某些出参：outputs 就是 run 第二个参数 ctx.outputs（不带 = 全部出参）
+curl -X POST localhost:6868/api/functions/text_stats/run \
+  -H "Content-Type: application/json" \
+  -d '{"rows":[{"text":"hello"}],"outputs":["length"]}'
 ```
 
 `results` 与 `rows` 等长；`ok:false` 的是返回了错误对象的行。接口出错（函数不存在、整批失败）会返回 HTTP 4xx/5xx 加 `{"error": "原因"}`。
@@ -368,7 +399,7 @@ for r in sorted(res, key=lambda x: x[1]): print(r)
 
 1. 复制 `_template/` 整个文件夹，改成函数名（**不要**以下划线开头），放到 `functions/` 下想要的分类目录里（要新分类就新建一层文件夹）；`function.mjs` 和 `function.py` 留一个，另一个删掉。
 2. 定好 `inputs`、`outputs`（需要时写 `requires`）；`id`、`name` 不写就用文件夹名。入参是“一次运行的设置”而不是每行的数据时，写成 `select` / `multiSelect` / `text`，并写上 `description`（见“不来自字段的入参”）。
-3. 实现 `run(rows)`：批量处理，返回等长数组；单行失败返回错误对象；没有值返回 `null`/`None`。
+3. 实现 `run(rows)`：批量处理，返回等长数组；单行失败返回错误对象；没有值返回 `null`/`None`。多出参且开销不同的，用 `run(rows, ctx)` 按 `ctx.outputs` 只算被选中的出参。
 4. 出参值按上面的表格给目标字段类型的原生形态。
 5. 这个函数依赖的其他文件（模块、数据）放进同一个文件夹；多个函数共用的才放根目录的 `_xxx`。
 6. **判断要不要开关**（按上面“30 秒上手”里的表）：一批要跑很久就加 `async`；两次执行不能交错（多步操作会互相踩）就加 `serializeCalls`；都不是就什么都不加。

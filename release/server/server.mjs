@@ -315,6 +315,14 @@ function validInput(fnId, p) {
   return !why;
 }
 
+// 这次调用前端要回写的出参：run(rows, { outputs }) 的第二个参数，函数据此只算需要的出参。
+// 请求体里的 outputs 是出参名数组（只留函数声明过的）；没带（比如 curl 直接调）就当全部都要
+function wantedOutputs(fn, body) {
+  const declared = (fn.outputs || []).map(o => o.name);
+  if (!Array.isArray(body.outputs)) return declared;
+  return declared.filter(n => body.outputs.indexOf(n) >= 0);
+}
+
 // 给面板的入参描述：字段入参保持原样（name、label），其他取值方式带上 type / options / default / description
 function publicInput(p) {
   const out = { name: p.name, label: p.label };
@@ -392,8 +400,8 @@ async function loadPyDef(full, fallbackId) {
   return [{
     id: meta.id || fallbackId, name: meta.name || meta.id || fallbackId, inputs: meta.inputs, outputs: meta.outputs, batchSize: meta.batchSize, async: meta.async === true, serializeCalls: meta.serializeCalls === true || meta.serializeRuns === true, // serializeRuns 是旧名字，仍然认
     // 与 JS 函数同形：返回与 rows 等长的数组，失败的行是 Error
-    async run(rows) {
-      const data = await runPython(full, 'run', { rows }, meta.async === true ? PY_ASYNC_TIMEOUT : PY_RUN_TIMEOUT);
+    async run(rows, ctx) {
+      const data = await runPython(full, 'run', { rows, outputs: ctx && ctx.outputs },meta.async === true ? PY_ASYNC_TIMEOUT : PY_RUN_TIMEOUT);
       if (!data || !Array.isArray(data.results)) throw new Error('Python 返回格式不对');
       const list = data.results.map(r => (r.ok ? r.outputs : new Error(r.error)));
       return data.detail === undefined || data.detail === null ? list : { results: list, detail: data.detail }; // 带批级详情时用 { results, detail }，和 JS 函数同形
@@ -493,7 +501,7 @@ async function loadFunctions() {
 
 // ── 批处理函数接口 ──────────────────────────────
 // GET  /api/functions          → [{ id, name, inputs, outputs, batchSize, async, serializeCalls, serializeRuns, path }]（serializeRuns 是 serializeCalls 的旧名字，值相同，留给旧版面板）（path：函数所在分类目录的各级目录名，不含函数文件夹自己）
-// POST /api/functions/<id>/run  body { rows: [{...入参}] } → { results: [{ ok: true, outputs } | { ok: false, error }], detail?: 这一批的整体详情 }（执行详情类型的出参就在 outputs 里）
+// POST /api/functions/<id>/run  body { rows: [{...入参}], outputs?: [要回写的出参名] }（outputs 会作为 run 的第二个参数 { outputs } 交给函数；不带就是全部出参；jobs 接口同理） → { results: [{ ok: true, outputs } | { ok: false, error }], detail?: 这一批的整体详情 }（执行详情类型的出参就在 outputs 里）
 const MAX_BODY = 64 * 1024 * 1024;
 
 function sendJson(res, status, data) {
@@ -543,7 +551,7 @@ async function handleFunctions(req, res, path) {
     }
     // 批量计算：函数一次拿到全部 rows，返回与 rows 等长的数组；Error 项表示该行失败
     let shaped;
-    try { shaped = shapeRun(fn, await fn.run(fillDefaults(fn, body.rows.map(r => r || {}))), body.rows.length); }
+    try { shaped = shapeRun(fn, await fn.run(fillDefaults(fn, body.rows.map(r => r || {})), { outputs: wantedOutputs(fn, body) }), body.rows.length); }
     catch (e) { return sendJson(res, 500, { error: e instanceof Error ? e.message : String(e) }); }
     finally {
       if (held) locks.leave(fn.id);
@@ -561,8 +569,9 @@ async function handleFunctions(req, res, path) {
     if (!body || !Array.isArray(body.rows)) return sendJson(res, 400, { error: 'rows is required' });
     if (typeof body.scope !== 'string' || !body.scope || body.scope.length > 200) return sendJson(res, 400, { error: 'scope is required' });
     const rows = fillDefaults(fn, body.rows.map(r => r || {}));
-    const job = jobs.create({ fnId: fn.id, fnName: fn.name, scope: body.scope, rows, meta: body.meta, locked: fn.serializeCalls === true }, async (input) => {
-      return shapeRun(fn, await fn.run(input), input.length);
+    const ctx = { outputs: wantedOutputs(fn, body) };
+    const job =jobs.create({ fnId: fn.id, fnName: fn.name, scope: body.scope, rows, meta: body.meta, locked: fn.serializeCalls === true }, async (input) => {
+      return shapeRun(fn, await fn.run(input, ctx), input.length);
     });
     return sendJson(res, 200, { job });
   }

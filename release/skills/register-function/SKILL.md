@@ -60,6 +60,7 @@ description: 把一个还没注册的 Python / JavaScript 函数（单个函数�
 - 返回值必须是**与 `rows` 等长、顺序一致**的列表，每项是 `{出参名: 值}`。
 - 某一行失败：在那个位置**返回**错误对象（Python `ValueError('原因')`，JS `new Error('原因')`），不要 `raise` / `throw`；原因写成用户看得懂的中文，带上关键的值。
 - 整批失败（下游整个不可用、凭证缺失）：直接抛异常，运行会中断并提示原因。
+- 出参有多个且各自开销明显不同（有的要调模型 / 查接口）：写成 `run(rows, ctx)`，按 `ctx.outputs`（这次前端要回写的出参名列表，Python 是 `ctx["outputs"]`）只算被选中的出参；没选的不用返回。只有一两个很便宜的出参就不必，写 `run(rows)` 即可。
 - 同一批合并成一次下游请求；下游只能逐条调用时，在 `run` 里循环，耗时长的用线程池并发（参考 `asset_time/function.py` 的 `ASSET_WORKERS`），注意下游限流。
 - Python：第三方库和慢的模块**在 `run` 里再 `import`**，导入失败也不会让函数从列表里消失；工作目录就是函数文件夹，可以直接 `import` 同文件夹的模块、按相对路径读数据文件；`print` 进服务日志。
 - JS：服务端要兼容 **Node 14**（不用 `??=`、`||=`、`replaceAll`、`.at()`）；读同文件夹的文件用 `new URL('./data.json', import.meta.url)`；入口 `import` 的其他 `.mjs` 改了要重启服务才生效。

@@ -6,6 +6,7 @@
 import sys
 import json
 import importlib.util
+import inspect
 import os
 
 sys.stdout = sys.stderr
@@ -24,8 +25,16 @@ def main():
         result = mod.META
     else:
         with open(in_path, 'r', encoding='utf-8') as f:
-            rows = json.load(f)['rows']
-        outs = mod.run(rows)
+            data = json.load(f)
+        rows = data['rows']
+        # 第二个参数 ctx = {"outputs": [前端要回写的出参名]}；run 只写了 rows 一个参数的旧函数照常调用
+        ctx = {'outputs': data.get('outputs') if isinstance(data.get('outputs'), list) else [o['name'] for o in mod.META.get('outputs', [])]}
+        try:
+            takes_ctx = len(inspect.signature(mod.run).parameters) >= 2 or any(
+                p.kind == inspect.Parameter.VAR_POSITIONAL for p in inspect.signature(mod.run).parameters.values())
+        except (TypeError, ValueError):
+            takes_ctx = False
+        outs = mod.run(rows, ctx) if takes_ctx else mod.run(rows)
         message = None
         if isinstance(outs, dict) and 'results' in outs:  # {"results": [...], "detail": "这一批的整体详情"}（旧名 message 也认）
             message = outs.get('detail', outs.get('message'))

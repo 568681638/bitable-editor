@@ -113,14 +113,23 @@ def check_declaration(f):
     return names, out_names, [o['name'] for o in outputs if o.get('type') in ('detail', 'message')]
 
 
-def check_run(base, f, rows, names, out_names, timeout, note_names=()):
+def check_run(base, f, rows, names, out_names, timeout, note_names=(), only=None):
     print('调用：%d 行样例' % len(rows))
+    if only is not None:  # 模拟面板只回写部分出参：body 里带 outputs，函数按 ctx.outputs 只算这些
+        bad = [n for n in only if n not in out_names]
+        if bad:
+            fail('--outputs 里有不是写进字段的出参：%s' % bad)
+        out_names = [n for n in out_names if n in only]
+        print('  只要出参：%s（对应 run 的 ctx.outputs）' % (out_names + list(note_names)))
     unknown = sorted({k for r in rows for k in r} - set(names))
     if unknown:
         fail('样例行里有函数没声明的入参：%s（面板不会传这些键）' % unknown)
     started = time.time()
+    body = {'rows': rows}
+    if only is not None:
+        body['outputs'] = out_names + list(note_names)
     while True:
-        status, data = http(base, '/api/functions/%s/run' % urllib.request.quote(f['id']), {'rows': rows}, timeout)
+        status, data = http(base, '/api/functions/%s/run' % urllib.request.quote(f['id']), body, timeout)
         if status == 202 and data.get('waiting'):  # 串行函数排队中，按约定重试
             print('  ..   串行函数正在排队，重试')
             continue
@@ -160,6 +169,7 @@ def main():
     ap.add_argument('fn_id', nargs='?', help='函数 id（不写 id 时默认是函数文件夹名）')
     ap.add_argument('--list', action='store_true', help='列出已注册的函数')
     ap.add_argument('--rows', help='样例行 JSON 文件：[{入参名: 值}, ...]')
+    ap.add_argument('--outputs', help='只要这些出参（逗号分隔），模拟面板只回写部分出参；不写 = 全部')
     ap.add_argument('--base', default='http://127.0.0.1:6868', help='服务地址')
     ap.add_argument('--timeout', type=float, default=300, help='一次调用最多等多少秒')
     a = ap.parse_args()
@@ -181,7 +191,7 @@ def main():
         if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
             print('--rows 文件必须是 [{入参名: 值}, ...]')
             return 2
-        check_run(base, f, rows, names, out_names, a.timeout, note_names)
+        check_run(base, f, rows, names, out_names, a.timeout, note_names, [s for s in a.outputs.split(',') if s] if a.outputs else None)
     else:
         print('（没有给 --rows，只检查了注册信息；建议再用样例行实际调用一次）')
     print('\n结果：%s' % ('全部通过' if not problems else '%d 个问题需要修' % len(problems)))
