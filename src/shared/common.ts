@@ -308,6 +308,17 @@ export function installMediaStep() {
     v.requestVideoFrameCallback(onFrame);
   }
 
+  // 视频窗格比画面大时（面板里），画面按比例缩放后居中、上下 / 左右留黑边；控制条贴着画面的边缘，不掉到窗格最底下（和原生一样）。
+  // 按 object-fit: contain 算出画面实际占的区域，把控制条向内缩进黑边的宽度（--bar-x / --bar-y，见 annotator.scss）
+  const fitObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(entries => entries.forEach(en => fit(en.target as HTMLVideoElement))) : null;
+  function fit(v: HTMLVideoElement) {
+    const wrap = v.closest<HTMLElement>('.media-wrap');
+    if (!wrap || !v.videoWidth || !v.videoHeight || !v.clientWidth || !v.clientHeight) return;
+    const k = Math.min(v.clientWidth / v.videoWidth, v.clientHeight / v.videoHeight);
+    wrap.style.setProperty('--bar-x', Math.max(0, (v.clientWidth - v.videoWidth * k) / 2) + 'px');
+    wrap.style.setProperty('--bar-y', Math.max(0, (v.clientHeight - v.videoHeight * k) / 2) + 'px');
+  }
+
   function step(m: HTMLMediaElement, dir: number) {
     m.pause();
     const fd = frameOf(m);
@@ -391,8 +402,8 @@ export function installMediaStep() {
   for (const ev of ['play', 'pause', 'ended', 'timeupdate', 'seeked', 'loadedmetadata', 'durationchange', 'volumechange', 'ratechange']) {
     document.addEventListener(ev, (e) => { if (isMedia(e.target)) sync(e.target); }, true);
   }
-  document.addEventListener('loadeddata', (e) => { if (e.target instanceof HTMLVideoElement) track(e.target); }, true);
-  document.addEventListener('fullscreenchange', () => document.querySelectorAll<HTMLMediaElement>('.media-wrap video, .media-wrap audio').forEach(sync));
+  document.addEventListener('loadeddata', (e) => { if (e.target instanceof HTMLVideoElement) { track(e.target); fit(e.target); fitObserver?.observe(e.target); } }, true);
+  document.addEventListener('fullscreenchange', () => document.querySelectorAll<HTMLMediaElement>('.media-wrap video, .media-wrap audio').forEach(m => { sync(m); if (m instanceof HTMLVideoElement) fit(m); }));
 }
 
 // 编辑区字段下方的预览。显示不出来的情况（走代理也加载失败、网页禁止嵌入）不留任何占位：

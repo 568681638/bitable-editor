@@ -1185,7 +1185,7 @@ body.sidebar-zoom #app {
 }
 // 视频：控制条盖在画面底部（渐变底），暂停或鼠标悬停时显示，播放中鼠标移开就隐藏，和原生一样
 .media-wrap.is-video .media-bar {
-  position: absolute; left: 0; right: 0; bottom: 0; padding: 18px 8px 4px; opacity: 0; transition: opacity 0.2s;
+  position: absolute; left: var(--bar-x, 0px); right: var(--bar-x, 0px); bottom: var(--bar-y, 0px); padding: 18px 8px 4px; opacity: 0; transition: opacity 0.2s;
   background: linear-gradient(to top, rgba(0, 0, 0, 0.7), rgba(0, 0, 0, 0));
 }
 .media-wrap.is-video.menu-open .media-bar, .media-wrap.is-video.paused .media-bar, .media-wrap.is-video:hover .media-bar, .media-wrap.is-video:focus-within .media-bar { opacity: 1; }
