@@ -4,7 +4,7 @@ import {
   FType, FieldMeta, RecordData,
   esc, isUrl, cleanUrl, segmentsToText, findUrlInSegments, extractUrlFromValue,
   detectUrlType, proxyUrl, resolveImageUrl, isFramebuster, installProxyFallback, HELP_URL,
-  checkEmbeddable, clearEmbeddableCache,
+  checkEmbeddable, clearEmbeddableCache, mediaWithStep, installMediaStep,
 } from '../shared/common';
 import { createAnnotatorUI, FIELD_DRAG_TYPE } from '../shared/annotator-ui';
 import { setupModeSwitch } from '../shared/mode-switch';
@@ -15,6 +15,7 @@ import { autosizeTextarea, trackManualResize, installLineSelectAll, fitValueBox 
 import type { HostMessage, PanelCommand, SnapshotMessage } from '../shared/bridge';
 
 installProxyFallback();
+installMediaStep();
 
 // ── 与侧边栏插件通信 ──────────────────────────────
 const opener = window.opener as Window | null;
@@ -248,7 +249,8 @@ document.addEventListener('keydown', (e) => {
 // 各个音视频的长度不一定一样，规则是按秒对齐：
 //   · 同步到某个时间点，比它短的就停在自己的结尾，不会倒回去重播；
 //   · 长的继续播，短的播完后保持停着；长的把进度拖回短的范围内，短的立刻跟上并继续播；
-//   · 都停下后再点播放，所有人一起从当前位置重新开始（播完的从头开始）。
+//   · 都停下后再点播放，所有人一起从当前位置重新开始（播完的从头开始）；
+//   · 倍速也同步：改其中一个的倍速，同组其他的一起改（各播各的倍速，进度会越差越多）。
 const syncExpect = new WeakMap<HTMLMediaElement, Record<string, number>>();
 function expectEvent(el: HTMLMediaElement, type: string) {
   const o = syncExpect.get(el) || {};
@@ -273,6 +275,7 @@ function syncGroupOf(viewerId: string): Group | null {
 
 // 让 other 跟上 m：位置按秒对齐（不超过 other 自己的长度），m 在播且 other 还没到结尾就播，否则停
 function alignTo(m: HTMLMediaElement, other: HTMLMediaElement) {
+  if (other.playbackRate !== m.playbackRate) other.playbackRate = m.playbackRate; // 倍速也要一致：各播各的倍速，进度很快就对不上了
   const d = isFinite(other.duration) ? other.duration : Infinity;
   const t = Math.min(m.currentTime, d);
   if (Math.abs(other.currentTime - t) > 0.1) {
@@ -292,7 +295,7 @@ function alignTo(m: HTMLMediaElement, other: HTMLMediaElement) {
 function onMediaSync(e: Event) {
   const m = e.target as HTMLMediaElement;
   if (!(m instanceof HTMLMediaElement)) return;
-  if (consumeExpected(m, e.type)) return;
+  if (e.type !== 'ratechange' && consumeExpected(m, e.type)) return;
   if (e.type === 'pause' && m.ended) return; // 播完自动触发的暂停不算，别把还没播完的拉停
   const wrap = m.closest('.viewer-item') as HTMLElement | null;
   const g = wrap?.dataset.leaf ? syncGroupOf(wrap.dataset.leaf) : null;
@@ -300,12 +303,17 @@ function onMediaSync(e: Event) {
   const ids = new Set([g.id, ...leaves(g.child).map(l => l.id)]);
   viewerLayer.querySelectorAll<HTMLElement>('.viewer-item').forEach(viewer => {
     if (!ids.has(viewer.dataset.leaf || '')) return;
-    viewer.querySelectorAll<HTMLMediaElement>('video, audio').forEach(other => { if (other !== m) alignTo(m, other); });
+    viewer.querySelectorAll<HTMLMediaElement>('video, audio').forEach(other => {
+      if (other === m) return;
+      if (e.type === 'ratechange') { if (other.playbackRate !== m.playbackRate) other.playbackRate = m.playbackRate; } // 改倍速：同组的跟着改（相等就不动，不会来回触发）
+      else alignTo(m, other);
+    });
   });
 }
 viewerLayer.addEventListener('play', onMediaSync, true);
 viewerLayer.addEventListener('pause', onMediaSync, true);
 viewerLayer.addEventListener('seeked', onMediaSync, true);
+viewerLayer.addEventListener('ratechange', onMediaSync, true);
 
 function removeViewer(id: string) {
   viewerEls.get(id)?.remove();
@@ -432,8 +440,8 @@ function renderViewer(url: string): string {
   const src = esc(proxyUrl(url));
   const link = `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(url)}</a>`;
   switch (type) {
-    case 'video': return `<video controls src="${src}" class="block-media"></video>`;
-    case 'audio': return `<audio controls src="${src}" class="block-audio"></audio>`;
+    case 'video': return mediaWithStep('video', src, 'block-media');
+    case 'audio': return mediaWithStep('audio', src, 'block-audio');
     case 'image': return `<img src="${esc(resolveImageUrl(proxyUrl(url)))}" alt="" class="block-media" />`;
     default:
       if (isFramebuster(url)) return `<div class="block-text">该站点禁止嵌入，请在新窗口打开：<br>${link}</div>`;

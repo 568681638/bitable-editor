@@ -1,6 +1,6 @@
 import { bitable, WidgetBaseEvent } from '@lark-base-open/js-sdk';
 import '../styles/annotator.scss';
-import { FType, FieldMeta, FieldOption, RecordData, installProxyFallback } from '../shared/common';
+import { FType, FieldMeta, FieldOption, RecordData, installProxyFallback, installMediaStep } from '../shared/common';
 import { createAnnotatorUI } from '../shared/annotator-ui';
 import { setupModeSwitch } from '../shared/mode-switch';
 import { setupZoom } from '../shared/zoom';
@@ -44,6 +44,7 @@ let panelWin: Window | null = null;
 let panelSession = '';
 
 installProxyFallback();
+installMediaStep();
 
 const ui = createAnnotatorUI({
   urlPreview: true,

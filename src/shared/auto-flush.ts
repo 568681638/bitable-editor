@@ -1170,8 +1170,13 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     return null;
   }
 
+  // 这次调用前端要回写的出参名（交给后端函数，让它只算这些）：选了字段的出参，加上执行详情出参（面板总会收集它）
+  function wantedOutputs(fn: FnMeta, outs: { name: string; fieldId: string }[]): string[] {
+    return [...new Set([...outs.filter(o => o.fieldId).map(o => o.name), ...(fn.noteOut ? [fn.noteOut] : [])])];
+  }
+
   // 这里抛出的错误都是已经带上函数名的中文说明，用 describedError 标记，避免被通用翻译二次改写
-  async function callFunction(fn: FnMeta, rows: Record<string, any>[]): Promise<{ results: FnResult[]; message?: string }> {
+  async function callFunction(fn: FnMeta, rows: Record<string, any>[], outputs: string[]): Promise<{ results: FnResult[]; message?: string }> {
     const prefix = `函数“${fn.name}”调用失败：`;
     const waitStart = Date.now();
     let res: Response;
@@ -1180,7 +1185,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
         res = await fetch(apiUrl(`api/functions/${encodeURIComponent(fn.id)}/run`), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ rows, wait: attempt === 0 ? 1500 : undefined }), // 第一次请求只等 1.5 秒，轮不到就马上回“排队中”让状态栏及时提示；之后的重试才等满
+          body: JSON.stringify({ rows, outputs, wait: attempt === 0 ? 1500 : undefined }), // 第一次请求只等 1.5 秒，轮不到就马上回“排队中”让状态栏及时提示；之后的重试才等满
         });
       } catch (e) {
         throw describedError(prefix + describeError(e, 'read'));
@@ -1207,10 +1212,10 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     return res.json();
   }
 
-  async function dispatchJob(fn: FnMeta, rows: Record<string, any>[], meta: JobMeta): Promise<void> {
+  async function dispatchJob(fn: FnMeta, rows: Record<string, any>[], meta: JobMeta, outputs: string[]): Promise<void> {
     const prefix = `函数“${fn.name}”下发失败：`;
     try {
-      await jobApi(`api/functions/${encodeURIComponent(fn.id)}/jobs`, { rows, scope: host.getScope(), meta });
+      await jobApi(`api/functions/${encodeURIComponent(fn.id)}/jobs`, { rows, outputs, scope: host.getScope(), meta });
     } catch (e) {
       throw describedError(prefix + describeError(e, 'read'));
     }
@@ -1885,7 +1890,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     const hasAny = live.length > 0 || callLog.length > 0 || noteLog.length > 0 || failN > 0;
     const state = dotState(failN > 0, live2);
     const tip = ['运行历史', busy ? `运行中 ${busy}` : '', waiting ? `待写回 ${waiting}` : '', applied ? `已写回 ${applied}` : '', callLog.length ? `同步调用 ${callLog.length} 次` : '', failN ? `${failN} 条失败` : ''].filter(Boolean).join(' · ');
-    return `<button type="button" class="af-job-badge${jobWin ? ' on' : ''}" data-act="jobs-toggle" title="${esc(tip + (hasAny && unseen ? ' · 有新的结果' : ''))}">${ico('list')}<span>历史</span>${hasAny && unseen ? `<i class="af-dot ${state}"></i>` : ''}</button>`;
+    return `<button type="button" class="af-job-badge${jobWin ? ' on' : ''}" data-act="jobs-toggle" title="${esc(tip + (hasAny && unseen ? ' · 有新的结果' : ''))}">历史${hasAny && unseen ? `<i class="af-dot ${state}"></i>` : ''}</button>`;
   }
 
   function jobNoteHtml(): string { return jobNote ? `<div class="af-hint af-err">${esc(jobNote)}</div>` : ''; }
@@ -2655,6 +2660,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
         for (const { fn, outs } of syncFns) {
           const rows = buildRows(fn);
           const size = batchOf(fn);
+          const wanted = wantedOutputs(fn, outs);
           const results: FnResult[] = [];
           for (let s = 0; s < rows.length; s += size) {
             // 每一批调用都记进历史（成功 / 失败条数、用时），有执行详情的一起收进去（有说明就弹出 / 追加到历史窗口）
@@ -2664,7 +2670,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
             const ref = { id: runId, at: runAt, part: seq, parts: partsOf(fn) };
             const t0 = Date.now();
             let part: { results: FnResult[]; message?: string };
-            try { part = await callFunction(fn, rows.slice(s, s + size)); }
+            try { part = await callFunction(fn, rows.slice(s, s + size), wanted); }
             catch (e) { pushCall(makeCall(fn, indexes, ref, [], Date.now() - t0, e instanceof Error ? e.message : String(e))); throw e; }
             results.push(...part.results);
             pushCall(makeCall(fn, indexes, ref, part.results, Date.now() - t0));
@@ -2708,7 +2714,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
             const seq = (partSeq.get(fn.id) || 0) + 1;
             partSeq.set(fn.id, seq);
             const run: RunInfo = { id: runId, at: runAt, total: matched.length, part: seq, parts: partsOf(fn), from: start + s + 1, to: start + s + part.length };
-            await dispatchJob(fn, rows.slice(s, s + size), { recordIds: part.map(r => r.recordId), indexes: part.map(r => indexOf.get(r.recordId) || 0), outs: mapped, run });
+            await dispatchJob(fn, rows.slice(s, s + size), { recordIds: part.map(r => r.recordId), indexes: part.map(r => indexOf.get(r.recordId) || 0), outs: mapped, run }, wantedOutputs(fn, outs));
             // 按函数累计，已下发条数取各函数里最多的那个（同一条记录给多个异步函数只算一条）；下发到一半失败时，已成功的部分也如实计入
             sentBy.set(fn.id, (sentBy.get(fn.id) || 0) + part.length);
             dispatched = Math.max(dispatched, ...sentBy.values());
