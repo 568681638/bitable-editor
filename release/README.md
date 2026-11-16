@@ -12,8 +12,11 @@ release/
 │   └── supervisor.conf   supervisord 程序配置模板
 ├── server/
 │   ├── server.mjs    生产服务：托管 dist/ + /api-proxy/ 通用代理 + /api/functions 批处理函数接口 + /api/jobs 异步任务接口 + /api/config 运行时配置
-│   ├── jobs.mjs      异步函数的任务存储（排队、执行、落盘到 server/data/jobs/、认领 / 确认、定期清理）；只有声明了 async 的函数才用到
-│   ├── locks.mjs     函数的串行锁（同一时间最多一个 run 在执行）；只有声明了 serializeCalls 的函数才用到
+│   ├── lib/
+│   │   ├── jobs.mjs  异步函数的任务存储（排队、执行、落盘到 server/data/jobs/、认领 / 确认、定期清理）；只有声明了 async 的函数才用到
+│   │   └── locks.mjs 函数的串行锁（同一时间最多一个 run 在执行）；只有声明了 serializeCalls 的函数才用到
+│   ├── runtime/
+│   │   └── python_executor.py   Python 函数的执行器（服务内部用，不要删）
 │   ├── data/         运行时生成：异步任务和结果（不入库；服务重启后保留，在途任务会被标记为失败）
 │   ├── config.json   运行时配置（目前只有教程链接 helpUrl）
 │   └── functions/    批处理函数：一个函数一个文件夹（入口 function.mjs 或 function.py，模板见 _template/），可放多层分类目录，热加载
@@ -69,7 +72,7 @@ python -I release/skills/register-function/check_function.py <函数 id> --rows 
 
 公式、附件、关联、地理位置、群组、自动编号等暂不支持写入，选了会在运行前被拦住。
 
-**Python 函数**：在函数文件夹里放入口 `function.py`，写法见 `functions/_template/function.py`（一个 `META` 加一个 `run(rows)`），函数依赖的其他模块和数据文件放在同一个文件夹里。服务用系统的 `python3` 执行（可用环境变量 `PYTHON_BIN` 指定其他解释器），`functions/_python_executor.py` 是执行器，不要删。数据通过临时目录里的 JSON 文件传给 Python 和取回结果，不经过命令行参数和管道，没有大小限制，用完自动清理；每批启动一次 Python 进程，函数里 `print` 的内容进服务日志。
+**Python 函数**：在函数文件夹里放入口 `function.py`，写法见 `functions/_template/function.py`（一个 `META` 加一个 `run(rows)`），函数依赖的其他模块和数据文件放在同一个文件夹里。服务用系统的 `python3` 执行（可用环境变量 `PYTHON_BIN` 指定其他解释器），`runtime/python_executor.py` 是执行器，不要删。数据通过临时目录里的 JSON 文件传给 Python 和取回结果，不经过命令行参数和管道，没有大小限制，用完自动清理；每批启动一次 Python 进程，函数里 `print` 的内容进服务日志。
 
 注意：函数文件夹里任何文件（含入口依赖的模块、数据）变了都会重新加载这个函数；唯一的例外是 JS 入口 `import` 的其他 `.mjs` 模块——被 Node 缓存住了，改了仍需重启服务（Python 函数每次调用都是新进程，没有这个限制）。
 
@@ -84,7 +87,7 @@ npm install     # 首次
 npm run build
 ```
 
-**2. 把整个 `release/` 目录拷到服务器**，例如放到 `/zyt_users/yuntong.li/server/bitable-annotator/release`。
+**2. 把整个 `release/` 目录拷到服务器**（函数用到的密钥文件 `server/functions/<函数>/_credentials.json` 不进 git，要随目录一起拷，或在服务器上改用环境变量；见 `server/functions/README.md` 文末的“配置”一节），例如放到 `/zyt_users/yuntong.li/server/bitable-annotator/release`。
 
 > 也可以在服务器上构建：服务器上 `git pull` → `npm install`（依赖有变化时）→ `npm run build`，效果一样；前提是 DSW 能访问 npm 仓库。
 
@@ -123,6 +126,7 @@ echo "alias redeploy-bitable='bash /zyt_users/yuntong.li/server/bitable-annotato
 - 旧的启动钩子和 supervisor 配置里记着旧路径，不重跑的话：正在运行的进程不受影响，但进程崩溃自动重启或容器重启后将找不到入口。
 - 新脚本会识别历代入口路径、停掉旧进程，并重写钩子和 supervisor 配置。
 - 旧路径下遗留的文件（项目根目录的 `deploy.sh`、`server.mjs` 等）可以删掉；日志里 supervisord 反复报 `Cannot find module …/server.mjs` 是它还记着旧配置，是历史报错，重启容器后会消失。
+- **目录结构调整后的升级**（`server/` 里新增了 `lib/`、`runtime/`，`asset_time`、`tte_issue` 移到了 `functions/业务/`，公共模块移到了 `functions/_shared/`）：整个 `release/` 拷过去是覆盖不是同步，旧位置的 `server/jobs.mjs`、`server/locks.mjs`、`functions/_python_executor.py`、`functions/_config.py`、`functions/_asset_id.py`、`functions/asset_time/`、`functions/tte_issue/` 会残留，**手动删掉**（残留的旧函数文件夹会和 `业务/` 下同 id 的函数重复，服务只保留一个并在日志里报警）；旧函数文件夹里的 `_credentials.json` 要先移到 `functions/业务/<函数>/` 里再删。入口 `server/server.mjs` 的路径没变，部署脚本和 supervisor 配置不用改。
 
 ---
 

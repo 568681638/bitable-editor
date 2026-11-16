@@ -5,6 +5,6 @@ dist/
 .claude/
 __pycache__/
 *.pyc
-release/server/functions/_credentials.json
+release/server/functions/**/_credentials.json
 
 release/server/data/

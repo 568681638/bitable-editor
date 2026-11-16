@@ -1,6 +1,7 @@
 # Python 批处理函数模板：复制整个 _template 文件夹，改成函数名（不要以下划线开头），入口文件保持叫 function.py，改内容，保存即生效，不用重启服务。
 # 一个函数 = 一个文件夹：入口文件 function.py + 它依赖的其他文件（模块、数据、配置）都放在这个文件夹里；函数里 `import 同文件夹的模块`、
-# 按相对路径读同文件夹的数据文件都行（服务把函数文件夹设为工作目录并加入 sys.path）。根目录下以 _ 开头的公共模块（_config、_asset_id）也能 import。
+# 按相对路径读同文件夹的数据文件都行（服务把函数文件夹设为工作目录并加入 sys.path）。functions/_shared/ 里的公共模块（_config、_asset_id）也能 import。
+# 函数自己的配置（服务地址、密钥）放在本文件夹里：默认值写进代码 `_config.get("NAME", default="...")`，密钥放本文件夹的 _credentials.json（不进 git，可在同目录放一份 _credentials.example.json 当模板），环境变量优先；不要去改 functions/ 根目录的文件。
 # 文件夹可以放在 functions/ 的任意分类目录下（不含入口文件的文件夹就是分类目录，可多层），面板里选函数时的层级和目录结构一致。以下划线或点开头的文件 / 目录会被忽略。
 # 入口需要提供 META 和 run 两样东西。
 #

@@ -17,6 +17,7 @@
 ## 30 秒上手
 
 1. 复制 `_template/` 整个文件夹，改成函数名（不以下划线开头），放进 `functions/` 下想要的分类目录；`function.mjs` / `function.py` 留一个，另一个删掉。
+**新增函数只需要新增这个文件夹，不用改 `functions/` 下或服务端的任何其他文件**（函数的配置、依赖模块、数据文件都放在它自己的文件夹里，见文末“配置”一节）。
 2. 在入口里写 `inputs`、`outputs` 和 `run(rows)`（批量：一次拿到一批行，返回**等长**数组；某行失败返回错误对象）。
 3. **按需**加两个可选开关（都不写就是最普通的同步函数，不用管它们）：
 
@@ -40,32 +41,36 @@
 - **旧写法已不再加载**：直接放在目录里的单个 `xxx.mjs` / `xxx.py` 会被忽略，服务日志里会提醒一次该怎么改（放进 `xxx/function.mjs` / `xxx/function.py`）。
 
 ```
-functions/
+functions/                      只放函数和分类目录；服务内部的代码不在这里（见上一级的 lib/、runtime/）
 ├── README.md                   本文档
 ├── _template/                  函数模板（复制整个文件夹改名，里面 function.mjs / function.py 二选一）
-├── _python_executor.py         Python 执行器：服务用它加载并执行 function.py，不要删、不要改名
-├── _asset_id.py                公共模块：资产 ID 格式检查（多个函数共用，Python 里 import _asset_id）
-├── _config.py                  公共模块：读取凭证和服务地址（环境变量 > _credentials.json > 默认值）
-├── _credentials.example.json   凭证模板；真实的 _credentials.json 不进 git，随 release 目录手动拷到服务器
-├── text_stats/function.mjs     示例（JS）
-├── url_host/function.mjs       示例（JS）
-├── asset_time/function.py      资产起止时间（Python，调资产服务）
-├── tte_issue/                  TTE 工单（Python，调 TTE 接口）
-│   ├── function.py             入口
-│   └── tte_client.py           只有这个函数用的客户端模块（和函数放在一起，function.py 里直接 import tte_client）
-├── 机制/url_previewable/       「机制」分类目录：存放和插件内部机理相关的函数（比如判断链接能否在预览窗格里加载）；业务函数放在别处
-├── 示例/无输出/log_rows/       无输出函数示例：「示例 / 无输出」是两层分类目录，log_rows 是函数文件夹
-│   └── function.mjs
-├── 示例/异步/slow_upper/       异步函数示例（JS，async: true，模拟耗时 15 秒）
-├── 示例/异步/slow_len/         异步函数示例（Python，"async": True，模拟耗时 10 秒）
-├── 示例/串行锁/locked_demo/    串行执行示例（同步，serializeCalls: true）
-├── 示例/串行锁/locked_async_demo/   串行执行 + 异步示例
-└── 示例/手动入参/manual_demo/  不来自字段的入参示例（单选 / 多选 / 文本）
+├── _shared/                    多个函数共用的 Python 模块（函数里直接 import）：
+│   ├── _asset_id.py            资产 ID 格式检查（import _asset_id）
+│   └── _config.py              函数读自己配置的小工具（环境变量 > 函数文件夹里的 _credentials.json > 代码里的 default），不用改它
+├── 业务/                       「业务」分类目录：对接真实业务系统的函数
+│   ├── asset_time/             资产起止时间（Python，调资产服务）
+│   │   ├── function.py         入口
+│   │   ├── _credentials.json   这个函数自己的密钥（不进 git，部署时手动拷）
+│   │   └── _credentials.example.json  密钥模板（进 git）
+│   └── tte_issue/              TTE 工单（Python，调 TTE 接口）
+│       ├── function.py         入口
+│       ├── tte_client.py       只有这个函数用的客户端模块（和函数放在一起，function.py 里直接 import tte_client）
+│       ├── _credentials.json / _credentials.example.json   同上
+├── 机制/url_previewable/       「机制」分类目录：存放和插件内部机理相关的函数（比如判断链接能否在预览窗格里加载）；业务函数不要放这里
+├── 示例/                       「示例」分类目录：各种写法的示例，可以删掉
+│   ├── 无输出/log_rows/        无输出函数示例（JS）：「示例 / 无输出」是两层分类目录，log_rows 是函数文件夹
+│   ├── 异步/slow_upper/        异步函数示例（JS，async: true，模拟耗时 15 秒）
+│   ├── 异步/slow_len/          异步函数示例（Python，"async": True，模拟耗时 10 秒）
+│   ├── 串行锁/locked_demo/     串行执行示例（同步，serializeCalls: true）
+│   ├── 串行锁/locked_async_demo/   串行执行 + 异步示例
+│   ├── 手动入参/manual_demo/   不来自字段的入参示例（单选 / 多选 / 文本）
+│   ├── 执行详情/               执行详情示例（Python）
+│   └── 按需出参/selective_demo/    按需计算出参示例（run 的 ctx.outputs；出参 requires 决定入参是否必需）
 ```
 
-（服务端支撑这两个开关的代码在上一级目录：`../jobs.mjs` 是异步任务存储，`../locks.mjs` 是串行锁，加函数时不用动它们。）
+（服务端支撑这两个开关的代码在上一级目录：`../lib/jobs.mjs` 是异步任务存储，`../lib/locks.mjs` 是串行锁，`../runtime/python_executor.py` 是 Python 执行器，加函数时不用动它们。）
 
-**什么放根目录的 `_xxx` 公共模块，什么放函数文件夹里**：只有一个函数用的（客户端、数据文件、辅助模块），放进它自己的文件夹；多个函数共用的（凭证读取 `_config`、资产 ID 检查 `_asset_id`），放在 `functions/` 根目录，以 `_` 开头。
+**什么放 `_shared/` 公共模块，什么放函数文件夹里**：只有一个函数用的（客户端、数据文件、辅助模块），放进它自己的文件夹；多个函数共用的（配置读取小工具 `_config`、资产 ID 检查 `_asset_id`），放在 `functions/_shared/`（文件名以 `_` 开头，函数里直接 `import _config`）。
 
 ## 函数的定义
 
@@ -281,12 +286,12 @@ def run(rows, ctx):
 - 服务用系统的 `python3` 执行（Windows 本机默认 `python`），可以用环境变量 `PYTHON_BIN` 指定别的解释器。
 - 每批调用启动一次 Python 进程；数据经临时目录里的 JSON 文件进出，没有大小限制，用完自动清理。
 - 函数里 `print` 的内容进服务日志，不会弄坏返回结果。
-- 服务把**函数文件夹**设为 Python 的工作目录并加入 `sys.path`：函数里可以直接 `import` 同文件夹里的模块、按相对路径读同文件夹里的数据文件；根目录下以 `_` 开头的公共模块（`_asset_id`、`_config`）同样可以 `import`。每次调用都是新进程，所以改了函数文件夹里的任何 `.py`，下一次调用就生效。
+- 服务把**函数文件夹**设为 Python 的工作目录并加入 `sys.path`：函数里可以直接 `import` 同文件夹里的模块、按相对路径读同文件夹里的数据文件；`functions/_shared/` 里的公共模块（`_asset_id`、`_config`）同样可以 `import`。每次调用都是新进程，所以改了函数文件夹里的任何 `.py`，下一次调用就生效。
 - 函数要**自包含**：只依赖本目录里的文件和 PyPI 上的第三方库（如 `requests`），**不要 import 其他项目的代码**，否则部署到服务器就找不到。需要的客户端逻辑直接写进函数自己的文件夹（参考 `tte_issue/tte_client.py`）。
-- 依赖放在**函数的 `run` 里再 import**（参考 `tte_issue/function.py`）：模块导入慢或依赖缺失时，函数仍能注册成功、出现在列表里，错误会在运行时明确报出，而不是让函数从列表里消失。
+- 依赖放在**函数的 `run` 里再 import**（参考 `业务/tte_issue/function.py`）：模块导入慢或依赖缺失时，函数仍能注册成功、出现在列表里，错误会在运行时明确报出，而不是让函数从列表里消失。
 - 单批执行超时默认 300 秒，可用 `PY_RUN_TIMEOUT_MS` 调大；读取元信息超时 15 秒。
 
-## 环境变量
+## 配置（环境变量与函数自己的 _credentials.json）
 
 | 变量 | 作用 | 默认 |
 | --- | --- | --- |
@@ -298,11 +303,11 @@ def run(rows, ctx):
 | `LOCK_WAIT_MS` | `serializeCalls` 函数的同步调用排队时，一次请求最多等多久就回“还在排队”（面板自动重试） | 25000 |
 | `ASSET_WORKERS` | `asset_time` 并发查询资产的线程数 | 8 |
 | `ASSET_BASE_URL` | 资产服务网关地址 | `https://data.zytintra.com/gw/openapi/data/assets` |
-| `ASSET_API_KEY` | 资产服务的 apiKey | 无，写在 `_credentials.json` |
+| `ASSET_API_KEY` | 资产服务的 apiKey | 无，写在 `业务/asset_time/_credentials.json` |
 | `TTE_BASE_URL` | TTE 开放接口地址 | `https://tte.zytintra.com/open-apis/v1` |
-| `TTE_APP_KEY` / `TTE_APP_SECRET` | TTE 开放接口的签名凭证 | 无，写在 `_credentials.json` |
+| `TTE_APP_KEY` / `TTE_APP_SECRET` | TTE 开放接口的签名凭证 | 无，写在 `业务/tte_issue/_credentials.json` |
 
-**凭证**：`ASSET_API_KEY`、`TTE_APP_KEY`、`TTE_APP_SECRET` 优先读同名环境变量，其次读本目录的 `_credentials.json`（模板见 `_credentials.example.json`）。`_credentials.json` 已加入 `.gitignore`，**不会进 git**，所以部署时要把本机这个文件随 `release/` 目录一起拷到服务器，或者在服务器上改用环境变量。缺少配置时函数会报出明确的错误，提示缺哪一项。
+**配置属于函数本身，放在函数自己的文件夹里**，新增函数不需要改 `functions/` 下任何别的文件：服务地址等默认值写在函数代码里（`_config.get("NAME", default="...")`），密钥写在函数文件夹里的 `_credentials.json`，查找顺序是同名环境变量 > 函数文件夹里的 `_credentials.json` > `default`。比如 `业务/asset_time/_credentials.json` 放 `ASSET_API_KEY`，`业务/tte_issue/_credentials.json` 放 `TTE_APP_KEY` / `TTE_APP_SECRET`，模板见各文件夹里的 `_credentials.example.json`。`_credentials.json` 已加入 `.gitignore`，**不会进 git**，所以部署时要把本机这些文件随 `release/` 目录一起拷到服务器，或者在服务器上改用环境变量。缺少配置时函数会报出明确的错误，提示缺哪一项、该写到哪个文件。
 
 依赖：服务器上的 `python3` 只需要装 `requests`。
 
@@ -401,7 +406,7 @@ for r in sorted(res, key=lambda x: x[1]): print(r)
 2. 定好 `inputs`、`outputs`（需要时写 `requires`）；`id`、`name` 不写就用文件夹名。入参是“一次运行的设置”而不是每行的数据时，写成 `select` / `multiSelect` / `text`，并写上 `description`（见“不来自字段的入参”）。
 3. 实现 `run(rows)`：批量处理，返回等长数组；单行失败返回错误对象；没有值返回 `null`/`None`。多出参且开销不同的，用 `run(rows, ctx)` 按 `ctx.outputs` 只算被选中的出参。
 4. 出参值按上面的表格给目标字段类型的原生形态。
-5. 这个函数依赖的其他文件（模块、数据）放进同一个文件夹；多个函数共用的才放根目录的 `_xxx`。
+5. 这个函数依赖的其他文件（模块、数据）放进同一个文件夹；多个函数共用的才放 `functions/_shared/`。
 6. **判断要不要开关**（按上面“30 秒上手”里的表）：一批要跑很久就加 `async`；两次执行不能交错（多步操作会互相踩）就加 `serializeCalls`；都不是就什么都不加。
 7. 保存。看服务日志里有没有 `[functions] 已加载 <路径>` 一行；用 `curl localhost:6868/api/functions` 确认它出现在列表里，`path` 是它所在的分类目录，`async` / `serializeCalls` 和你声明的一致。
 8. 用 `curl` 调一次，确认结果等长、格式对，再去面板里试（异步函数的 curl 测法见“本地怎么测”）。

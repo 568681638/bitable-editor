@@ -1,6 +1,6 @@
-# 批处理的 Python 函数执行器：由 server.mjs 调用，不要直接运行。
-#   python _python_executor.py <函数入口 function.py> meta <输入文件> <输出文件>   → 把该文件的 META 写进输出文件
-#   python _python_executor.py <函数入口 function.py> run  <输入文件> <输出文件>   → 读输入文件 {"rows": [...]}，把 {"results": [...], "detail": 可选，这一批的整体详情} 写进输出文件
+# 批处理的 Python 函数执行器（服务内部实现，不在 functions/ 里）：由 server.mjs 调用，不要直接运行。
+#   python python_executor.py <函数入口 function.py> meta <输入文件> <输出文件>   → 把该文件的 META 写进输出文件
+#   python python_executor.py <函数入口 function.py> run  <输入文件> <输出文件>   → 读输入文件 {"rows": [...]}，把 {"results": [...], "detail": 可选，这一批的整体详情} 写进输出文件
 # 数据全部走文件（JSON，UTF-8），不经过命令行参数和管道，数据量不受限制；
 # 函数里 print 的内容会被转到 stderr（进服务日志）。
 import sys
@@ -14,8 +14,9 @@ sys.stdout = sys.stderr
 
 def main():
     path, mode, in_path, out_path = sys.argv[1:5]
-    # 入口可以 import 同文件夹里的任何模块（函数文件夹在最前面），以及 functions/ 根目录下以 _ 开头的公共模块（_config、_asset_id）
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    os.environ['AUTOFLOW_FN_DIR'] = os.path.dirname(os.path.abspath(path))  # _config 据此找函数自己文件夹里的 _credentials.json
+    # 入口可以 import 同文件夹里的任何模块（函数文件夹在最前面），以及 functions/_shared/ 里多个函数共用的公共模块（_config、_asset_id）
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'functions', '_shared'))
     sys.path.insert(0, os.path.dirname(os.path.abspath(path)))
     spec = importlib.util.spec_from_file_location('autoflush_fn', path)
     mod = importlib.util.module_from_spec(spec)

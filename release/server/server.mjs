@@ -12,8 +12,8 @@ import { readdir, mkdtemp, writeFile, unlink, rmdir } from 'fs/promises';
 import { tmpdir } from 'os';
 import { spawn } from 'child_process';
 import { pathToFileURL } from 'url';
-import { createJobStore } from './jobs.mjs';
-import { createFnLocks } from './locks.mjs';
+import { createJobStore } from './lib/jobs.mjs';
+import { createFnLocks } from './lib/locks.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = join(__dirname, '..', 'dist');
@@ -354,10 +354,10 @@ function batchSizeOf(d) {
   return n >= 1 ? Math.min(n, MAX_BATCH) : DEFAULT_BATCH;
 }
 
-// ── Python 函数：由 functions/_python_executor.py 加载 .py 并执行，一批行启动一次进程 ──
+// ── Python 函数：由 runtime/python_executor.py 加载 .py 并执行，一批行启动一次进程 ──
 // 数据经临时目录里的 JSON 文件传递（不走命令行参数和管道），数据量不受限制
 const PYTHON_BIN = process.env.PYTHON_BIN || (process.platform === 'win32' ? 'python' : 'python3');
-const PY_EXECUTOR = join(FUNCTIONS_DIR, '_python_executor.py');
+const PY_EXECUTOR = join(__dirname, 'runtime', 'python_executor.py');
 const PY_META_TIMEOUT = 15000;
 const PY_RUN_TIMEOUT = Number(process.env.PY_RUN_TIMEOUT_MS) || 300000; // 单批执行的超时，可用环境变量调大
 const PY_ASYNC_TIMEOUT = Number(process.env.PY_ASYNC_TIMEOUT_MS) || 4 * 3600 * 1000; // 异步函数（META 里 async: true）单批执行的超时，默认 4 小时

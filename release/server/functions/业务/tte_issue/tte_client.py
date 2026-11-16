@@ -52,7 +52,7 @@ def _records(payload):
 
 def _query_batch(batch):
     """查一批资产的工单；命中条数超过单页时按 total 翻页取全。"""
-    url = _config.get("TTE_BASE_URL").rstrip("/") + "/issue/list"
+    url = _config.get("TTE_BASE_URL", default="https://tte.zytintra.com/open-apis/v1").rstrip("/") + "/issue/list"
     page_size = max(len(batch), 10)
     records, page = [], 1
     while True:

@@ -48,7 +48,7 @@ def _fetch(session, base, headers, asset_id):
 
 
 def run(rows):
-    base = _config.get("ASSET_BASE_URL").rstrip("/")
+    base = _config.get("ASSET_BASE_URL", default="https://data.zytintra.com/gw/openapi/data/assets").rstrip("/")
     headers = {"apiKey": _config.get("ASSET_API_KEY")}
 
     ids = [str(r.get("asset_id", "")).strip() for r in rows]
