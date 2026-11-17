@@ -85,7 +85,7 @@ def check_declaration(f):
         if kind in MANUAL_TYPES:
             line = '入参 %s（%s）：%s' % (p['name'], p.get('label') or '', kind)
             if kind != 'text':
-                line += '，可选值 %s' % [o['value'] for o in p.get('options') or []]
+                line += '，可选值 %s' % leaf_values(p.get('options') or [])
             if 'default' in p:
                 line += '，默认 %s' % json.dumps(p['default'], ensure_ascii=False)
             ok(line)
@@ -111,6 +111,14 @@ def check_declaration(f):
     if not out_names:
         ok('没有要写进表格的出参：只调用、不写表格，run 每项返回 {} 即可' + ('（执行详情照常返回）' if outputs else ''))
     return names, out_names, [o['name'] for o in outputs if o.get('type') in ('detail', 'message')]
+
+
+def leaf_values(opts):
+    # 选项可以嵌套（带 children 的是分类，只有叶子才是可选的值）
+    out = []
+    for o in opts:
+        out.extend(leaf_values(o['children']) if o.get('children') else [o['value']])
+    return out
 
 
 def check_run(base, f, rows, names, out_names, timeout, note_names=(), only=None):

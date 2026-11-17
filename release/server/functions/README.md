@@ -132,7 +132,7 @@ def run(rows):
 
 | 键 | 说明 |
 | --- | --- |
-| `options` | 可选值。`['a', 'b']`，或 `[{ value: 'a', label: '显示名' }]`（`value` 传给 `run`，`label` 显示在面板里）。`select` / `multiSelect` 必须写，且不能为空 |
+| `options` | 可选值。`['a', 'b']`，或 `[{ value: 'a', label: '显示名' }]`（`value` 传给 `run`，`label` 显示在面板里）。`select` / `multiSelect` 必须写，且不能为空。**可以嵌套成多级目录**：写 `{ label: '华东', children: [{ value: 'sh', label: '上海' }, …] }`，带 `children` 的是分类（只用来分组，不能选，可以再往下嵌套任意层），只有叶子的 `value` 才是可选的值，`run` 拿到的永远是叶子的 `value`（单选是字符串，多选是数组），`default` 也写叶子的 `value`。面板里单选弹层按目录缩进显示、搜索时按「分类 / 子分类 / 名字」匹配；多选勾选列表里分类可折叠，勾分类等于勾它下面的全部叶子（部分勾选显示半选）。示例见 `示例/手动入参/manual_demo` |
 | `default` | 面板里的初始值：`select` 写一个 `options` 里的值，`multiSelect` 写这些值组成的数组，`text` 写字符串。不写就是空，等用户自己选 / 填 |
 | `description` | 给填写的人看的说明，显示在这一行输入下面（也是参数下拉的悬停提示）。**建议都写**：这种入参的含义只能靠它说明 |
 

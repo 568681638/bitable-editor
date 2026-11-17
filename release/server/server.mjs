@@ -300,11 +300,22 @@ function shapeRun(fn, out, n) {
 // description：给填写的人看的说明，显示在输入行下面
 const INPUT_TYPES = ['field', 'select', 'multiSelect', 'text'];
 const isManualInput = (p) => !!p.type && p.type !== 'field';
-const optionList = (p) => (Array.isArray(p.options) ? p.options : [])
-  .filter(o => o != null && (typeof o !== 'object' || o.value != null))
-  .map(o => (typeof o === 'object' ? { value: String(o.value), label: String(o.label != null ? o.label : o.value) } : { value: String(o), label: String(o) }))
-  .filter(o => o.value !== '');
-
+// options 可以嵌套成多级目录：{ label, children: [...] } 是分类（只用来分组，不能选），叶子 { value, label } 或字符串才是可选的值；run 拿到的永远只是叶子的 value
+function optionTree(list) {
+  const out = [];
+  for (const o of Array.isArray(list) ? list : []) {
+    if (o == null) continue;
+    if (typeof o === 'object' && Array.isArray(o.children)) {
+      const kids = optionTree(o.children);
+      if (kids.length) out.push({ label: String(o.label != null ? o.label : o.value != null ? o.value : ''), children: kids });
+    } else if (typeof o === 'object') {
+      if (o.value != null && String(o.value) !== '') out.push({ value: String(o.value), label: String(o.label != null ? o.label : o.value) });
+    } else if (String(o) !== '') out.push({ value: String(o), label: String(o) });
+  }
+  return out;
+}
+const leavesOfTree = (tree) => tree.flatMap(n => (n.children ? leavesOfTree(n.children) : [n]));
+const optionList = (p) => leavesOfTree(optionTree(p.options)); // 可选的值（叶子），校验用
 function validInput(fnId, p) {
   let why = '';
   if (p.type !== undefined && INPUT_TYPES.indexOf(p.type) < 0) why = 'type 只能是 ' + INPUT_TYPES.join(' / ') + '，收到 ' + JSON.stringify(p.type);
@@ -329,7 +340,7 @@ function publicInput(p) {
   if (typeof p.description === 'string' && p.description) out.description = p.description;
   if (!isManualInput(p)) return out;
   out.type = p.type;
-  if (p.type !== 'text') out.options = optionList(p);
+  if (p.type !== 'text') out.options = optionTree(p.options); // 平铺的选项和以前一样是 { value, label }，有目录的带 children
   if (p.default !== undefined) out.default = p.type === 'multiSelect' ? p.default.map(String) : String(p.default);
   return out;
 }

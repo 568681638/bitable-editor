@@ -44,7 +44,7 @@ description: 把一个还没注册的 Python / JavaScript 函数（单个函数�
 
 **入参**（`inputs`）：
 - 每行不同的数据 → 不写 `type`，用户在面板里映射到字段。`run` 拿到的是**字符串**（单元格拍平成文本；没映射的可选入参不会出现在 `row` 里），需要数字 / 列表 / JSON 的，在适配层里解析，解析失败就让这一行失败。
-- 一次运行的设置 → `type: 'select'`（`options` 必填）/ `'multiSelect'`（`options` 必填，`run` 拿到字符串数组）/ `'text'`；写上 `default`，**一定写 `description`**（面板里这类入参的含义只能靠它说明）。原函数参数有默认值的，通常就是这一类。
+- 一次运行的设置 → `type: 'select'`（`options` 必填）/ `'multiSelect'`（`options` 必填，`run` 拿到字符串数组；选项很多有层级时可嵌套 `{label, children:[…]}` 做成多级目录，只有叶子 `value` 可选，见 README）/ `'text'`；写上 `default`，**一定写 `description`**（面板里这类入参的含义只能靠它说明）。原函数参数有默认值的，通常就是这一类。
 - `name` 用原函数的参数名（或贴近的英文），`label` 用中文，面板里显示。
 
 **出参**（`outputs`）：

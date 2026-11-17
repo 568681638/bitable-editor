@@ -29,8 +29,10 @@ interface ParamMeta {
   name: string; label?: string; requires?: string[];
   // 以下只有入参有：type 不写 = 来自字段（每行取那一格的文本）；select / multiSelect / text 不来自字段，在卡片里直接填，整次运行每行都是同一个值
   // 出参的 type 只有 'detail'（执行详情，旧名 message）：不写进字段，面板收集并展示；loadFunctions 会把它从 outputs 里拆出来放进 FnMeta.noteOut
-  type?: 'select' | 'multiSelect' | 'text' | 'detail' | 'message'; options?: { value: string; label: string }[]; default?: string | string[]; description?: string;
+  type?: 'select' | 'multiSelect' | 'text' | 'detail' | 'message'; options?: OptNode[]; default?: string | string[]; description?: string;
 }
+// 选项节点：叶子有 value（可选的值）；带 children 的是分类，只用来分组、不能选
+interface OptNode { value?: string; label: string; children?: OptNode[] }
 interface FnMeta { id: string; name: string; inputs: ParamMeta[]; outputs: ParamMeta[]; noteOut?: string /* 执行详情出参的名字（type: 'message'）；没有声明则为空 */; batchSize?: number; async?: boolean /* 异步函数：下发后由服务端后台执行，完成后插件取回结果写回 */; serializeCalls?: boolean /* 串行执行：同一时间最多一个 run 在跑，按到达先后排队 */; serializeRuns?: boolean /* serializeCalls 的旧名字（旧版服务端只返回它） */; path?: string[] /* 函数所在目录的各级目录名（后端 functions/ 的目录结构） */ }
 
 type Cond = { kind: 'cond'; fieldId: string; op: string; value: string; sep?: string; customSep?: string };
@@ -355,9 +357,14 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     const d = inp.default;
     return { fn: fn.id, param: inp.name, fieldId: '', value: inp.type === 'multiSelect' ? (Array.isArray(d) ? [...d] : []) : typeof d === 'string' ? d : '' };
   }
+  // 选项（可能是多级目录）里全部可选的叶子，path 是它上面各级分类的名字
+  function leavesOf(opts: OptNode[] | undefined, path: string[] = []): { value: string; label: string; path: string[] }[] {
+    return (opts || []).flatMap(o => o.children ? leavesOf(o.children, [...path, o.label]) : [{ value: o.value ?? '', label: o.label, path }]);
+  }
+  const hasTree = (opts: OptNode[] | undefined) => (opts || []).some(o => o.children);
   // 填写的值有什么问题（没填、已经不是可选值），没问题返回空串
   function manualProblem(inp: ParamMeta, v: Mapping['value']): string {
-    const allowed = new Set((inp.options || []).map(o => o.value));
+    const allowed = new Set(leavesOf(inp.options).map(o => o.value));
     if (inp.type === 'text') return typeof v === 'string' && v.trim() ? '' : '还没有填写';
     if (inp.type === 'select') return typeof v !== 'string' || !v ? '还没有选择值' : allowed.has(v) ? '' : `的值“${v}”已不是可选值，请重新选择`;
     if (!Array.isArray(v) || !v.length) return '至少要勾选一个值';
@@ -497,6 +504,38 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     }).join('') || '<div class="af-hint">这个函数没有输出参数</div>';
   }
 
+  // 「＋输入」的选择器：和「＋输出」一样点开一个勾选列表，列出这个函数全部入参；已添加的打勾，再点一下移除（必需的入参不能移除）
+  const IN_PICK = 'in:';
+  const inPickKey = (fn: FnMeta, name: string) => `${IN_PICK}${encodeURIComponent(fn.id)}:${encodeURIComponent(name)}`;
+  function renderInputPicker(fn: FnMeta): string {
+    const req = groupRequired(fn);
+    const allOn = fn.inputs.length > 0 && fn.inputs.every(inp => config.inputs.some(i => i.fn === fn.id && i.param === inp.name));
+    const tools = fn.inputs.length ? `<span class="af-tn-tools"><span class="af-ico${allOn ? ' on' : ''}" data-pick="${esc(inPickKey(fn, ''))}" title="${allOn ? '取消全选：移除这个函数已添加的输入（必需的除外）' : '全选：一次加上这个函数的全部输入'}">${allOn ? '☑' : '☐'}</span></span>` : '';
+    return `<div class="af-tn-row af-scope-head"><span class="af-tn-name">${esc(fn.name)}　的输入</span>${tools}</div>` + fn.inputs.map(inp => {
+      const on = config.inputs.some(i => i.fn === fn.id && i.param === inp.name);
+      const locked = req.has(inp.name);
+      return `<div class="af-opt${on ? ' on' : ''}${locked ? ' locked' : ''}" data-pick="${esc(inPickKey(fn, inp.name))}" title="${esc((inp.description ? inp.description + '\n' : '') + (locked ? '必需的入参，不能移除' : ''))}"><span class="af-box"></span>${esc(inp.label || inp.name)}（${esc(inp.name)}）${locked ? '<span class="af-lock">必需</span>' : ''}</div>`;
+    }).join('') || '<div class="af-hint">这个函数没有入参</div>';
+  }
+  // 在「＋输入」选择器里点了一项：没添加就加一行输入（填上默认值），已添加就移除（必需的除外）
+  function toggleInputPick(pick: string) {
+    const [fid, name] = pick.slice(IN_PICK.length).split(':').map(decodeURIComponent);
+    const fn = fns.find(f => f.id === fid);
+    if (fn && name === '') { // 全选：都加过了就取消全选（必需的留着），否则把没加的补齐
+      const has = (n: string) => config.inputs.some(i => i.fn === fn.id && i.param === n);
+      if (fn.inputs.every(i => has(i.name))) {
+        const req = groupRequired(fn);
+        config.inputs = config.inputs.filter(i => i.fn !== fn.id || req.has(i.param));
+      } else for (const i of fn.inputs) if (!has(i.name)) config.inputs.push(newInput(fn, i));
+      return;
+    }
+    const inp = fn?.inputs.find(i => i.name === name);
+    if (!fn || !inp) return;
+    const idx = config.inputs.findIndex(i => i.fn === fn.id && i.param === name);
+    if (idx >= 0) { if (!groupRequired(fn).has(name)) config.inputs.splice(idx, 1); }
+    else config.inputs.push(newInput(fn, inp));
+  }
+
   // 选择器顶部的搜索框（见 filterPicker）
   const PICK_SEARCH = '<div class="af-pick-search"><input type="text" class="af-pick-q" placeholder="搜索函数 / 输出参数…" /></div>';
 
@@ -545,12 +584,14 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
   //   单个输出参数 → 没加就加上，加了就移除（勾选列表）。
   // 输出参数加进来后，自动归到所属函数的分组里（没有分组就自动建）。这些操作都不收起选择器，可以接着选
   function applyPick(pick: string) {
-    const target = pick.startsWith(ALL_PREFIX) ? fns.find(f => ALL_PREFIX + f.id === pick) : pick.startsWith(FN_PREFIX) ? findCall(pick) : findOutput(pick)?.fn;
+    const inPick = pick.startsWith(IN_PICK);
+    const target = inPick ? undefined : pick.startsWith(ALL_PREFIX) ? fns.find(f => ALL_PREFIX + f.id === pick) : pick.startsWith(FN_PREFIX) ? findCall(pick) : findOutput(pick)?.fn;
     const existed = !!target && config.outputs.some(o => fnOfKey(o.param)?.id === target.id);
     const have = new Set(config.outputs.map(o => o.param));
     const add = (param: string) => { if (!have.has(param)) { config.outputs.push({ param, fieldId: '' }); have.add(param); } };
     const remove = (param: string) => { const i = config.outputs.findIndex(o => o.param === param); if (i >= 0) removeOutputAt(i); };
-    if (pick.startsWith(ALL_PREFIX)) {
+    if (inPick) toggleInputPick(pick);
+    else if (pick.startsWith(ALL_PREFIX)) {
       const fn = fns.find(f => ALL_PREFIX + f.id === pick);
       if (fn) {
         const keys = fn.outputs.map(o => outputKey(fn, o));
@@ -586,26 +627,49 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     if (!inp || !isManual(inp)) return `<span class="af-arrow">←</span><select data-act="in-field" data-ss>${fieldOptions(m.fieldId)}</select>`;
     const arrow = '<span class="af-arrow" title="这个入参不来自字段：在这里填的值会原样传给每一行">←</span>';
     if (inp.type === 'text') return `${arrow}<input type="text" class="af-in-text" data-act="in-text" value="${esc(typeof m.value === 'string' ? m.value : '')}" placeholder="输入值" />`;
-    const opts = inp.options || [];
+    const tree = inp.options || [];
+    const opts = leavesOf(tree);
     if (inp.type === 'select') {
       const cur = typeof m.value === 'string' ? m.value : '';
       const stale = cur && !opts.some(o => o.value === cur);
-      return `${arrow}<select data-act="in-value" data-ss><option value="">选择值</option>` +
-        (stale ? `<option value="${esc(cur)}" selected>${esc(cur)}（已不是可选值）</option>` : '') +
-        opts.map(o => `<option value="${esc(o.value)}"${o.value === cur ? ' selected' : ''}>${esc(o.label)}</option>`).join('') + '</select>';
+      // 有多级目录：分类做成置灰的标题项，叶子按层级缩进（弹层里显示缩进，选中后下拉框上只显示叶子的名字）
+      const optHtml = (nodes: OptNode[], depth: number, path: string[]): string => nodes.map(o => o.children
+        ? `<option disabled data-grp="1" data-depth="${depth}">${esc(o.label)}</option>` + optHtml(o.children, depth + 1, [...path, o.label])
+        : `<option value="${esc(o.value ?? '')}"${o.value === cur ? ' selected' : ''} data-depth="${depth}" data-path="${esc([...path, o.label].join(' / '))}">${esc(o.label)}</option>`).join('');
+      return `${arrow}<select data-act="in-value" data-ss${hasTree(tree) ? ' data-tree' : ''}><option value="">选择值</option>` +
+        (stale ? `<option value="${esc(cur)}" selected>${esc(cur)}（已不是可选值）</option>` : '') + optHtml(tree, 0, []) + '</select>';
     }
     const cur = Array.isArray(m.value) ? m.value : [];
     const stale = cur.filter(v => !opts.some(o => o.value === v)); // 函数改了可选值：旧值还勾着，让用户自己取消
-    const box = (value: string, label: string, on: boolean, cls = '') => `<label class="af-ss-item af-in-chk${cls}"><input type="checkbox" data-act="in-multi" value="${esc(value)}"${on ? ' checked' : ''} />${esc(label)}</label>`;
+    const box = (value: string, label: string, on: boolean, cls = '', depth = 0, path = '') => `<label class="af-ss-item af-in-chk af-ms-leaf${cls}" style="padding-left:${6 + depth * 16}px" data-path="${esc(path)}"><input type="checkbox" data-act="in-multi" value="${esc(value)}"${on ? ' checked' : ''} />${esc(label)}</label>`;
+    // 多级目录：每个分类一行（可折叠、勾它等于勾下面全部叶子，部分勾选显示半选），叶子按层级缩进
+    const nodeHtml = (nodes: OptNode[], depth: number, path: string[]): string => nodes.map(o => {
+      if (!o.children) return box(o.value ?? '', o.label, cur.includes(o.value ?? ''), '', depth, [...path, o.label].join(' / '));
+      // 默认折叠，由用户点开；里面已经勾了值的分类先展开，打开列表就能看到
+      const openIt = leavesOf(o.children).some(l => cur.includes(l.value));
+      return `<div class="af-ms-grp${openIt ? '' : ' fold'}"><div class="af-ms-grphead" style="padding-left:${2 + depth * 16}px"><button type="button" class="af-ms-fold" data-act="ms-fold" title="折叠 / 展开">${openIt ? '▾' : '▸'}</button>` +
+        `<label class="af-in-chk af-in-grp"><input type="checkbox" data-act="in-multi-group" />${esc(o.label)}</label></div><div class="af-ms-kids">${nodeHtml(o.children, depth + 1, [...path, o.label])}</div></div>`;
+    }).join('');
     const open = msOpen === idx;
+    const showQ = opts.length > SS_MIN || hasTree(tree);
     return `${arrow}<span class="af-ms${open ? ' open' : ''}"><button type="button" class="af-ms-btn" data-act="ms-toggle" data-in="${idx}">${msSummary(inp, cur)}<span class="af-ms-caret">▾</span></button>` +
-      (open ? `<div class="af-ss-pop af-ms-pop">${opts.length > SS_MIN ? '<input type="text" class="af-ss-input af-ms-q" placeholder="搜索…" />' : ''}<div class="af-ss-list">` +
-        opts.map(o => box(o.value, o.label, cur.includes(o.value))).join('') + stale.map(v => box(v, `${v}（已不是可选值）`, true, ' stale')).join('') + '</div></div>' : '') + '</span>';
+      (open ? `<div class="af-ss-pop af-ms-pop">${showQ ? '<input type="text" class="af-ss-input af-ms-q" placeholder="搜索…" />' : ''}<div class="af-ss-list">` +
+        nodeHtml(tree, 0, []) + stale.map(v => box(v, `${v}（已不是可选值）`, true, ' stale')).join('') + '</div></div>' : '') + '</span>';
+  }
+
+  // 多选勾选列表里，每个分类的勾选状态跟着下面的叶子走（全勾 = 勾上，部分 = 半选）
+  function syncMsGroups(root: ParentNode = container) {
+    root.querySelectorAll<HTMLElement>('.af-ms-grp').forEach(g => {
+      const leaves = [...g.querySelectorAll<HTMLInputElement>('input[data-act="in-multi"]')];
+      const on = leaves.filter(x => x.checked).length;
+      const box = g.querySelector<HTMLInputElement>(':scope > .af-ms-grphead input[data-act="in-multi-group"]');
+      if (box) { box.checked = leaves.length > 0 && on === leaves.length; box.indeterminate = on > 0 && on < leaves.length; }
+    });
   }
 
   // 多选下拉框上显示的内容：已选的值（按可选值的顺序，不认识的旧值原样显示），没选显示占位提示
   function msSummary(inp: ParamMeta, values: string[]): string {
-    const labelOf = new Map((inp.options || []).map(o => [o.value, o.label]));
+    const labelOf = new Map(leavesOf(inp.options).map(o => [o.value, o.label]));
     const text = values.map(v => labelOf.get(v) ?? v).join('、');
     return text ? `<span class="af-ms-text" title="${esc(text)}">${esc(text)}</span>` : '<span class="af-ms-text af-ms-ph">选择值（可多选）</span>';
   }
@@ -659,7 +723,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       <div class="af-fg-head" title="${esc([...(g.fn?.path || []), g.name].join(' / '))}">
         <span class="af-fg-title"><span class="af-fg-name">${esc(g.name)}</span>${g.fn && isSerial(g.fn) ? SERIAL_TAG : ''}${g.fn?.async ? '<span class="af-async-tag" title="异步函数：点运行只下发数据，函数在服务端后台执行，完成后插件自动取回结果并写回字段（需要保持这张表的插件页面开着）">异步</span>' : ''}</span>
         <span class="af-fg-actions">
-          ${g.fn ? `<button type="button" class="af-add" data-act="add-in" data-fn="${esc(g.fn.id)}" title="${g.fn.inputs.every(inp => config.inputs.some(i => i.fn === g.fn!.id && i.param === inp.name)) ? '这个函数的入参都已添加' : '给这个函数添加一个输入（入参 ← 字段）'}"${g.fn.inputs.every(inp => config.inputs.some(i => i.fn === g.fn!.id && i.param === inp.name)) ? ' disabled' : ''}>＋输入</button><span class="af-pick"><button type="button" class="af-add" data-act="pick-toggle" data-scope="${esc(g.fn.id)}" title="给这个函数添加输出参数" ${g.fn.outputs.length ? '' : 'disabled'}>＋输出</button>${pickerScope === g.fn.id ? `<div class="af-pick-pop">${renderScopedPicker(g.fn, present)}</div>` : ''}</span>` : ''}
+          ${g.fn ? `<span class="af-pick"><button type="button" class="af-add" data-act="pick-toggle" data-scope="${esc(IN_PICK + g.fn.id)}" title="给这个函数添加 / 移除输入（入参）" ${g.fn.inputs.length ? '' : 'disabled'}>＋输入</button>${pickerScope === IN_PICK + g.fn.id ? `<div class="af-pick-pop">${renderInputPicker(g.fn)}</div>` : ''}</span><span class="af-pick"><button type="button" class="af-add" data-act="pick-toggle" data-scope="${esc(g.fn.id)}" title="给这个函数添加输出参数" ${g.fn.outputs.length ? '' : 'disabled'}>＋输出</button>${pickerScope === g.fn.id ? `<div class="af-pick-pop">${renderScopedPicker(g.fn, present)}</div>` : ''}</span>` : ''}
           <button class="af-x af-x-group" data-act="del-group" data-fn="${esc(key)}" title="移除这个函数（连同它的全部输出参数）">×</button>
         </span>
       </div>
@@ -700,6 +764,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       const qi = container.querySelector('.af-pick-q') as HTMLInputElement | null;
       if (qi) { qi.value = pickerQuery; filterPicker(); }
     }
+    syncMsGroups();
     syncRunBtn();
     updateFilterCount();
     container.scrollTop = keepScroll;
@@ -795,7 +860,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
   }
   function openSS(sel: HTMLSelectElement) {
     closeSS();
-    const opts = [...sel.options].map(o => ({ value: o.value, text: o.textContent || '', disabled: o.disabled }));
+    const opts = [...sel.options].map(o => ({ value: o.value, text: o.textContent || '', disabled: o.disabled, depth: Number(o.dataset.depth) || 0, grp: !!o.dataset.grp, path: o.dataset.path || '' }));
     const parent = sel.parentElement as HTMLElement;
     if (getComputedStyle(parent).position === 'static') parent.style.position = 'relative';
     const pop = document.createElement('div');
@@ -809,16 +874,33 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     ssSel = sel;
     const input = pop.querySelector('.af-ss-input') as HTMLInputElement;
     const list = pop.querySelector('.af-ss-list') as HTMLElement;
+    const folded = new Set<string>(); // 折叠了的分类（弹层开着期间有效）
+    const foldKey = (o: { text: string; depth: number }) => o.text + '\u0000' + o.depth + '\u0000' + opts.indexOf(o as typeof opts[number]);
     let shown = opts;
     let active = Math.max(0, opts.findIndex(o => o.value === sel.value));
     const draw = () => {
       const q = input.value.trim().toLowerCase();
-      shown = q ? opts.filter(o => o.text.toLowerCase().includes(q)) : opts;
+      // 搜索时只列叶子（分类标题没有意义），用「分类 / 子分类 / 名字」的完整路径匹配并显示；不搜索时按目录缩进显示
+      if (q) shown = opts.filter(o => !o.grp && (o.path || o.text).toLowerCase().includes(q));
+      else { // 不搜索：折叠了的分类，下面（层级更深、紧跟着的）整段都不显示
+        shown = [];
+        let hideBelow = -1;
+        for (const o of opts) {
+          if (hideBelow >= 0 && o.depth > hideBelow && o.value !== '' ) continue;
+          hideBelow = -1;
+          shown.push(o);
+          if (o.grp && folded.has(foldKey(o))) hideBelow = o.depth;
+        }
+      }
       if (active >= shown.length) active = shown.length - 1;
       if (active < 0) active = 0;
+      // 折叠 / 展开会让列表变高变矮：弹层随之伸缩，下面的内容会跟着上下跳。所以列表高度只增不减（最高到 max-height），并保住滚动位置
+      const prevTop = list.scrollTop;
+      list.style.minHeight = `${Math.max(parseFloat(list.style.minHeight) || 0, Math.min(list.offsetHeight, 220))}px`;
       list.innerHTML = shown.length
-        ? shown.map((o, i) => `<div class="af-ss-item${o.value === sel.value ? ' sel' : ''}${o.disabled ? ' dis' : ''}${i === active ? ' on' : ''}" data-i="${i}">${highlight(o.text || '（未选择）', q)}</div>`).join('')
+        ? shown.map((o, i) => `<div class="af-ss-item${o.value === sel.value ? ' sel' : ''}${o.disabled ? ' dis' : ''}${o.grp ? ' grp' : ''}${i === active ? ' on' : ''}" data-i="${i}"${!q && o.depth ? ` style="padding-left:${8 + o.depth * 16}px"` : ''}>${o.grp && !q ? `<span class="af-ss-fold">${folded.has(foldKey(o)) ? '▸' : '▾'}</span>` : ''}${highlight(q && o.path ? o.path : (o.text || '（未选择）'), q)}</div>`).join('')
         : '<div class="af-ss-empty">没有匹配的选项</div>';
+      list.scrollTop = prevTop;
       const cur = list.querySelector('.on') as HTMLElement | null; // 键盘移动时，让高亮项留在列表可见范围内（只滚列表自己，不带动整个面板）
       if (cur) {
         if (cur.offsetTop < list.scrollTop) list.scrollTop = cur.offsetTop;
@@ -835,7 +917,17 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     list.addEventListener('mousedown', (e) => {
       e.preventDefault(); // 不让搜索框失焦
       const item = (e.target as HTMLElement).closest('.af-ss-item') as HTMLElement | null;
-      if (item) choose(Number(item.dataset.i));
+      if (!item) return;
+      const o = shown[Number(item.dataset.i)];
+      if (o && o.grp && !input.value.trim()) { // 点分类标题：折叠 / 展开
+        const k = foldKey(o);
+        if (folded.has(k)) folded.delete(k); else folded.add(k);
+        draw();
+        active = Math.max(0, shown.indexOf(o)); // 高亮停在刚点的分类上，列表不会为了找高亮项去滚动
+        draw();
+        return;
+      }
+      choose(Number(item.dataset.i));
     });
     input.addEventListener('input', () => { active = 0; draw(); });
     input.addEventListener('keydown', (e) => {
@@ -845,13 +937,22 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeSS(); sel.focus(); }
       else if (e.key === 'Tab') closeSS();
     });
+    // 默认全部折叠，由用户点开；当前选中的值所在的那几层分类先展开，打开弹层就能看到它
+    opts.forEach(o => { if (o.grp) folded.add(foldKey(o)); });
+    const selAt = opts.findIndex(o => !o.grp && o.value === sel.value && o.value !== '');
+    if (selAt >= 0) {
+      let need = opts[selAt].depth;
+      for (let i = selAt - 1; i >= 0 && need > 0; i--) if (opts[i].grp && opts[i].depth < need) { folded.delete(foldKey(opts[i])); need = opts[i].depth; }
+    }
+    draw();
+    active = Math.max(0, shown.findIndex(o => !o.grp && o.value === sel.value && o.value !== ''));
     draw();
     input.focus({ preventScroll: true });
     pop.scrollIntoView({ block: 'nearest' }); // 弹层在面板底部时，只在被挡住的情况下滚一点，让它完整出现在视野里
   }
   const searchable = (el: EventTarget | null): HTMLSelectElement | null => {
     const sel = (el as HTMLElement | null)?.closest?.('select[data-ss]') as HTMLSelectElement | null;
-    return sel && !sel.disabled && sel.options.length > SS_MIN ? sel : null;
+    return sel && !sel.disabled && (sel.options.length > SS_MIN || sel.hasAttribute('data-tree')) ? sel : null; // 有多级目录的一律用弹层（原生下拉显示不出层级）
   };
   container.addEventListener('mousedown', (e) => {
     const sel = searchable(e.target);
@@ -866,7 +967,8 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     const sel = searchable(e.target);
     if (sel) { e.preventDefault(); openSS(sel); }
   });
-  document.addEventListener('mousedown', (e) => { if (ssPop && !ssPop.contains(e.target as Node) && e.target !== ssSel) closeSS(); });
+  // 用事件路径判断点没点在弹层里：点分类标题折叠 / 展开会重绘列表，被点的节点此时已经不在 DOM 里，用 contains(e.target) 会误判成点了外面而把弹层关掉
+  document.addEventListener('mousedown', (e) => { if (ssPop && !e.composedPath().includes(ssPop) && e.target !== ssSel) closeSS(); });
 
   // ── 函数选择器里的搜索：按目录 / 函数 / 输出参数的名字过滤；不匹配的隐藏，命中的目录和函数自动展开；
   // 目录名或函数名命中时，它下面的全部内容都保留。只改样式类，不重绘，所以输入时不会丢焦点 ──
@@ -967,6 +1069,14 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     pickerScope = null;
     const act = btn.dataset.act!;
     if (handleJobAct(act, btn)) return;
+    if (act === 'ms-fold') { // 多选列表里折叠 / 展开一个分类：只改样式，不重绘
+      const g = btn.closest('.af-ms-grp');
+      const lst = btn.closest<HTMLElement>('.af-ss-list'); // 折叠会让列表变矮、弹层跟着缩，下面的内容会上下跳：列表高度只增不减
+      if (lst) lst.style.minHeight = `${Math.max(parseFloat(lst.style.minHeight) || 0, Math.min(lst.offsetHeight, 220))}px`;
+      const folded = g?.classList.toggle('fold');
+      btn.textContent = folded ? '▸' : '▾';
+      return;
+    }
     if (act === 'ms-toggle') {
       const idx = Number(btn.dataset.in);
       msOpen = msOpen === idx ? null : idx;
@@ -1002,12 +1112,6 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
         break;
       case 'clear-filter': config.filter = emptyGroup(); break;
       case 'clear-outputs': config.outputs = []; config.inputs = []; break;
-      case 'add-in': { // 新加一行输入：默认选这个函数里第一个还没用的入参（可以再改）
-        const fn = fns.find(f => f.id === btn.dataset.fn);
-        const free = fn?.inputs.find(inp => !config.inputs.some(i => i.fn === fn.id && i.param === inp.name));
-        if (fn && free) config.inputs.push(newInput(fn, free));
-        break;
-      }
       case 'del-in': config.inputs.splice(Number(btn.dataset.in), 1); break;
       case 'del-group': { // 移除整个函数分组：它的全部输出参数一起删
         const key = btn.dataset.fn!;
@@ -1033,7 +1137,11 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     if (el.classList && el.classList.contains('af-pick-q')) { pickerQuery = el.value; filterPicker(); return; }
     if (el.classList && el.classList.contains('af-ms-q')) { // 多选勾选列表里的搜索：只隐藏不匹配的项，不重绘
       const q = el.value.trim().toLowerCase();
-      el.closest('.af-ms-pop')?.querySelectorAll<HTMLElement>('.af-in-chk').forEach(x => x.classList.toggle('ss-hide', !!q && !(x.textContent || '').toLowerCase().includes(q)));
+      const pop = el.closest('.af-ms-pop');
+      // 叶子按「分类 / 子分类 / 名字」的完整路径匹配；分类行没有可见的叶子就隐藏，搜索时忽略折叠
+      pop?.querySelectorAll<HTMLElement>('.af-ms-leaf').forEach(x => x.classList.toggle('ss-hide', !!q && !((x.dataset.path || x.textContent || '')).toLowerCase().includes(q)));
+      pop?.querySelectorAll<HTMLElement>('.af-ms-grp').forEach(g => g.classList.toggle('ss-hide', !!q && !g.querySelector('.af-ms-leaf:not(.ss-hide)')));
+      pop?.classList.toggle('searching', !!q);
       return;
     }
     if (el.dataset.act === 'in-text') { // 输入行的文本值：边输入边存，不重绘（重绘会丢焦点）
@@ -1076,7 +1184,12 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
         else m.param = el.value;
       } else if (m && act === 'in-field') m.fieldId = el.value;
       else if (m && act === 'in-value') m.value = el.value;
-      else if (m && act === 'in-multi') {
+      else if (m && (act === 'in-multi' || act === 'in-multi-group')) {
+        if (act === 'in-multi-group') { // 勾 / 取消一个分类：下面全部叶子一起勾 / 取消
+          const on = (el as HTMLInputElement).checked;
+          el.closest('.af-ms-grp')?.querySelectorAll<HTMLInputElement>('input[data-act="in-multi"]').forEach(x => { x.checked = on; });
+        }
+        syncMsGroups(inRow);
         // 勾选列表开着时不重绘（保住列表的滚动位置和搜索词），只更新下拉框上显示的已选值
         m.value = [...inRow.querySelectorAll<HTMLInputElement>('input[data-act="in-multi"]:checked')].map(x => x.value); // 按可选值的顺序
         saveConfig();

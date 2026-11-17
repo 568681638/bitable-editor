@@ -1236,3 +1236,15 @@ body.sidebar-zoom #app {
   .media-bar .media-menu .media-rates button { padding: 4px 9px; }
   .media-bar .media-menu .media-menu-item { padding: 7px 10px; }
 }
+
+// 选项的多级目录：多选勾选列表里的分类行（可折叠、勾它等于勾下面全部叶子）、单选弹层里的分类标题
+.af-ms-grphead { display: flex; align-items: center; gap: 2px; padding: 2px 6px; background: #f7f9fc; border-radius: 3px; }
+.af-ms-grphead .af-in-grp { flex: 1; display: flex; align-items: center; gap: 6px; font-weight: 600; color: #333; cursor: pointer; input { margin: 0; } }
+.af-ms-fold { flex: none; width: 18px; height: 18px; padding: 0; border: 0; background: transparent; color: #666; font-size: 11px; line-height: 18px; cursor: pointer; &:hover { color: #4f7cff; } }
+.af-ms-grp.fold > .af-ms-kids { display: none; }
+.af-ms-pop.searching .af-ms-grp.fold > .af-ms-kids { display: block; }
+.af-ms-pop .af-ms-grp.ss-hide { display: none; }
+.af-ss-item.grp { font-weight: 600; color: #333; background: #f7f9fc; cursor: pointer; }
+.af-ss-fold { display: inline-block; width: 14px; color: #666; font-size: 11px; }
+// 「＋输入」选择器里必需的入参：已勾选、不能取消
+.af-opt.locked { cursor: not-allowed; opacity: 0.85; .af-lock { margin-left: auto; } }
