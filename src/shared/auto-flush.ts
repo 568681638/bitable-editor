@@ -308,13 +308,23 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
 
   // ── 函数元信息 ──────────────────────────────────
   // silent：已经有函数列表时静默重读（后端热加载了新函数），不闪“加载中”
+  // 上一次拿到的函数列表缓存在本地：下次打开面板先用它直接显示，后台再静默刷新（后端冷启动 / 网络慢时不用干等）
+  const FNS_CACHE_KEY = () => `af-fns-cache:${apiUrl('api/functions')}`;
+  function readFnsCache(): FnMeta[] | null {
+    try { const v = JSON.parse(localStorage.getItem(FNS_CACHE_KEY()) || 'null'); return Array.isArray(v) && v.length ? v : null; } catch { return null; }
+  }
   async function loadFunctions(silent = false) {
-    if (!silent) { fnState = 'loading'; render(); }
+    if (!silent) {
+      const cached = fns.length === 0 ? readFnsCache() : null;
+      if (cached) { fns = cached; fnState = 'ready'; silent = true; render(); }
+      else { fnState = 'loading'; render(); }
+    }
     try {
-      const res = await fetch(apiUrl('api/functions'));
+      const res = await fetch(apiUrl('api/functions?refresh=1')); // refresh=1：让后端重新扫描函数目录（热加载改过的函数），运行时后端不再扫描
       if (!res.ok) throw new Error(`后端服务返回错误：${await serverMessage(res)}`);
       fns = await res.json();
       for (const f of fns) f.outputs = f.outputs.filter(o => (o.type as string) !== 'detail' && (o.type as string) !== 'message'); // 旧版服务端可能还带逐行详情出参：不再支持，忽略
+      try { localStorage.setItem(FNS_CACHE_KEY(), JSON.stringify(fns)); } catch { /* ignore */ }
       fnState = 'ready';
     } catch (e) {
       if (silent) return; // 静默刷新失败就沿用旧列表

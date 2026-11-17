@@ -464,15 +464,31 @@ async function folderSignature(dir) {
   return latest + '-' + count;
 }
 
-async function loadFunctions() {
+// 函数列表：扫描一次要遍历所有函数文件夹，所以结果缓存着，只在需要时重扫（同时到达的重扫共用一次）：
+//   - 服务启动时预热一次；
+//   - 面板打开 / 点刷新时请求 GET /api/functions?refresh=1 强制重扫（改过的函数文件在这时热加载，没改的沿用缓存）；
+//   - 运行函数用缓存；缓存里找不到这个函数 id（刚新增的）才重扫一次
+let fnScan = null;
+function loadFunctions(force) {
+  if (!fnScan || force) {
+    const p = scanFunctions();
+    fnScan = p;
+    p.catch(() => { if (fnScan === p) fnScan = null; });
+  }
+  return fnScan;
+}
+async function findFunction(id) {
+  return (await loadFunctions()).find(f => f.id === id) || (await loadFunctions(true)).find(f => f.id === id);
+}
+
+async function scanFunctions() {
   const found = [];
   await listFunctions(FUNCTIONS_DIR, [], found);
   const seen = new Set(found.map(f => f.key));
   for (const key of fnFileCache.keys()) if (!seen.has(key)) fnFileCache.delete(key);
 
-  const all = [];
-  const ids = new Set();
-  for (const { key, dir, full, categories, folderName } of found) {
+  // 各函数并行加载（Python 函数首次要起一个进程读元信息，串行会叠加），结果按原顺序合并、去重
+  const loaded = await Promise.all(found.map(async ({ key, dir, full, categories, folderName }) => {
     try {
       const sig = await folderSignature(dir);
       let entry = fnFileCache.get(key);
@@ -492,23 +508,28 @@ async function loadFunctions() {
         fnFileCache.set(key, entry);
         console.log('[functions] 已加载 ' + key + '：' + (defs.map(d => d.id).join(', ') || '（没有有效的函数定义）'));
       }
-      for (const d of entry.defs) {
-        if (ids.has(d.id)) { console.error('[functions] 函数 id 重复，忽略 ' + key + ' 里的 ' + d.id); continue; }
-        ids.add(d.id);
-        all.push(d);
-      }
+      return { key, defs: entry.defs };
     } catch (e) {
       // 失败的不缓存指纹，下次请求会重试；同时保留它上一次加载成功的版本
       console.error('[functions] 加载 ' + key + ' 失败:', e.message);
       const old = fnFileCache.get(key);
-      if (old) for (const d of old.defs) if (!ids.has(d.id)) { ids.add(d.id); all.push(d); }
+      return { key, defs: old ? old.defs : [] };
+    }
+  }));
+  const all = [];
+  const ids = new Set();
+  for (const { key, defs } of loaded) {
+    for (const d of defs) {
+      if (ids.has(d.id)) { console.error('[functions] 函数 id 重复，忽略 ' + key + ' 里的 ' + d.id); continue; }
+      ids.add(d.id);
+      all.push(d);
     }
   }
   return all;
 }
 
 // ── 批处理函数接口 ──────────────────────────────
-// GET  /api/functions          → [{ id, name, inputs, outputs, batchSize, async, serializeCalls, serializeRuns, path }]（serializeRuns 是 serializeCalls 的旧名字，值相同，留给旧版面板）（path：函数所在分类目录的各级目录名，不含函数文件夹自己）
+// GET  /api/functions[?refresh=1]（refresh=1 强制重新扫描）        → [{ id, name, inputs, outputs, batchSize, async, serializeCalls, serializeRuns, path }]（serializeRuns 是 serializeCalls 的旧名字，值相同，留给旧版面板）（path：函数所在分类目录的各级目录名，不含函数文件夹自己）
 // POST /api/functions/<id>/run  body { rows: [{...入参}], outputs?: [要回写的出参名] }（outputs 会作为 run 的第二个参数 { outputs } 交给函数；不带就是全部出参；jobs 接口同理） → { results: [{ ok: true, outputs } | { ok: false, error }], detail?: 这一批的整体详情 }（执行详情类型的出参就在 outputs 里）
 const MAX_BODY = 64 * 1024 * 1024;
 
@@ -534,12 +555,12 @@ function readJson(req) {
 
 async function handleFunctions(req, res, path) {
   if (path === '/api/functions' && req.method === 'GET') {
-    const FUNCTIONS = await loadFunctions();
+    const FUNCTIONS = await loadFunctions(new URL(req.url, 'http://x').searchParams.get('refresh') === '1');
     return sendJson(res, 200, FUNCTIONS.map((d) => ({ id: d.id, name: d.name, inputs: d.inputs.map(publicInput), outputs: (d.outputs || []).filter(o => !isDetailOut(o)), batchSize: batchSizeOf(d), async: d.async === true, serializeCalls: d.serializeCalls === true, serializeRuns: d.serializeCalls === true, path: d.folder || [] })));
   }
   const m = path.match(/^\/api\/functions\/([^/]+)\/run$/);
   if (m && req.method === 'POST') {
-    const fn = (await loadFunctions()).find(f => f.id === decodeURIComponent(m[1]));
+    const fn = await findFunction(decodeURIComponent(m[1]));
     if (!fn) return sendJson(res, 404, { error: 'Unknown function' });
     let body;
     try { body = await readJson(req); } catch (e) { return sendJson(res, 400, { error: e.message }); }
@@ -569,7 +590,7 @@ async function handleFunctions(req, res, path) {
   // 异步函数：下发一批行，立刻返回任务 ID，函数在后台执行（任务和结果落盘，见 jobs.mjs）。只有声明了 async: true 的函数能这样用
   const jm = path.match(/^\/api\/functions\/([^/]+)\/jobs$/);
   if (jm && req.method === 'POST') {
-    const fn = (await loadFunctions()).find(f => f.id === decodeURIComponent(jm[1]));
+    const fn = await findFunction(decodeURIComponent(jm[1]));
     if (!fn) return sendJson(res, 404, { error: 'Unknown function' });
     if (fn.async !== true) return sendJson(res, 400, { error: '函数 ' + fn.id + ' 不是异步函数（定义里没有 async: true）' });
     let body;
@@ -667,5 +688,6 @@ const server = createServer((req, res) => {
 jobs.init().catch((e) => console.error('[jobs] 初始化失败，异步任务不可用:', e.message)).then(() => {
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running at http://0.0.0.0:${PORT}/`);
+    loadFunctions().catch(() => {}); // 启动时预热：Python 函数的元信息提前读好，第一次打开面板不用等
   });
 });
