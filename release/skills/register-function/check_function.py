@@ -96,12 +96,10 @@ def check_declaration(f):
     all_out = [o['name'] for o in outputs]
     if len(set(all_out)) != len(all_out):
         fail('出参名有重复：%s' % all_out)
-    if len([o for o in outputs if o.get('type') in ('detail', 'message')]) > 1:
-        fail('type: "detail"（执行详情）的出参最多一个')
     out_names = [o['name'] for o in outputs if o.get('type') not in ('detail', 'message')]  # 执行详情不写进字段，可以不返回
     for o in outputs:
         if o.get('type') in ('detail', 'message'):
-            ok('出参 %s（%s）：执行详情，不写进字段，面板会展示它；这一行没有详情就返回 None' % (o['name'], o.get('label') or ''))
+            print('  warn 出参 %s 是旧的逐行执行详情（type: "detail"），已不再支持、会被忽略；执行详情请改成 run 返回 {"results": [...], "detail": "整批汇总"}' % o['name'])
             continue
         req = o.get('requires')
         bad = [r for r in req or [] if r not in names]
@@ -152,7 +150,7 @@ def check_run(base, f, rows, names, out_names, timeout, note_names=(), only=None
         return
     ok('返回 %d 条，与行数一致，用时 %.1f 秒（单批）' % (len(results), took))
     if (data.get('detail') or data.get('message')):
-        print('  批级详情：%s' % (data.get('detail') or data.get('message')))
+        print('  整批执行详情：%s' % (data.get('detail') or data.get('message')))
     for i, (row, r) in enumerate(zip(rows, results), 1):
         shown = json.dumps(row, ensure_ascii=False)
         shown = shown if len(shown) <= 80 else shown[:77] + '...'
@@ -167,9 +165,6 @@ def check_run(base, f, rows, names, out_names, timeout, note_names=(), only=None
         if extra:
             print('  note 第 %d 行返回了没声明的出参 %s，面板会忽略它们' % (i, extra))
         print('  row%-2d 成功：%s    ← %s' % (i, json.dumps({k: outs.get(k) for k in out_names}, ensure_ascii=False), shown))
-        for n in note_names:
-            if outs.get(n):
-                print('         详情：%s' % str(outs[n]).replace('\n', ' / '))
 
 
 def main():

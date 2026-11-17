@@ -254,18 +254,15 @@ function validDef(d) {
     && okParams(d.inputs) && d.inputs.every(p => validInput(d.id, p)) && (d.outputs === undefined || (okParams(d.outputs) && validOutputs(d.id, d.outputs)));
 }
 
-// ── 出参的类型：type 不写 = 普通出参（值写进表格字段）；
-//   detail   执行详情（旧名 message 仍然认）：一段文本，描述这一行 / 这一批执行得怎么样。不写进字段，也不出现在“＋输出”的选项里，面板每次调用都会收集并展示（悬浮窗）。每个函数最多一个
-// 另外 run 可以不返回数组，而返回 { results: [...与 rows 等长], detail: '本批整体的详情' }（旧名 message 仍然认），detail 是这一批（这一次 run）的详情，同样给面板展示
-const OUTPUT_TYPES = ['detail', 'message'];
+// ── 执行详情：只有“每批一条”。run 可以不返回数组，而返回 { results: [...与 rows 等长], detail: '这一批的汇总说明' }（旧名 message 仍然认），
+// detail 是这一批（这一次 run）的整体执行情况，给面板展示；不需要逐行说明。
+// 旧版支持过 type: 'detail' 的出参（每行一条）：现在不再支持，声明了也只是被忽略——不写进字段、不出现在“＋输出”里，run 返回的这一项也会被丢掉
 const isDetailOut = (o) => o && (o.type === 'detail' || o.type === 'message');
 const MAX_NOTE = 20000; // 单条说明的字数上限，超出截断（说明是给人看的，免得撑大响应和落盘的任务文件）
 function validOutputs(fnId, list) {
-  let why = '';
-  for (const p of list) if (p.type !== undefined && OUTPUT_TYPES.indexOf(p.type) < 0) { why = '出参 ' + p.name + ' 的 type 只能是 ' + OUTPUT_TYPES.join(' / ') + '（或不写），收到 ' + JSON.stringify(p.type); break; }
-  if (!why && list.filter(isDetailOut).length > 1) why = 'type: "detail" 的出参最多一个';
-  if (why) console.error('[functions] 函数 ' + fnId + ' 不合法：' + why);
-  return !why;
+  const bad = list.find(p => p.type !== undefined && !isDetailOut(p));
+  if (bad) console.error('[functions] 函数 ' + fnId + ' 不合法：出参 ' + bad.name + ' 的 type 不支持：' + JSON.stringify(bad.type));
+  return !bad;
 }
 function noteText(v) {
   if (v === null || v === undefined) return undefined;
@@ -281,11 +278,11 @@ function shapeRun(fn, out, n) {
   if (!Array.isArray(list) || list.length !== n) {
     throw new Error('函数 ' + fn.id + ' 必须返回与 rows 等长的数组（收到 ' + n + ' 行，返回 ' + (Array.isArray(list) ? list.length : typeof list) + '）');
   }
-  const msgName = ((fn.outputs || []).find(isDetailOut) || {}).name;
+  const legacy = (fn.outputs || []).filter(isDetailOut).map(o => o.name); // 旧的逐行详情出参：丢掉
   const results = list.map((o) => {
     if (o instanceof Error) return { ok: false, error: o.message };
     const outputs = Object.assign({}, o || {});
-    if (msgName && msgName in outputs) { const t = noteText(outputs[msgName]); if (t === undefined) delete outputs[msgName]; else outputs[msgName] = t; }
+    for (const k of legacy) delete outputs[k];
     return { ok: true, outputs };
   });
   return message === undefined ? { results } : { results, detail: message };
@@ -538,7 +535,7 @@ function readJson(req) {
 async function handleFunctions(req, res, path) {
   if (path === '/api/functions' && req.method === 'GET') {
     const FUNCTIONS = await loadFunctions();
-    return sendJson(res, 200, FUNCTIONS.map((d) => ({ id: d.id, name: d.name, inputs: d.inputs.map(publicInput), outputs: (d.outputs || []).map(o => (o.type === 'message' ? { ...o, type: 'detail' } : o)), batchSize: batchSizeOf(d), async: d.async === true, serializeCalls: d.serializeCalls === true, serializeRuns: d.serializeCalls === true, path: d.folder || [] })));
+    return sendJson(res, 200, FUNCTIONS.map((d) => ({ id: d.id, name: d.name, inputs: d.inputs.map(publicInput), outputs: (d.outputs || []).filter(o => !isDetailOut(o)), batchSize: batchSizeOf(d), async: d.async === true, serializeCalls: d.serializeCalls === true, serializeRuns: d.serializeCalls === true, path: d.folder || [] })));
   }
   const m = path.match(/^\/api\/functions\/([^/]+)\/run$/);
   if (m && req.method === 'POST') {

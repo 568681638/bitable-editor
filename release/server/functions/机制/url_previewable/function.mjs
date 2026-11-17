@@ -80,11 +80,11 @@ export default {
   inputs: [{ name: 'url', label: '链接' }],
   outputs: [
     { name: 'previewable', label: '可预览' }, // 布尔值 true / false
-    { name: 'reason', label: '判断依据', type: 'detail' },
   ],
   batchSize: 100,
   async run(rows) {
     const results = new Array(rows.length);
+    const whys = new Map(); // 判断依据 → 条数，汇总进这一批的执行详情
     let next = 0;
     const worker = async () => {
       while (next < rows.length) {
@@ -93,11 +93,14 @@ export default {
         if (!url) { results[i] = new Error('链接为空'); continue; }
         try {
           const r = await check(url, 0);
-          results[i] = { previewable: r.ok, reason: r.why };
+          results[i] = { previewable: r.ok };
+          whys.set(r.why, (whys.get(r.why) || 0) + 1);
         } catch (e) { results[i] = new Error(e.message); } // 连不上 / 超时：这一行失败，不猜结果
       }
     };
     await Promise.all(Array.from({ length: Math.min(WORKERS, rows.length) }, worker));
-    return results;
+    const failed = results.filter(r => r instanceof Error).length;
+    const lines = [...whys].sort((a, b) => b[1] - a[1]).map(([why, n]) => `${n} 条：${why}`);
+    return { results, detail: `本批 ${rows.length} 条，判断失败 ${failed} 条\n` + lines.join('\n') };
   },
 };

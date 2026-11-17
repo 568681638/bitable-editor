@@ -20,7 +20,6 @@ export default {
     { name: 'upper', label: '大写', requires: ['text'] },
     { name: 'length', label: '长度', requires: ['text'] },
     { name: 'slow_hash', label: '慢哈希（开销大）', requires: ['text', 'salt'] },
-    { name: 'report', label: '执行详情', type: 'detail' },
   ],
   async run(rows, ctx) {
     const want = new Set(ctx.outputs);
@@ -32,6 +31,6 @@ export default {
       if (want.has('slow_hash')) o.slow_hash = slowHash(String(row.salt || '') + text); // salt 只有选了 slow_hash 才保证有
       return o;
     });
-    return { results, detail: '本批实际计算的出参：' + (ctx.outputs.filter(n => n !== 'report').join('、') || '（无）') };
+    return { results, detail: '本批实际计算的出参：' + (ctx.outputs.join('、') || '（无）') };
   },
 };

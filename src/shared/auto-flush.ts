@@ -28,12 +28,11 @@ export interface AutoFlushHost {
 interface ParamMeta {
   name: string; label?: string; requires?: string[];
   // 以下只有入参有：type 不写 = 来自字段（每行取那一格的文本）；select / multiSelect / text 不来自字段，在卡片里直接填，整次运行每行都是同一个值
-  // 出参的 type 只有 'detail'（执行详情，旧名 message）：不写进字段，面板收集并展示；loadFunctions 会把它从 outputs 里拆出来放进 FnMeta.noteOut
-  type?: 'select' | 'multiSelect' | 'text' | 'detail' | 'message'; options?: OptNode[]; default?: string | string[]; description?: string;
+  type?: 'select' | 'multiSelect' | 'text'; options?: OptNode[]; default?: string | string[]; description?: string;
 }
 // 选项节点：叶子有 value（可选的值）；带 children 的是分类，只用来分组、不能选
 interface OptNode { value?: string; label: string; children?: OptNode[] }
-interface FnMeta { id: string; name: string; inputs: ParamMeta[]; outputs: ParamMeta[]; noteOut?: string /* 执行详情出参的名字（type: 'message'）；没有声明则为空 */; batchSize?: number; async?: boolean /* 异步函数：下发后由服务端后台执行，完成后插件取回结果写回 */; serializeCalls?: boolean /* 串行执行：同一时间最多一个 run 在跑，按到达先后排队 */; serializeRuns?: boolean /* serializeCalls 的旧名字（旧版服务端只返回它） */; path?: string[] /* 函数所在目录的各级目录名（后端 functions/ 的目录结构） */ }
+interface FnMeta { id: string; name: string; inputs: ParamMeta[]; outputs: ParamMeta[]; batchSize?: number; async?: boolean /* 异步函数：下发后由服务端后台执行，完成后插件取回结果写回 */; serializeCalls?: boolean /* 串行执行：同一时间最多一个 run 在跑，按到达先后排队 */; serializeRuns?: boolean /* serializeCalls 的旧名字（旧版服务端只返回它） */; path?: string[] /* 函数所在目录的各级目录名（后端 functions/ 的目录结构） */ }
 
 type Cond = { kind: 'cond'; fieldId: string; op: string; value: string; sep?: string; customSep?: string };
 type Group = { kind: 'group'; logic: 'and' | 'or'; negate: boolean; children: (Cond | Group)[] };
@@ -59,12 +58,11 @@ const WRITE_BATCH = 100; // 写回表格每次提交的记录数（不足 100 �
 const DEFAULT_BATCH = 100; // 函数没有声明 batchSize 时，每次调用传给它的行数
 type FnResult = { ok: boolean; outputs?: Record<string, any>; error?: string };
 // 历史记录里的两种记录（都只存在面板本地，按表格存进 localStorage；异步任务本身在服务端，见下面的 JobSummary）：
-// CallRec：同步函数的一次调用（一批）；ExecNote：这次调用（或异步任务回写时）收集到的执行详情——batch 是这一批的整体说明，rows 是各行的说明（index 是记录在视图里的序号）
+// CallRec：同步函数的一次调用（一批）；ExecNote：这次调用（或异步任务回写时）收集到的执行详情——函数对这一批的汇总说明
 // runId / runAt：属于哪次点「运行」（批次）；part / parts：函数在这个批次里的第几次调用（共几次）
 interface CallRec { uid: number; runId: string; runAt: number; fnId: string; fnName: string; part: number; parts: number; from: number; to: number; time: number; ok: number; failed: number; ms: number; error?: string }
-interface ExecNote { uid: number; runId: string; runAt: number; fnId: string; part: number; parts: number; time: number; fnName: string; from: number; to: number; batch?: string; rows: { index: number; text: string }[]; more?: number /* 超出保存上限、没存下的行数 */; async: boolean }
-const NOTE_ROWS_MAX = 200; // 一条详情最多保存多少行的详情
-const NOTE_ROW_CHARS = 2000; // 保存到本地时，每行详情最多多少字
+interface ExecNote { uid: number; runId: string; runAt: number; fnId: string; part: number; parts: number; time: number; fnName: string; from: number; to: number; batch: string; async: boolean }
+const NOTE_BATCH_CHARS = 8000; // 保存到本地时，一条详情最多多少字
 
 // 异步函数的任务（服务端见 release/server/jobs.mjs）。下发时把回写需要的信息放进 meta，之后不管页面刷没刷新都能照着写回
 // 批次：一次点「运行」是一个批次，被函数的 batchSize 拆成多个任务；同一批次的任务共用 id，part / parts 是第几个 / 共几个，from–to 是对应批次里的第几到第几条
@@ -229,7 +227,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
   const afailOpenKeys = new Set<string>(); // 展开着的异步失败明细（key = failKey：函数 id）
   let statusText = '';
   let statusKind: '' | 'error' | 'ok' = '';
-  // 执行详情：函数声明了 type: 'message' 的出参，或 run 返回了批级 message 时收集到这里（只在内存里，刷新页面就没了）
+  // 执行详情：函数的 run 返回了批级 detail 时收集到这里（只在内存里，刷新页面就没了）
   const noteLog: ExecNote[] = [];
   const callLog: CallRec[] = []; // 同步函数的调用记录
   let histTable = ''; // callLog / noteLog 当前对应哪张表
@@ -316,10 +314,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
       const res = await fetch(apiUrl('api/functions'));
       if (!res.ok) throw new Error(`后端服务返回错误：${await serverMessage(res)}`);
       fns = await res.json();
-      for (const f of fns) { // 执行详情出参不是写进字段的值：从 outputs 里拆出来，其余逻辑（选输出、必需入参）不用知道它
-        f.noteOut = f.outputs.find(o => o.type === 'detail' || o.type === 'message')?.name;
-        f.outputs = f.outputs.filter(o => o.type !== 'detail' && o.type !== 'message');
-      }
+      for (const f of fns) f.outputs = f.outputs.filter(o => (o.type as string) !== 'detail' && (o.type as string) !== 'message'); // 旧版服务端可能还带逐行详情出参：不再支持，忽略
       fnState = 'ready';
     } catch (e) {
       if (silent) return; // 静默刷新失败就沿用旧列表
@@ -1283,9 +1278,9 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     return null;
   }
 
-  // 这次调用前端要回写的出参名（交给后端函数，让它只算这些）：选了字段的出参，加上执行详情出参（面板总会收集它）
+  // 这次调用前端要回写的出参名（交给后端函数，让它只算这些）：选了字段的出参
   function wantedOutputs(fn: FnMeta, outs: { name: string; fieldId: string }[]): string[] {
-    return [...new Set([...outs.filter(o => o.fieldId).map(o => o.name), ...(fn.noteOut ? [fn.noteOut] : [])])];
+    return [...new Set(outs.filter(o => o.fieldId).map(o => o.name))];
   }
 
   // 这里抛出的错误都是已经带上函数名的中文说明，用 describedError 标记，避免被通用翻译二次改写
@@ -1361,7 +1356,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     }
     if (results.length !== meta.recordIds.length) throw new Error('结果条数与下发的记录数不一致');
     const noteFn = fns.find(f => f.id === job.fnId) ?? { id: job.fnId, name: job.fnName, inputs: [], outputs: [] } as FnMeta;
-    pushNote(makeNote(noteFn, results, typeof (job.detail ?? job.message) === 'string' ? (job.detail ?? job.message) : undefined, meta.indexes, true, meta.run ? { id: meta.run.id, at: meta.run.at, part: meta.run.part, parts: meta.run.parts } : undefined));
+    pushNote(makeNote(noteFn, typeof (job.detail ?? job.message) === 'string' ? (job.detail ?? job.message) : undefined, meta.indexes, true, meta.run ? { id: meta.run.id, at: meta.run.at, part: meta.run.part, parts: meta.run.parts } : undefined));
     const optionsOf = new Map<string, FieldOption[]>();
     for (const o of meta.outs) {
       const f = fieldById.get(o.fieldId);
@@ -1503,7 +1498,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
   }
 
   // ── 历史记录的数据 ──────────────────────────────
-  // 函数除了返回值，还可以返回执行详情（出参 type: 'message'，或 run 返回的批级 message），面板每调用一批就收集一份。
+  // 函数除了返回值，还可以返回执行详情（run 返回 {results, detail}，一批一条汇总），面板每调用一批就收集一份。
   // 同步函数的每次调用也记一条（CallRec），和异步任务、说明一起放进「函数」块右上角的「历史」里，按「批次 → 函数 → 每次调用」分层。
   const histKey = () => `annotator-auto-flush-hist:${host.getTableId()}`;
   function loadHist() {
@@ -1547,18 +1542,10 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     const ok = results.filter(r => r.ok).length;
     return { uid: ++histUid, runId: run.id, runAt: run.at, fnId: fn.id, fnName: fn.name, part: run.part, parts: run.parts, ...idxRange(indexes), time: Date.now(), ok, failed: error ? 0 : results.length - ok, ms, ...(error ? { error } : {}) };
   }
-  function makeNote(fn: FnMeta, results: FnResult[], batch: string | undefined, indexes: number[], isAsync: boolean, run?: RunRef): ExecNote | null {
-    const all: { index: number; text: string }[] = [];
-    if (fn.noteOut) {
-      results.forEach((r, i) => {
-        const t = r.ok ? r.outputs?.[fn.noteOut!] : undefined;
-        if (typeof t === 'string' && t.trim()) all.push({ index: indexes[i] || 0, text: t.length > NOTE_ROW_CHARS ? t.slice(0, NOTE_ROW_CHARS) + '…' : t });
-      });
-    }
-    if (!batch && all.length === 0) return null;
-    const rows = all.slice(0, NOTE_ROWS_MAX);
+  function makeNote(fn: FnMeta, batch: string | undefined, indexes: number[], isAsync: boolean, run?: RunRef): ExecNote | null {
+    if (!batch) return null;
     return { uid: ++histUid, runId: run?.id ?? '', runAt: run?.at ?? 0, fnId: fn.id, part: run?.part ?? 0, parts: run?.parts ?? 0, time: Date.now(), fnName: fn.name, ...idxRange(indexes),
-      batch: batch && batch.length > NOTE_ROW_CHARS * 4 ? batch.slice(0, NOTE_ROW_CHARS * 4) + '…' : batch, rows, ...(all.length > rows.length ? { more: all.length - rows.length } : {}), async: isAsync };
+      batch: batch.length > NOTE_BATCH_CHARS ? batch.slice(0, NOTE_BATCH_CHARS) + '…' : batch, async: isAsync };
   }
 
   function pushCall(c: CallRec) {
@@ -1578,11 +1565,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
   }
 
   function noteInnerHtml(n: ExecNote): string {
-    const same = n.rows.length > 1 && n.rows.every(r => r.text === n.rows[0].text); // 每行详情都一样：只列一次
-    const rowsHtml = same
-      ? `<div class="af-note-row"><span class="af-note-idx">全部 ${n.rows.length} 行</span><pre>${esc(n.rows[0].text)}</pre></div>`
-      : n.rows.map(r => `<div class="af-note-row"><span class="af-note-idx">${r.index ? `第 ${r.index} 条` : '—'}</span><pre>${esc(r.text)}</pre></div>`).join('');
-    return (n.batch ? `<div class="af-note-batch"><pre>${esc(n.batch)}</pre></div>` : '') + rowsHtml + (n.more ? `<div class="af-note-row"><span class="af-note-idx"></span><span class="af-jobs-more">…另有 ${n.more} 行详情未保存</span></div>` : '');
+    return `<div class="af-note-batch"><pre>${esc(n.batch)}</pre></div>`;
   }
   // 下发时间：今天只显示时:分，其他天带上月-日
   function fmtClock(ms: number, seconds = false): string {
@@ -1704,7 +1687,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
 
   // 复制用的文本：不传参数是全部，传了批次（和函数）就只复制那些
   function noteLines(n?: ExecNote): string[] {
-    return n ? [...(n.batch ? [`    详情：${n.batch}`] : []), ...n.rows.map(r => `    ${r.index ? `第 ${r.index} 条：` : ''}${r.text}`)] : [];
+    return n ? [`    详情：${n.batch}`] : [];
   }
   function histText(runKeys?: string[], fnId?: string): string {
     const { runs, noteOf } = groupHistory();
@@ -1798,7 +1781,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     let ordered = grouped.runs;
     if (q) {
       const fnText = (rk: string, fid: string, g: FnGroup) => [g.name, ...g.jobs.map(j => jobView(j).text), ...g.calls.map(c => c.error || ''), ...g.fails.map(f => f.error),
-        ...noteLog.filter(n => n.runId === rk && n.fnId === fid).flatMap(n => [n.batch || '', ...n.rows.map(r => r.text)])].join('\n').toLowerCase();
+        ...noteLog.filter(n => n.runId === rk && n.fnId === fid).flatMap(n => [n.batch])].join('\n').toLowerCase();
       ordered = ordered.flatMap(([rk, r]): [string, RunGroup][] => {
         const runHit = `批次 ${fmtClock(r.at, true)} ${dayLabelOf(r.at)} ${runNames[rk] || ''}`.toLowerCase().includes(q);
         const fns = new Map([...r.fns].filter(([fid, g]) => runHit || fnText(rk, fid, g).includes(q)));
@@ -2787,7 +2770,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
             catch (e) { pushCall(makeCall(fn, indexes, ref, [], Date.now() - t0, e instanceof Error ? e.message : String(e))); throw e; }
             results.push(...part.results);
             pushCall(makeCall(fn, indexes, ref, part.results, Date.now() - t0));
-            pushNote(makeNote(fn, part.results, part.message, indexes, false, ref));
+            pushNote(makeNote(fn, part.message, indexes, false, ref));
           }
           results.forEach((r, i) => {
             if (bad[i]) return;
