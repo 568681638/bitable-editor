@@ -331,6 +331,13 @@ function wantedOutputs(fn, body) {
   return declared.filter(n => body.outputs.indexOf(n) >= 0);
 }
 
+// run(rows, ctx) 的第二个参数：outputs 之外，还带着这次点「运行」的 ID（runId）和这一批调用的 ID（batchId，被 batchSize 拆出的每个批次各一个）；
+// 面板之外直接调用（比如 curl）没带就是 null
+function runCtx(fn, body) {
+  const idOf = (v) => (typeof v === 'string' && v && v.length <= 200 ? v : null);
+  return { outputs: wantedOutputs(fn, body), runId: idOf(body.runId), batchId: idOf(body.batchId) };
+}
+
 // 给面板的入参描述：字段入参保持原样（name、label），其他取值方式带上 type / options / default / description
 function publicInput(p) {
   const out = { name: p.name, label: p.label };
@@ -409,7 +416,7 @@ async function loadPyDef(full, fallbackId) {
     id: meta.id || fallbackId, name: meta.name || meta.id || fallbackId, inputs: meta.inputs, outputs: meta.outputs, batchSize: meta.batchSize, async: meta.async === true, serializeCalls: meta.serializeCalls === true || meta.serializeRuns === true, // serializeRuns 是旧名字，仍然认
     // 与 JS 函数同形：返回与 rows 等长的数组，失败的行是 Error
     async run(rows, ctx) {
-      const data = await runPython(full, 'run', { rows, outputs: ctx && ctx.outputs },meta.async === true ? PY_ASYNC_TIMEOUT : PY_RUN_TIMEOUT);
+      const data = await runPython(full, 'run', { rows, outputs: ctx && ctx.outputs, runId: ctx ? ctx.runId : null, batchId: ctx ? ctx.batchId : null },meta.async === true ? PY_ASYNC_TIMEOUT : PY_RUN_TIMEOUT);
       if (!data || !Array.isArray(data.results)) throw new Error('Python 返回格式不对');
       const list = data.results.map(r => (r.ok ? r.outputs : new Error(r.error)));
       return data.detail === undefined || data.detail === null ? list : { results: list, detail: data.detail }; // 带批级详情时用 { results, detail }，和 JS 函数同形
@@ -580,7 +587,7 @@ async function handleFunctions(req, res, path) {
     }
     // 批量计算：函数一次拿到全部 rows，返回与 rows 等长的数组；Error 项表示该行失败
     let shaped;
-    try { shaped = shapeRun(fn, await fn.run(fillDefaults(fn, body.rows.map(r => r || {})), { outputs: wantedOutputs(fn, body) }), body.rows.length); }
+    try { shaped = shapeRun(fn, await fn.run(fillDefaults(fn, body.rows.map(r => r || {})), runCtx(fn, body)), body.rows.length); }
     catch (e) { return sendJson(res, 500, { error: e instanceof Error ? e.message : String(e) }); }
     finally {
       if (held) locks.leave(fn.id);
@@ -598,7 +605,7 @@ async function handleFunctions(req, res, path) {
     if (!body || !Array.isArray(body.rows)) return sendJson(res, 400, { error: 'rows is required' });
     if (typeof body.scope !== 'string' || !body.scope || body.scope.length > 200) return sendJson(res, 400, { error: 'scope is required' });
     const rows = fillDefaults(fn, body.rows.map(r => r || {}));
-    const ctx = { outputs: wantedOutputs(fn, body) };
+    const ctx = runCtx(fn, body);
     const job =jobs.create({ fnId: fn.id, fnName: fn.name, scope: body.scope, rows, meta: body.meta, locked: fn.serializeCalls === true }, async (input) => {
       return shapeRun(fn, await fn.run(input, ctx), input.length);
     });

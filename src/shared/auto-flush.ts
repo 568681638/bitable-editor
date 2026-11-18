@@ -1293,8 +1293,11 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     return [...new Set(outs.filter(o => o.fieldId).map(o => o.name))];
   }
 
+  // 每次点「运行」一个 runId，被 batchSize 拆出的每个批次一个 batchId（同一次运行里按函数各自从 1 编号）；随请求交给后端，函数在 run 的 ctx 里拿到
+  const batchIdOf = (runId: string, part: number) => `${runId}-${part}`;
+
   // 这里抛出的错误都是已经带上函数名的中文说明，用 describedError 标记，避免被通用翻译二次改写
-  async function callFunction(fn: FnMeta, rows: Record<string, any>[], outputs: string[]): Promise<{ results: FnResult[]; message?: string }> {
+  async function callFunction(fn: FnMeta, rows: Record<string, any>[], outputs: string[], ids: { runId: string; batchId: string }): Promise<{ results: FnResult[]; message?: string }> {
     const prefix = `函数“${fn.name}”调用失败：`;
     const waitStart = Date.now();
     let res: Response;
@@ -1303,7 +1306,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
         res = await fetch(apiUrl(`api/functions/${encodeURIComponent(fn.id)}/run`), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ rows, outputs, wait: attempt === 0 ? 1500 : undefined }), // 第一次请求只等 1.5 秒，轮不到就马上回“排队中”让状态栏及时提示；之后的重试才等满
+          body: JSON.stringify({ rows, outputs, runId: ids.runId, batchId: ids.batchId, wait: attempt === 0 ? 1500 : undefined }), // 第一次请求只等 1.5 秒，轮不到就马上回“排队中”让状态栏及时提示；之后的重试才等满
         });
       } catch (e) {
         throw describedError(prefix + describeError(e, 'read'));
@@ -1330,10 +1333,10 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
     return res.json();
   }
 
-  async function dispatchJob(fn: FnMeta, rows: Record<string, any>[], meta: JobMeta, outputs: string[]): Promise<void> {
+  async function dispatchJob(fn: FnMeta, rows: Record<string, any>[], meta: JobMeta, outputs: string[], ids: { runId: string; batchId: string }): Promise<void> {
     const prefix = `函数“${fn.name}”下发失败：`;
     try {
-      await jobApi(`api/functions/${encodeURIComponent(fn.id)}/jobs`, { rows, outputs, scope: host.getScope(), meta });
+      await jobApi(`api/functions/${encodeURIComponent(fn.id)}/jobs`, { rows, outputs, runId: ids.runId, batchId: ids.batchId, scope: host.getScope(), meta });
     } catch (e) {
       throw describedError(prefix + describeError(e, 'read'));
     }
@@ -2776,7 +2779,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
             const ref = { id: runId, at: runAt, part: seq, parts: partsOf(fn) };
             const t0 = Date.now();
             let part: { results: FnResult[]; message?: string };
-            try { part = await callFunction(fn, rows.slice(s, s + size), wanted); }
+            try { part = await callFunction(fn, rows.slice(s, s + size), wanted, { runId, batchId: batchIdOf(runId, seq) }); }
             catch (e) { pushCall(makeCall(fn, indexes, ref, [], Date.now() - t0, e instanceof Error ? e.message : String(e))); throw e; }
             results.push(...part.results);
             pushCall(makeCall(fn, indexes, ref, part.results, Date.now() - t0));
@@ -2820,7 +2823,7 @@ export function createAutoFlush(container: HTMLElement, host: AutoFlushHost, run
             const seq = (partSeq.get(fn.id) || 0) + 1;
             partSeq.set(fn.id, seq);
             const run: RunInfo = { id: runId, at: runAt, total: matched.length, part: seq, parts: partsOf(fn), from: start + s + 1, to: start + s + part.length };
-            await dispatchJob(fn, rows.slice(s, s + size), { recordIds: part.map(r => r.recordId), indexes: part.map(r => indexOf.get(r.recordId) || 0), outs: mapped, run }, wantedOutputs(fn, outs));
+            await dispatchJob(fn, rows.slice(s, s + size), { recordIds: part.map(r => r.recordId), indexes: part.map(r => indexOf.get(r.recordId) || 0), outs: mapped, run }, wantedOutputs(fn, outs), { runId, batchId: batchIdOf(runId, seq) });
             // 按函数累计，已下发条数取各函数里最多的那个（同一条记录给多个异步函数只算一条）；下发到一半失败时，已成功的部分也如实计入
             sentBy.set(fn.id, (sentBy.get(fn.id) || 0) + part.length);
             dispatched = Math.max(dispatched, ...sentBy.values());

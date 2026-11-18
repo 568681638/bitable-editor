@@ -28,8 +28,9 @@ def main():
         with open(in_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         rows = data['rows']
-        # 第二个参数 ctx = {"outputs": [前端要回写的出参名]}；run 只写了 rows 一个参数的旧函数照常调用
-        ctx = {'outputs': data.get('outputs') if isinstance(data.get('outputs'), list) else [o['name'] for o in mod.META.get('outputs', [])]}
+        # 第二个参数 ctx = {"outputs": [前端要回写的出参名], "runId": 这次点「运行」的 ID, "batchId": 这一批调用的 ID（没有就是 None）}；run 只写了 rows 一个参数的旧函数照常调用
+        ctx = {'outputs': data.get('outputs') if isinstance(data.get('outputs'), list) else [o['name'] for o in mod.META.get('outputs', [])],
+               'runId': data.get('runId'), 'batchId': data.get('batchId')}
         try:
             takes_ctx = len(inspect.signature(mod.run).parameters) >= 2 or any(
                 p.kind == inspect.Parameter.VAR_POSITIONAL for p in inspect.signature(mod.run).parameters.values())

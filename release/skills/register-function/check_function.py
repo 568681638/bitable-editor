@@ -131,7 +131,7 @@ def check_run(base, f, rows, names, out_names, timeout, note_names=(), only=None
     if unknown:
         fail('样例行里有函数没声明的入参：%s（面板不会传这些键）' % unknown)
     started = time.time()
-    body = {'rows': rows}
+    body = {'rows': rows, 'runId': 'check', 'batchId': 'check-1'}  # 模拟面板带上的 runId / batchId
     if only is not None:
         body['outputs'] = out_names + list(note_names)
     while True:
